@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pix-tool-set"
+version = "0.1.0"
+description = "Unified CLI and MCP tools for PIX C++ export based analysis."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+pix_tool_set = "pix_tool_set.mcp_server:main"
+pix-tool-set = "pix_tool_set.cli:main"
+pix-tool-set-cli = "pix_tool_set.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
