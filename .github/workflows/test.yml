@@ -1,0 +1,21 @@
+name: test
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+jobs:
+  gpu-free-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package
+        run: pip install -e .
+      - name: CLI smoke test
+        run: pix-tool-set list-tools --brief
+      - name: Replay-override suite (synthetic export, no GPU needed)
+        run: python tests\verify_replay_override.py
+# 说明：verify_live.py 及 --with-replay 依赖本机 PIX 安装、.wpix 截帧与 D3D12 GPU，
+# 无法在 GitHub Actions 运行，需在本地按 README「验证」一节执行。

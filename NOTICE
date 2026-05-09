@@ -1,0 +1,28 @@
+pix-tool-set
+Copyright (c) 2026 pix-tool-set contributors
+
+This product bundles third-party components under their own licenses:
+
+================================================================================
+Microsoft WinPixEventRuntime
+================================================================================
+Location : src/pix_tool_set/vendor/winpixeventruntime/
+Source   : https://www.nuget.org/package/WinPixEventRuntime
+Copyright (c) Microsoft Corporation.
+License  : see src/pix_tool_set/vendor/winpixeventruntime/LICENSE.txt
+
+The redistributable DLL/LIB/header files of WinPixEventRuntime are vendored
+so that replay builds work offline; they are NOT covered by this project's
+MIT license and remain subject to the Microsoft license terms bundled in the
+directory above.
+
+================================================================================
+Runtime dependencies (NOT distributed by this project)
+================================================================================
+The following are required at runtime but must be obtained separately by the
+user; nothing from them is redistributed in this repository:
+
+- Microsoft PIX for Windows (pixtool.exe) - https://devblogs.microsoft.com/pix/
+- Microsoft DirectX Shader Compiler (dxcompiler.dll / dxil.dll, ships with PIX)
+- Microsoft D3D12 Agility SDK (downloaded from nuget.org by the exported
+  project's CMake at configure time)

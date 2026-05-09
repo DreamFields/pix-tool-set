@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pix-tool-set"
+version = "2.0.0"
+description = "Scriptable PIX (.wpix) capture analysis toolkit with an AI-client friendly CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = []
+
+[project.scripts]
+pix-tool-set = "pix_tool_set.cli:main"
+pixts = "pix_tool_set.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pix_tool_set = [
+    "py.typed",
+    "viewer/*.html",
+    "vendor/winpixeventruntime/LICENSE.txt",
+    "vendor/winpixeventruntime/include/*.h",
+    "vendor/winpixeventruntime/bin/*/*.dll",
+    "vendor/winpixeventruntime/bin/*/*.lib",
+]

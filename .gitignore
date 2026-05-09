@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# local verification artefacts
+verify-out/
+outputs/
+activity_renders/
+
+# pixtool export caches (can be regenerated from the .wpix)
+*.pixcache/
+*.events.csv
+*.log
+depth-out/
+lightgrid-out/
+
+# agent memory (managed by the memory system, not part of the repo)
+.codebuddy/memory/
+.workbuddy/memory/
+
+.codebuddy

@@ -1,0 +1,755 @@
+"""Requirement section 2: event and action navigation."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..context import ToolContext
+from ..engine.model import DRAW_KINDS, EventKind
+from ..errors import invalid_argument, not_found
+from ..results import ToolResult
+from ._common import (
+    DRAW_SELECTOR,
+    PAGE_PARAMS,
+    draw_selector_args,
+    note_missing_queue_id,
+    page_args,
+    page_envelope,
+    pass_identity,
+    resolve_draw,
+    resolve_pass,
+    tool,
+    with_session,
+)
+
+
+_KIND_VALUES = [kind.value for kind in EventKind]
+
+
+@tool(
+    name="list-actions",
+    summary=(
+        "List capture events (PIX 'actions') in submission order, optionally filtered by "
+        "kind, marker path, or a global-id range."
+    ),
+    category="events",
+    parameters=with_session(
+        PAGE_PARAMS,
+        kind={
+            "type": "string",
+            "enum": _KIND_VALUES,
+            "description": "Keep only events of this kind (the literal D3D12 API call).",
+        },
+        effective_kind={
+            "type": "string",
+            "enum": ["draw", "dispatch", "dispatch_rays", "execute_indirect"],
+            "description": (
+                "Keep only events by what the GPU actually runs. A UE5 export contains no "
+                "literal DispatchRays call -- ray dispatches appear as ExecuteIndirect on a "
+                "DISPATCH_RAYS command signature -- so --kind raytracing finds only the "
+                "acceleration structure builds while --effective-kind dispatch_rays finds "
+                "the dispatches that actually trace rays."
+            ),
+        },
+        drawable_only={
+            "type": "boolean",
+            "description": "Keep only draw/dispatch/indirect events.",
+        },
+        marker={
+            "type": "string",
+            "description": "Substring match against the marker path of the event.",
+        },
+        min_queue_id={"type": "integer", "description": "Lowest PIX Queue ID to include."},
+        max_queue_id={"type": "integer", "description": "Highest PIX Queue ID to include."},
+        detail={"type": "boolean", "description": "Include marker path and counters."},
+    ),
+    returns="Paged list of events with kind, name, Queue ID, Global ID and depth.",
+    examples=[
+        "pix-tool-set list-actions --limit 20",
+        "pix-tool-set list-actions --drawable-only --limit 50",
+        "pix-tool-set list-actions --kind dispatch --detail",
+    ],
+)
+def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    offset, limit = page_args(args)
+    detail = bool(args.get("detail"))
+
+    events = capture.events
+    if not events:
+        return ToolResult.partial(
+            {"events": [], **page_envelope(0, offset, limit, 0)}
+        ).add_diagnostic(
+            "warning",
+            "This session has no event list; re-open the capture without --skip-events.",
+        )
+
+    kind = args.get("kind")
+    effective = args.get("effective_kind")
+    marker = (args.get("marker") or "").lower()
+    lo = args.get("min_queue_id")
+    hi = args.get("max_queue_id")
+    drawable_only = bool(args.get("drawable_only"))
+
+    # effective_kind lives on the draw call, not on the event row, so build the set of
+    # Global IDs whose action actually runs the requested work. Without this, ray
+    # dispatches are unreachable from the event view: their API name is ExecuteIndirect.
+    effective_gids: set[int] | None = None
+    if effective:
+        effective_gids = {
+            draw.global_id
+            for draw in capture.draw_calls
+            if draw.effective_kind.value == effective and draw.global_id is not None
+        }
+
+    filtered = []
+    for event in events:
+        if kind and event.kind.value != kind:
+            continue
+        if effective_gids is not None:
+            gid = getattr(event, "global_id", None)
+            if gid is None or gid not in effective_gids:
+                continue
+        if drawable_only and event.kind not in DRAW_KINDS:
+            continue
+        # Range filtering on Queue ID rather than Global ID: every row has a Queue ID,
+        # so a window expressed this way cannot silently drop markers.
+        if lo is not None and event.queue_id < lo:
+            continue
+        if hi is not None and event.queue_id > hi:
+            continue
+        if marker and marker not in " / ".join(event.marker_path).lower():
+            continue
+        filtered.append(event)
+
+    window = filtered[offset : offset + limit] if limit else filtered[offset:]
+    result = ToolResult.success(
+        {
+            "events": [event.to_dict(detail=detail) for event in window],
+            **page_envelope(len(filtered), offset, limit, len(window)),
+        }
+    )
+    if effective and not filtered:
+        result.add_diagnostic(
+            "info",
+            f"No event resolves to effective_kind={effective!r}. Note that events on a "
+            "queue the exported event list does not cover have no row here; use "
+            f"find-draw-calls --effective-kind {effective} to reach those.",
+        )
+    return result
+
+
+@tool(
+    name="action-info",
+    summary=(
+        "Full detail for one event: kind, marker path, parent/child links, counters, and "
+        "the associated draw call when the event is a draw or dispatch."
+    ),
+    category="events",
+    parameters=with_session(
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID. Resolves across all queues, including actions the "
+                "exported event list does not cover. For an ExecuteIndirect expansion "
+                "(an id the GUI shows but the export did not emit), the parent "
+                "ExecuteIndirect's action is reported."
+            ),
+        },
+        queue_id={
+            "type": "integer",
+            "description": (
+                "Row id from the exported event list; it addresses markers as well as "
+                "actions, but only for the queue that export covers. For an action on "
+                "another queue use --global-id instead."
+            ),
+        },
+
+        include_children={
+            "type": "boolean",
+            "description": "Include the immediate child events.",
+        },
+    ),
+    returns="Event detail, ancestor chain, and linked draw call summary.",
+    examples=[
+        "pix-tool-set action-info --queue-id 18704",
+        "pix-tool-set action-info --global-id 5099",
+    ],
+)
+def action_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    global_id = args.get("global_id")
+    queue_id = args.get("queue_id")
+    if global_id is None and queue_id is None:
+        raise invalid_argument("global_id/queue_id", "provide one of them")
+
+    event = None
+    draw = None
+    if global_id is not None:
+        # Try the event list first (covers the exported queue), then the draw
+        # list (covers every queue, and ExecuteIndirect expansions). The draw
+        # path is what reaches the 90 async-compute actions and the sub-actions
+        # the export did not emit.
+        event = capture.event_by_global_id(int(global_id))
+        draw = capture.resolve_draw(global_id=int(global_id))
+    elif queue_id is not None:
+        event = capture.event_by_queue_id(int(queue_id))
+
+    if event is None and draw is None:
+        raise not_found(
+            "action",
+            f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}",
+            "Use list-actions, search-actions, or find-draw-calls to locate a valid id.",
+        )
+
+    ancestors = []
+    if event is not None:
+        node = event.parent
+        while node is not None:
+            ancestors.append(node.to_dict())
+            node = node.parent
+        ancestors.reverse()
+        if draw is None:
+            draw = event.draw_call
+
+    data: dict[str, Any] = {
+        "event": event.to_dict(detail=True) if event is not None else None,
+        "ancestors": ancestors,
+        "draw_call": draw.to_dict() if draw is not None else None,
+        "effective_kind": draw.effective_kind.value if draw is not None else None,
+    }
+    if bool(args.get("include_children")) and event is not None:
+        data["children"] = [child.to_dict() for child in event.children]
+
+    return ToolResult.success(data)
+
+
+@tool(
+    name="search-actions",
+    summary="Search events by name using a substring or a regular expression.",
+    category="events",
+    parameters=with_session(
+        PAGE_PARAMS,
+        query={"type": "string", "description": "Text or regex to match against event names."},
+        regex={"type": "boolean", "description": "Treat query as a regular expression."},
+        kind={"type": "string", "enum": _KIND_VALUES, "description": "Restrict to one kind."},
+        detail={"type": "boolean", "description": "Include marker path and counters."},
+        required=["query"],
+    ),
+    returns="Paged list of matching events.",
+    examples=[
+        "pix-tool-set search-actions --query Lumen",
+        'pix-tool-set search-actions --query "Draw\\w+Instanced" --regex',
+    ],
+)
+def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    offset, limit = page_args(args)
+    window, total = capture.find_events(
+        args["query"],
+        kind=args.get("kind"),
+        regex=bool(args.get("regex")),
+        offset=offset,
+        limit=limit,
+    )
+    detail = bool(args.get("detail"))
+    result = ToolResult.success(
+        {
+            "query": args["query"],
+            "regex": bool(args.get("regex")),
+            "events": [event.to_dict(detail=detail) for event in window],
+            **page_envelope(total, offset, limit, len(window)),
+        }
+    )
+    if not capture.events:
+        result.degrade("This session has no event list, so the search had nothing to scan.")
+    return result
+
+
+@tool(
+    name="find-draw-calls",
+    summary=(
+        "Find draw calls / dispatches by pass name, PSO, shader hash, resource usage or "
+        "size thresholds. This is the main entry point for 'which draws do X'."
+    ),
+    category="events",
+    parameters=with_session(
+        PAGE_PARAMS,
+        pass_name={"type": "string", "description": "Substring match on the innermost marker."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of any event inside a pass. Restricts the search to that "
+                "one pass, across every queue -- this is the selector for an id copied "
+                "out of the PIX GUI. A name cannot single out a pass when several share "
+                "a label, and queue_id only reaches the exported queue."
+            ),
+        },
+        queue_id={
+            "type": "integer",
+            "description": (
+                "Exported event list row id of any event inside a pass. Restricts the "
+                "search to that one pass, which a name cannot do when passes share a "
+                "label. Only works for the exported queue; global_id, pass_name or "
+                "marker reach every pass."
+            ),
+        },
+
+
+        marker={"type": "string", "description": "Substring match on the full marker path."},
+        kind={
+            "type": "string",
+            "enum": ["draw", "dispatch", "dispatch_rays", "execute_indirect"],
+            "description": "Restrict to one API call kind (the literal D3D12 API).",
+        },
+        effective_kind={
+            "type": "string",
+            "enum": ["draw", "dispatch", "dispatch_rays", "execute_indirect"],
+            "description": (
+                "Restrict by what the GPU actually runs. An ExecuteIndirect on a "
+                "DISPATCH_RAYS command signature has effective_kind=dispatch_rays, so "
+                "this is how raytracing work is found in a frame whose export has no "
+                "literal DispatchRays call. Use --kind for the raw API call name."
+            ),
+        },
+        pso_id={"type": "integer", "description": "Only draws using this pipeline state."},
+        uses_resource={"type": "integer", "description": "Only draws touching this resource id."},
+        shader_hash={"type": "string", "description": "Match a shader hash or PDB debug name."},
+        min_instances={"type": "integer", "description": "Minimum instance count."},
+        min_triangles={"type": "integer", "description": "Minimum triangle count."},
+        detail={"type": "boolean", "description": "Include full bound state per draw."},
+    ),
+    returns="Paged list of draw calls with counts of bound resources.",
+    examples=[
+        "pix-tool-set find-draw-calls --pass-name Lumen --limit 10",
+        "pix-tool-set find-draw-calls --global-id 5367",
+        "pix-tool-set find-draw-calls --queue-id 18704",
+        "pix-tool-set find-draw-calls --kind dispatch --min-triangles 0",
+        "pix-tool-set find-draw-calls --uses-resource 641 --detail",
+    ],
+    aliases=["search-draw-calls"],
+)
+def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    offset, limit = page_args(args)
+
+    # Either id names exactly one pass, so both take the "restrict to this pass"
+    # path; resolve_pass prefers global_id when both are given.
+    pass_selected = args.get("queue_id") is not None or args.get("global_id") is not None
+
+    if pass_selected:
+        # Resolve the id to one pass, then apply the remaining filters within it.
+        # Filtering by the pass's name would widen the result again, because names
+        # are not unique across the frame.
+        wanted = tuple(resolve_pass(capture, args)["marker_path"])
+        candidates, _ = capture.find_draw_calls(
+            kind=args.get("kind"),
+            pso_id=args.get("pso_id"),
+            uses_resource=args.get("uses_resource"),
+            shader_hash=args.get("shader_hash"),
+            min_instances=args.get("min_instances"),
+            min_triangles=args.get("min_triangles"),
+        )
+        matched = [d for d in candidates if d.marker_path == wanted]
+        total = len(matched)
+        window = matched[offset : offset + limit] if limit else matched[offset:]
+    else:
+        window, total = capture.find_draw_calls(
+            pass_name=args.get("pass_name"),
+            marker=args.get("marker"),
+            kind=args.get("kind"),
+            pso_id=args.get("pso_id"),
+            uses_resource=args.get("uses_resource"),
+            shader_hash=args.get("shader_hash"),
+            min_instances=args.get("min_instances"),
+            min_triangles=args.get("min_triangles"),
+            offset=offset,
+            limit=limit,
+        )
+
+    # effective_kind is a derived field the engine does not index, so it is applied
+    # as a post-filter here. It is the only way to list raytracing work: the export
+    # has no DispatchRays API calls, only ExecuteIndirect on a DISPATCH_RAYS
+    # signature, so --kind dispatch_rays returns nothing while --effective-kind
+    # dispatch_rays returns the two actions that actually trace rays.
+    eff = args.get("effective_kind")
+    if eff is not None:
+        # The engine paginates before this filter runs, so a page that contains no
+        # matching actions would report total=0 even though later pages have them.
+        # Re-run without pagination, filter, then apply the caller's page.
+        if pass_selected:
+            wanted = tuple(resolve_pass(capture, args)["marker_path"])
+            candidates, _ = capture.find_draw_calls(
+                kind=args.get("kind"),
+                pso_id=args.get("pso_id"),
+                uses_resource=args.get("uses_resource"),
+                shader_hash=args.get("shader_hash"),
+                min_instances=args.get("min_instances"),
+                min_triangles=args.get("min_triangles"),
+            )
+            all_matched = [d for d in candidates if d.marker_path == wanted]
+        else:
+            all_matched, _ = capture.find_draw_calls(
+                pass_name=args.get("pass_name"),
+                marker=args.get("marker"),
+                kind=args.get("kind"),
+                pso_id=args.get("pso_id"),
+                uses_resource=args.get("uses_resource"),
+                shader_hash=args.get("shader_hash"),
+                min_instances=args.get("min_instances"),
+                min_triangles=args.get("min_triangles"),
+            )
+        filtered = [d for d in all_matched if d.effective_kind.value == eff]
+        total = len(filtered)
+        window = filtered[offset : offset + limit] if limit else filtered[offset:]
+    detail = bool(args.get("detail"))
+    return ToolResult.success(
+        {
+            "draw_calls": [draw.to_dict(detail=detail) for draw in window],
+            **page_envelope(total, offset, limit, len(window)),
+        }
+    )
+
+
+@tool(
+    name="locate-event",
+    summary=(
+        "Locate an event in the frame: its ordinal position, marker path, containing pass, "
+        "neighbouring draws, and the exact generated C++ source line."
+    ),
+    category="events",
+    parameters=with_session(
+        DRAW_SELECTOR,
+        pass_name={
+            "type": "string",
+            "description": (
+                "Pass name as shown in the PIX GUI marker tree (substring match). Resolves "
+                "to the pass's first action, so a name read off the screen is enough to "
+                "start from even when the pass has no event list row."
+            ),
+        },
+        neighbours={
+            "type": "integer",
+            "description": "How many draws before and after to include. Default 3.",
+        },
+    ),
+    returns="Position within the frame plus surrounding context.",
+    examples=[
+        "pix-tool-set locate-event --queue-id 18461",
+        "pix-tool-set locate-event --draw-index 2461 --neighbours 5",
+        'pix-tool-set locate-event --pass-name "CompactTraces WaveOps"',
+    ],
+)
+def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+
+    # A pass name is what the user can actually read off the PIX GUI, and for a pass on
+    # an unexported queue it is the only thing they have: there is no Queue ID to copy and
+    # the draw index is precisely what they are trying to find out. Resolving it here
+    # closes that loop in one call instead of sending them through find-pass first.
+    matched_pass = None
+    if args.get("pass_name") and args.get("draw_index") is None and args.get("queue_id") is None:
+        needle = str(args["pass_name"]).lower()
+        candidates = [p for p in capture.passes if needle in p["name"].lower()]
+        if not candidates:
+            raise not_found(
+                "pass",
+                args["pass_name"],
+                "Run list-passes or find-pass to browse the marker tree.",
+            )
+        matched_pass = candidates[0]
+        args = {**args, "draw_index": matched_pass["first_draw_index"]}
+
+    # Go through draw_selector_args so the queue qualifiers are forwarded; picking the
+    # keys by hand here is what silently dropped them before.
+    draw = capture.resolve_draw(**draw_selector_args(args))
+    if draw is None:
+        # The id may name a marker rather than an action. Markers carry no Global ID at
+        # all, so a marker's Queue ID is the only way to name the pass row itself;
+        # answer with the marker and the pass it opens.
+        event = capture.resolve_event(queue_id=args.get("queue_id"))
+        if event is not None:
+            pass_entry = capture.find_pass_by_event(queue_id=event.queue_id)
+            result = ToolResult.success(
+                {
+                    "is_action": False,
+                    "event": event.to_dict(),
+                    "pass": (
+                        {
+                            "pass_index": pass_entry["pass_index"],
+                            "name": pass_entry["name"],
+                            **pass_identity(pass_entry),
+                            "marker_path": pass_entry["marker_path"],
+                            "first_draw_index": pass_entry["first_draw_index"],
+                        }
+                        if pass_entry
+                        else None
+                    ),
+                }
+            )
+            result.add_diagnostic(
+                "info",
+                "This id names a marker, not a draw. Use the pass's first_draw_index "
+                "for draw-level tools.",
+            )
+            return result
+
+        # The id may name a recorded command that is not an action: the canonical case is
+        # BuildRaytracingAccelerationStructure, which has a marker path, a generated
+        # source line and neighbouring draws -- exactly what this tool reports. Refusing
+        # it would deny an answer the export can perfectly well give, so degrade instead.
+        gid = args.get("global_id")
+        command = None
+        if gid is not None and hasattr(capture, "command_by_global_id"):
+            command = capture.command_by_global_id(int(gid))
+        if command is not None:
+            # command_by_global_id returns {api, source_file, source_line}; it has no
+            # marker path. Acceleration structure builds do carry one in the parsed
+            # AS records, so recover it from there when the id is a build.
+            marker_path: list[str] = []
+            as_build = None
+            for build in getattr(capture, "acceleration_structure_builds", []) or []:
+                if build.global_id is not None and int(build.global_id) == int(gid):
+                    as_build = build
+                    marker_path = list(build.marker_path or ())
+                    break
+            pass_entry = next(
+                (p for p in capture.passes if list(p["marker_path"]) == marker_path), None
+            ) if marker_path else None
+            nearest = [
+                d
+                for d in capture.draw_calls
+                if d.global_id is not None and d.global_id >= int(gid)
+            ]
+            following = nearest[0] if nearest else None
+            preceding_all = [
+                d
+                for d in capture.draw_calls
+                if d.global_id is not None and d.global_id <= int(gid)
+            ]
+            preceding = preceding_all[-1] if preceding_all else None
+            payload: dict[str, Any] = {
+                "is_action": False,
+                "command": {
+                    "global_id": int(gid),
+                    "api": command.get("api"),
+                    "marker_path": marker_path,
+                    "pass_name": marker_path[-1] if marker_path else None,
+                    "source": f"{command.get('source_file')}:{command.get('source_line')}",
+                },
+                "pass": (
+                    {
+                        "pass_index": pass_entry["pass_index"],
+                        "name": pass_entry["name"],
+                        **pass_identity(pass_entry),
+                        "marker_path": pass_entry["marker_path"],
+                        "first_draw_index": pass_entry["first_draw_index"],
+                    }
+                    if pass_entry
+                    else None
+                ),
+                "neighbouring_draws": {
+                    "preceding": (
+                        {
+                            "draw_index": preceding.index,
+                            "global_id": preceding.global_id,
+                            "api": preceding.api,
+                            "pass_name": preceding.marker_path[-1]
+                            if preceding.marker_path
+                            else None,
+                        }
+                        if preceding is not None
+                        else None
+                    ),
+                    "following": (
+                        {
+                            "draw_index": following.index,
+                            "global_id": following.global_id,
+                            "api": following.api,
+                            "pass_name": following.marker_path[-1]
+                            if following.marker_path
+                            else None,
+                        }
+                        if following is not None
+                        else None
+                    ),
+                },
+            }
+            if as_build is not None:
+                payload["acceleration_structure_build"] = {
+                    "type": getattr(as_build, "type", None),
+                    "instance_count": len(getattr(as_build, "instances", []) or []),
+                    "dest_resource_id": getattr(as_build, "dest_resource_id", None),
+                    "flags": list(getattr(as_build, "flags", []) or []),
+                }
+            result = ToolResult.partial(payload)
+            result.degrade(
+                f"Global ID {gid} is a {command.get('api')} command, not an action, so "
+                "there is no draw index, no position within the draw list and no counters.",
+                remedy=(
+                    "Marker path, generated source line and the surrounding draws are "
+                    "reported above. For acceleration structure builds specifically, "
+                    "analyze-acceleration-structures gives the full description."
+                ),
+            )
+            return result
+
+        # Delegate the miss so the two Queue ID failure modes are described in one place;
+        # a bare "not found" here would hide the row-order trap that makes a wrong id look
+        # like a right one elsewhere.
+        resolve_draw(capture, args, what="event")
+
+    span = int(args.get("neighbours") or 3)
+    lo = max(draw.index - span, 0)
+    hi = min(draw.index + span + 1, len(capture.draw_calls))
+    pass_entry = next(
+        (p for p in capture.passes if tuple(p["marker_path"]) == draw.marker_path), None
+    )
+
+    total_draws = len(capture.draw_calls)
+    data = {
+        "draw_index": draw.index,
+        "global_id": draw.global_id,
+        "api": draw.api,
+        "kind": draw.kind.value,
+        "queue_id": draw.queue_id,
+        "position": {
+            "draw_index": draw.index,
+            "total_draw_calls": total_draws,
+            "percent_through_frame": round(100.0 * draw.index / total_draws, 2)
+            if total_draws
+            else 0.0,
+        },
+        "marker_path": list(draw.marker_path),
+        "pass": pass_entry,
+        "source": {"file": draw.source_file, "line": draw.source_line},
+        "command_list_id": draw.command_list_id,
+        "neighbours": [
+            {
+                "draw_index": other.index,
+                "global_id": other.global_id,
+                "api": other.api,
+                "pass_name": other.pass_name,
+                "is_target": other.index == draw.index,
+            }
+            for other in capture.draw_calls[lo:hi]
+        ],
+    }
+    event = draw.event
+    if event is not None:
+        data["event"] = event.to_dict(detail=True)
+    result = ToolResult.success(data)
+    if matched_pass is not None:
+        result.add_diagnostic(
+            "info",
+            f"Matched pass {matched_pass['name']!r} (pass_index="
+            f"{matched_pass['pass_index']}) and located its first action; the pass spans "
+            f"draw indices {matched_pass['first_draw_index']}..{matched_pass['last_draw_index']}.",
+            pass_index=matched_pass["pass_index"],
+        )
+    note_missing_queue_id(result, draw, level="info")
+    return result
+
+
+@tool(
+    name="queue-attribution",
+    summary=(
+        "Which command queues the frame was submitted to, how many draws ran on each, "
+        "and which of those queues the exported event list actually covers."
+    ),
+    category="events",
+    parameters=with_session(
+        queue_name={
+            "type": "string",
+            "description": (
+                "Substring match on a queue name, e.g. 'Compute'. Also lists that queue's "
+                "draws, which is the only way to browse a queue with no event list."
+            ),
+        },
+        queue_object_id={
+            "type": "integer",
+            "description": "Same, by ID3D12CommandQueue ApiObjectId instead of name.",
+        },
+        limit={
+            "type": "integer",
+            "description": "Cap on listed draws when a queue is selected. Default 50.",
+        },
+    ),
+    returns="Per-queue submission and draw counts, event-list coverage, and optionally the draws on one queue.",
+    examples=[
+        "pix-tool-set queue-attribution",
+        "pix-tool-set queue-attribution --queue-name Compute --limit 10",
+    ],
+    notes=(
+        "Queue ownership is derived from the ExecuteCommandLists calls in the C++ export, "
+        "so it is known even for actions the event list omits. It does not recover their "
+        "Queue ID: that number is PIX's and is not reconstructible, so those actions stay "
+        "addressable by draw_index only."
+    ),
+)
+def queue_attribution(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    attribution = capture.queue_attribution
+
+    data: dict[str, Any] = dict(attribution)
+    queue_name = args.get("queue_name")
+    queue_object_id = args.get("queue_object_id")
+
+    if queue_name is not None or queue_object_id is not None:
+        limit = int(args.get("limit") or 50)
+        selected = capture.draws_on_queue(
+            queue_name=queue_name,
+            queue_object_id=None if queue_object_id is None else int(queue_object_id),
+        )
+        data["selected_queue"] = {
+            "queue_name": queue_name,
+            "queue_object_id": queue_object_id,
+            "draw_count": len(selected),
+            "draws_with_queue_id": sum(1 for d in selected if d.queue_id is not None),
+            "draws": [
+                {
+                    "draw_index": draw.index,
+                    "global_id": draw.global_id,
+                    "queue_id": draw.queue_id,
+                    "api": draw.api,
+                    "pass_name": draw.pass_name,
+                }
+                for draw in selected[:limit]
+            ],
+        }
+
+    result = ToolResult.success(data)
+    if not attribution["event_list_is_complete"]:
+        # Reported as a warning rather than folded into the payload because it is
+        # the reason a caller's Queue ID lookups can come back empty for real work,
+        # and that is easy to misread as the capture being incomplete.
+        uncovered = [
+            entry
+            for entry in attribution["queues"]
+            if entry.get("draw_count") and not entry.get("draws_with_queue_id")
+        ]
+        listed = ", ".join(
+            f"{entry.get('queue_name') or 'unnamed'} "
+            f"(object {entry['queue_object_id']}, {entry['draw_count']} draws)"
+            for entry in uncovered
+        )
+        result.add_diagnostic(
+            "warning",
+            f"The exported event list covers only some of the queues used this frame. "
+            f"Actions on {listed} have no Queue ID and must be selected by draw_index.",
+        )
+    if attribution["draws_without_queue_owner"]:
+        result.add_diagnostic(
+            "warning",
+            f"{attribution['draws_without_queue_owner']} draws could not be attributed to "
+            "a queue, which means a command list was submitted in a form this parser does "
+            "not recognise. Re-check RenderFrameWorker_*.cpp before trusting the counts.",
+        )
+    if attribution["ambiguous_command_lists"]:
+        result.add_diagnostic(
+            "warning",
+            "Some command lists were submitted to more than one queue, so the draws in "
+            "them have no single owner: "
+            f"{sorted(attribution['ambiguous_command_lists'])}",
+        )
+    return result
