@@ -77,6 +77,7 @@ def get_event_resource_tool(args: dict[str, Any], context: ToolContext) -> ToolR
             "global_id": {"type": "integer", "description": "Event Global ID used to resolve the bound resource."},
             "resource": {"type": "string", "description": "Resource selector: resource id, resource name, shader binding name, or display name such as RayTracing.LightGrid:RWLightGrid."},
             "descriptor_scan_count": {"type": "integer", "description": "Number of descriptors to inspect from each root descriptor table start."},
+            "pdb_search_paths": {"type": "array", "description": "Directories or files to search for shader PDBs when resolving shader binding names."},
             "output_path": {"type": "string", "description": "Optional JSON output path."},
             "auto_export": {"type": "boolean", "description": "Export C++ project with pixtool when missing."},
             "refresh": {"type": "boolean", "description": "Rebuild the index even if cache is valid."},
@@ -94,6 +95,7 @@ def get_resource_access_history_tool(args: dict[str, Any], context: ToolContext)
         args["global_id"],
         args["resource"],
         descriptor_scan_count=_optional_int(args.get("descriptor_scan_count"), DEFAULT_DESCRIPTOR_SCAN_COUNT),
+        pdb_search_paths=args.get("pdb_search_paths"),
         refresh=bool(args.get("refresh", False)),
     )
     filename = "access_history_" + str(args["global_id"]) + ".json"

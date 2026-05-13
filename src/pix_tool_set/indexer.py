@@ -8,7 +8,7 @@ from typing import Any
 
 from .errors import PixToolError
 
-INDEX_VERSION = 4
+INDEX_VERSION = 5
 SHADER_CALLS = {
     "Dispatch": "->Dispatch(",
     "DispatchIndirect": "->DispatchIndirect(",
@@ -335,6 +335,20 @@ def _parse_resource_names(files: list[Path]) -> dict[str, dict[str, Any]]:
     return resources
 
 
+def _build_resource_refs_by_resource_id(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    refs_by_resource_id: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        for ref in event.get("resource_refs", []):
+            text = str(ref.get("text") or "")
+            for match in re.finditer(r"GetResource\((\d+)\)", text):
+                refs_by_resource_id.setdefault(match.group(1), []).append({
+                    "global_id": event.get("global_id"),
+                    "line": ref.get("line"),
+                    "text": text,
+                })
+    return refs_by_resource_id
+
+
 def _descriptor_kind(call: str) -> str:
     if "UnorderedAccessView" in call:
         return "UAV"
@@ -417,6 +431,7 @@ def build_index(export_dir: str | Path, refresh: bool = False) -> dict[str, Any]
         "pso_index": _parse_pso_files(root),
         "descriptor_index": _parse_descriptors(descriptor_files),
         "resource_names": _parse_resource_names(resource_name_files),
+        "resource_refs_by_resource_id": _build_resource_refs_by_resource_id(events),
         "diagnostics": {"source_file_count": len(files), "event_count": len(events), "shader_event_count": len(shader_events)},
         "cache_hit": False,
     }

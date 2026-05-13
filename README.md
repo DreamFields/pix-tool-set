@@ -39,8 +39,10 @@ The CLI command name and MCP tool name are the same.
 ### Export a .wpix capture to a C++ project
 
 ```powershell
+# 默认导出到 PIX 文件同目录下的 frame\ 文件夹
 pix-tool-set export-to-cpp --capture-path "G:\captures\frame.wpix"
-pix-tool-set export-to-cpp --capture-path "G:\captures\frame.wpix" --export-dir "G:\exports\frame\cpp_export"
+# 指定导出目录
+pix-tool-set export-to-cpp --capture-path "G:\captures\frame.wpix" --export-dir "G:\captures\frame"
 pix-tool-set export-to-cpp --capture-path "G:\captures\frame.wpix" --force
 ```
 
@@ -49,11 +51,12 @@ pix-tool-set export-to-cpp --capture-path "G:\captures\frame.wpix" --force
 ### Analyze an exported C++ project
 
 ```powershell
-pix-tool-set check-cpp-export --export-dir "G:\exports\frame\cpp_export"
-pix-tool-set build-index --export-dir "G:\exports\frame\cpp_export"
-pix-tool-set extract-shader-events-tree --export-dir "G:\exports\frame\cpp_export" --output-path "G:\pix-tool-set\examples\shader_events_tree.json"
-pix-tool-set get-event-shader-source --export-dir "G:\exports\frame\cpp_export" --global-id 13 --output-path "G:\pix-tool-set\examples\shader_source_13.json"
-pix-tool-set get-event-resource-history --export-dir "G:\exports\frame\cpp_export" --global-id 13 --window 10
+# 默认导出目录与 PIX 文件同路径，以 PIX 文件名作为文件夹名
+pix-tool-set check-cpp-export --export-dir "G:\captures\frame"
+pix-tool-set build-index --export-dir "G:\captures\frame"
+pix-tool-set extract-shader-events-tree --export-dir "G:\captures\frame" --output-path "G:\pix-tool-set\examples\shader_events_tree.json"
+pix-tool-set get-event-shader-source --export-dir "G:\captures\frame" --global-id 13 --output-path "G:\pix-tool-set\examples\shader_source_13.json"
+pix-tool-set get-event-resource-history --export-dir "G:\captures\frame" --global-id 13 --window 10
 ```
 
 ## Documentation
@@ -199,7 +202,7 @@ Attach the debugger to port `5678`. Use `--wait-for-client` only when debugging 
 4. Test the same handler through CLI first, for example:
 
    ```powershell
-   pix-tool-set run <tool-name> --json-args '{"export_dir":"G:\\exports\\frame\\cpp_export"}'
+   pix-tool-set run <tool-name> --json-args '{"export_dir":"G:\\captures\\frame"}'
    ```
 
 5. Test the MCP call through MCP Inspector with the same arguments.
@@ -225,10 +228,12 @@ There are two ways to obtain a C++ export:
 1. **Standalone `export-to-cpp` tool** — Explicitly export a `.wpix` capture file to a C++ project directory. This is the recommended entry point: call `export-to-cpp` first, then pass the resulting `export_dir` to analysis tools.
 
    ```powershell
-   pix-tool-set export-to-cpp --capture-path "G:\captures\frame.wpix"
-   ```
+pix-tool-set export-to-cpp --capture-path "G:\captures\frame.wpix"
+  ```
 
-   The tool validates the `.wpix` extension, locates `pixtool.exe`, runs the export, and verifies the output. If the target directory already contains a valid export it skips re-exporting unless `--force` is given.
+  By default, the C++ export is created in the same directory as the `.wpix` file, using the PIX file name (without extension) as the folder name. For example, `G:\\captures\\frame.wpix` will be exported to `G:\\captures\\frame\\`.
+
+  The tool validates the `.wpix` extension, locates `pixtool.exe`, runs the export, and verifies the output. If the target directory already contains a valid export it skips re-exporting unless `--force` is given.
 
 2. **Automatic export inside capture-dependent tools** — Every capture-dependent tool also accepts `export_dir` and optional `capture_path` / `auto_export` arguments as a fallback.
 

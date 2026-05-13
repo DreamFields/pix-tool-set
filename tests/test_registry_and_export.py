@@ -75,8 +75,10 @@ def test_resource_access_history_accepts_nullable_descriptor_scan_count(tmp_path
         resource: str,
         *,
         descriptor_scan_count: int = 8,
+        pdb_search_paths: list[str] | None = None,
         refresh: bool = False,
     ) -> dict:
+        assert pdb_search_paths is None
         assert export_dir == "export"
         assert global_id == 1590
         assert resource == "RayTracing.LightGrid:RWLightGrid"
@@ -119,6 +121,93 @@ def test_resource_access_history_accepts_nullable_descriptor_scan_count(tmp_path
     assert result.data["resource"] == "RayTracing.LightGrid:RWLightGrid"
     assert result.data["resource_id"] == "839"
     assert result.data["access_count"] == 1
+
+
+def test_resource_access_history_tracks_same_named_resource_aliases_and_shader_reads(monkeypatch) -> None:
+    def make_event(global_id: str, name: str, line: int, refs: list[str] | None = None, descriptor_index: str | None = None) -> dict:
+        event = {
+            "global_id": global_id,
+            "name": name,
+            "event_type": "Dispatch" if descriptor_index is not None else "PIXBeginEvent",
+            "is_shader_event": descriptor_index is not None,
+            "shader_stage_group": "compute" if descriptor_index is not None else None,
+            "file": "CommandLists_000.cpp",
+            "line": line,
+            "root_descriptor_tables": {},
+            "root_constant_buffer_views": {},
+            "resource_refs": [{"line": line + offset, "text": text} for offset, text in enumerate(refs or [])],
+        }
+        if descriptor_index is not None:
+            event["root_descriptor_tables"] = {
+                "0": {"stage": "Compute", "root_index": "0", "heap_id": "1", "descriptor_index": descriptor_index, "line": line}
+            }
+        return event
+
+    events = [
+        make_event("1164", "ReduceHZB(mips=[0;3] Closest Furthest) 1024x512", 100, ["Use(a, b, c, d, e, f, GetResource(6955).Get())"]),
+        make_event("1181", "ReduceHZB(mips=[0;3] Closest Furthest) 1024x512", 110, ["GetCommandList(1)->DiscardResource(GetResource(6955).Get(), nullptr);"]),
+        make_event("1259", "ClearBuffer(NumCulledLightsGrid Size=146432bytes)", 120, ["GetCommandList(1)->ClearUnorderedAccessViewUint(a, b, GetResource(97).Get(), values, 0, nullptr);"]),
+        make_event("1263", "LightGridInject LinkedList SingleThread", 130, descriptor_index="4000"),
+        make_event("1275", "LightGridFeedbackStatus", 140, ["Barrier(a, b, GetResource(6955).Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);"]),
+        make_event("1931", "PruneLightGrid(Min=0,Max=2)", 150, descriptor_index="4099"),
+        make_event("1939", "GeneratePageFlagsFromPixels(GBuffer,NumShadowMaps=12,(88,51))", 160, descriptor_index="4200"),
+        make_event("3412", "VirtualShadowMapProjection(Input:GBuffer)", 170, descriptor_index="4300"),
+        make_event("3419", "Light::StandardDeferred: PointLight", 180, descriptor_index="4400"),
+        make_event("3424", "Light::StandardDeferred: RectLight", 190, descriptor_index="4500"),
+        make_event("3867", "ClearBuffer(VirtualTexture.CompactedFeedback Size=8192bytes)", 200, ["Barrier(a, b, c, GetResource(6955).Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);"]),
+        make_event("5000", "UnrelatedCompute", 210, descriptor_index="9000"),
+    ]
+    fake_index = {
+        "events": events,
+        "events_by_global_id": {event["global_id"]: event for event in events},
+        "descriptor_index": {
+            "4000": [{"descriptor_index": "4000", "heap_id": "1", "resource_id": "887", "view_type": "UAV", "call": "CreateUnorderedAccessView_Buffer", "line": 129}],
+            "4100": [{"descriptor_index": "4100", "heap_id": "1", "resource_id": "1446", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer", "line": 149}],
+            "4205": [{"descriptor_index": "4205", "heap_id": "1", "resource_id": "1446", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer", "line": 159}],
+            "4306": [{"descriptor_index": "4306", "heap_id": "1", "resource_id": "1446", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer", "line": 169}],
+            "4412": [{"descriptor_index": "4412", "heap_id": "1", "resource_id": "1446", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer", "line": 179}],
+            "4514": [{"descriptor_index": "4514", "heap_id": "1", "resource_id": "1446", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer", "line": 189}],
+            "9000": [{"descriptor_index": "9000", "heap_id": "1", "resource_id": "7777", "view_type": "UAV", "call": "CreateUnorderedAccessView_Buffer", "line": 209}],
+        },
+        "resource_refs_by_resource_id": {
+            "97": [{"global_id": "1259", "line": 120, "text": "GetCommandList(1)->ClearUnorderedAccessViewUint(a, b, GetResource(97).Get(), values, 0, nullptr);"}],
+            "6955": [
+                {"global_id": "1164", "line": 100, "text": "Use(a, b, c, d, e, f, GetResource(6955).Get())"},
+                {"global_id": "1181", "line": 110, "text": "GetCommandList(1)->DiscardResource(GetResource(6955).Get(), nullptr);"},
+                {"global_id": "1275", "line": 140, "text": "Barrier(a, b, GetResource(6955).Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);"},
+                {"global_id": "3867", "line": 200, "text": "Barrier(a, b, c, GetResource(6955).Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);"},
+            ],
+        },
+        "resource_names": {
+            "97": {"name": "NumCulledLightsGrid"},
+            "887": {"name": "NumCulledLightsGrid"},
+            "1446": {"name": "NumCulledLightsGrid"},
+            "6955": {"name": "NumCulledLightsGrid"},
+        },
+        "cache_hit": False,
+    }
+
+    shader_source_calls: list[str] = []
+
+    def fake_get_event_shader_source(export_dir, global_id, pdb_search_paths=None, refresh=False):
+        shader_source_calls.append(str(global_id))
+        return {
+            "stages": [{"resolver_result": {"result": {"sources": [{"content": "RWStructuredBuffer<uint> RWNumCulledLightsGrid;\nBuffer<uint> NumCulledLightsGrid;"}]}}}]
+        }
+
+    monkeypatch.setattr(resource_history, "build_index", lambda export_dir, refresh=False: fake_index)
+    monkeypatch.setattr(resource_history, "get_event_shader_source", fake_get_event_shader_source)
+
+    result = resource_history.get_resource_access_history("export", 1263, "NumCulledLightsGrid", pdb_search_paths=["shader.pdb"])
+
+    assert [row["global_id"] for row in result["access_history"]] == ["1164", "1181", "1259", "1263", "1275", "1931", "1939", "3412", "3419", "3424", "3867"]
+    assert [row["resource_id"] for row in result["access_history"]] == ["6955", "6955", "97", "887", "6955", "1446", "1446", "1446", "1446", "1446", "6955"]
+    assert [row["binding"] for row in result["access_history"]] == ["API Parameters [6]", "API Parameters [0]", "OM [None]", "CS UAV 0", "API Parameters [2]", "CS SRV 1", "CS SRV 5", "CS SRV 6", "CS SRV 12", "CS SRV 14", "API Parameters [3]"]
+    assert "5000" not in shader_source_calls
+    assert result["diagnostics"]["resource_ref_index_hit"] is True
+    assert result["diagnostics"]["shader_event_candidate_count"] == 6
+    assert result["access_history"][3]["states"] == "STATE_COMMON"
+    assert result["access_history"][5]["read_write"] == "Read"
 
 
 def test_get_event_resource_uses_shader_declared_bindings(monkeypatch) -> None:

@@ -33,8 +33,11 @@ class CppExportInfo:
 
 
 def default_export_dir(capture_path: Path, workspace: Path) -> Path:
-    safe_name = capture_path.stem if capture_path else "capture"
-    return workspace / "exports" / safe_name / "cpp_export"
+    """Default export directory: same path as PIX file, using PIX filename as folder name"""
+    if capture_path is None:
+        return workspace / "exports" / "capture"
+    # Export directory is in the same path as the PIX file, using PIX filename (without extension) as folder name
+    return capture_path.parent / capture_path.stem
 
 
 def find_pixtool(explicit_path: str | None = None) -> Path | None:
