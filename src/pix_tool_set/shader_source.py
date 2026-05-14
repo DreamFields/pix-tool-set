@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .capture_db import load_shader_source_cache, store_shader_source_cache
 from .errors import PixToolError
 from .indexer import build_index
 from .shader_extractor import extract_debug_name_from_shader_blob, extract_shader_blobs
@@ -188,6 +189,28 @@ def get_event_shader_source(
 
     search_paths = pdb_search_paths or [str(Path(export_dir).resolve())]
     export_root = Path(export_dir).resolve()
+    database_path = index.get("database_path")
+    if database_path and not refresh:
+        try:
+            cached_stages = load_shader_source_cache(database_path, event.get("pso_id"))
+        except Exception:
+            cached_stages = []
+        if cached_stages:
+            return {
+                "event": event,
+                "pso_id": event.get("pso_id"),
+                "stages": cached_stages,
+                "diagnostics": {
+                    "cache_hit": index.get("cache_hit", False),
+                    "database_hit": True,
+                    "database_path": database_path,
+                    "query_mode": "sqlite",
+                    "pdb_search_paths": search_paths,
+                    "resolver_path": None,
+                    "shader_extraction": {"status": "not_needed", "reason": "shader source was loaded from capture database"},
+                },
+            }
+
     stages, extraction = _ensure_stage_blobs(export_root, index, event)
     resolved: list[dict[str, Any]] = []
     resolver = Path(resolver_path).resolve() if resolver_path else _in_repo_resolver_path()
@@ -207,12 +230,21 @@ def get_event_shader_source(
             }
         resolved.append(item)
 
+    if database_path:
+        try:
+            store_shader_source_cache(database_path, event.get("pso_id"), resolved)
+        except Exception:
+            pass
+
     return {
         "event": event,
         "pso_id": event.get("pso_id"),
         "stages": resolved,
         "diagnostics": {
             "cache_hit": index.get("cache_hit", False),
+            "database_hit": False,
+            "database_path": database_path,
+            "query_mode": "resolver",
             "pdb_search_paths": search_paths,
             "resolver_path": str(resolver) if resolver else None,
             "shader_extraction": extraction,

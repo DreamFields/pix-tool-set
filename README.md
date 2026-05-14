@@ -56,8 +56,49 @@ pix-tool-set check-cpp-export --export-dir "G:\captures\frame"
 pix-tool-set build-index --export-dir "G:\captures\frame"
 pix-tool-set extract-shader-events-tree --export-dir "G:\captures\frame" --output-path "G:\pix-tool-set\examples\shader_events_tree.json"
 pix-tool-set get-event-shader-source --export-dir "G:\captures\frame" --global-id 13 --output-path "G:\pix-tool-set\examples\shader_source_13.json"
-pix-tool-set get-event-resource-history --export-dir "G:\captures\frame" --global-id 13 --window 10
+pix-tool-set get-event-resource --export-dir "G:\captures\frame" --global-id 13
+pix-tool-set get-resource-access-history --export-dir "G:\captures\frame" --global-id 13 --resource "MyResource"
 ```
+
+### Capture database index
+
+`build-index` 会在 C++ 导出目录下生成两份缓存：
+
+- `G:\captures\frame\.cache\pix-tool-set\index.json`：兼容旧流程的 JSON 索引。
+- `G:\captures\frame\.cache\pix-tool-set\capture.sqlite`：用于快速查询事件、资源、descriptor 写入、root binding、资源访问历史和 shader source 缓存的 SQLite 数据库。
+
+常用流程：
+
+```powershell
+# 首次构建 JSON 索引和 SQLite 捕获数据库
+pix-tool-set build-index --export-dir "G:\captures\frame"
+
+# C++ 导出内容变化后，强制重建索引和数据库
+pix-tool-set build-index --export-dir "G:\captures\frame" --refresh
+
+# 查询事件当前绑定资源；默认优先使用 capture.sqlite，必要时回退到 C++ 扫描
+pix-tool-set get-event-resource --export-dir "G:\captures\frame" --global-id 13
+
+# 如果需要解析 shader binding 名称，可提供 PDB 搜索路径；解析结果会写回 capture.sqlite 供后续复用
+pix-tool-set get-event-resource --export-dir "G:\captures\frame" --global-id 13 --pdb-search-paths "G:\captures\frame\pdb"
+
+# 查询某个资源的访问历史；resource 可使用资源 ID、资源名、shader binding 名或 display name
+pix-tool-set get-resource-access-history --export-dir "G:\captures\frame" --global-id 13 --resource "MyResource"
+
+# 查询 shader source；成功解析到的 source 会缓存到 capture.sqlite
+pix-tool-set get-event-shader-source --export-dir "G:\captures\frame" --global-id 13 --pdb-search-paths "G:\captures\frame\pdb"
+```
+
+相关工具的 `diagnostics` 中会包含数据库状态字段：
+
+- `database_path`：当前使用的 SQLite 数据库路径。
+- `database_cache_hit`：`build-index` 是否复用了已有数据库。
+- `database_table_counts`：数据库内各核心表的行数。
+- `database_hit`：查询是否直接命中数据库。
+- `query_mode`：查询路径，例如 `sqlite`、`fallback_scan` 或 `resolver`。
+- `fallback_reason`：未命中数据库时的回退原因。
+
+如果需要丢弃缓存并重新分析，使用对应工具的 `--refresh` 参数即可。
 
 ## Documentation
 

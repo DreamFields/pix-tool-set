@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .capture_db import build_capture_database, database_path
 from .errors import PixToolError
 
 INDEX_VERSION = 5
@@ -404,6 +405,21 @@ def _parse_pso_files(export_dir: Path) -> dict[str, Any]:
     return pso_index
 
 
+def _attach_database_info(root: Path, payload: dict[str, Any], refresh: bool) -> dict[str, Any]:
+    database = build_capture_database(root, payload, refresh=refresh)
+    payload["database_path"] = database["database_path"]
+    payload["database_cache_hit"] = database.get("cache_hit", False)
+    payload["database_schema_version"] = database.get("schema_version")
+    payload["database_table_counts"] = database.get("table_counts", {})
+    diagnostics = dict(payload.get("diagnostics") or {})
+    diagnostics["database"] = database.get("diagnostics", {})
+    diagnostics["database_path"] = database["database_path"]
+    diagnostics["database_cache_hit"] = database.get("cache_hit", False)
+    diagnostics["database_table_counts"] = database.get("table_counts", {})
+    payload["diagnostics"] = diagnostics
+    return payload
+
+
 def build_index(export_dir: str | Path, refresh: bool = False) -> dict[str, Any]:
     root = Path(export_dir).resolve()
     if not root.exists():
@@ -414,7 +430,7 @@ def build_index(export_dir: str | Path, refresh: bool = False) -> dict[str, Any]
         cached = _load_cached(root, fingerprints)
         if cached is not None:
             cached["cache_hit"] = True
-            return cached
+            return _attach_database_info(root, cached, refresh=False)
     command_files = [path for path in files if path.name.startswith("CommandLists")]
     descriptor_files = [path for path in files if path.name.startswith("Descriptors") or path.name.startswith("ModifyDescriptors")]
     resource_name_files = [path for path in files if path.name.startswith("FrameResources")]
@@ -435,5 +451,6 @@ def build_index(export_dir: str | Path, refresh: bool = False) -> dict[str, Any]
         "diagnostics": {"source_file_count": len(files), "event_count": len(events), "shader_event_count": len(shader_events)},
         "cache_hit": False,
     }
+    payload = _attach_database_info(root, payload, refresh=True)
     _write_cached(root, payload)
     return payload

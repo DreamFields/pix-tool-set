@@ -42,15 +42,25 @@ def check_cpp_export(args: dict[str, Any], context: ToolContext) -> ToolResult:
     requires_cpp_export=True,
 )
 def build_export_index(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    from pathlib import Path
+
     from pix_tool_set.indexer import build_index
 
     index = build_index(args["export_dir"], refresh=bool(args.get("refresh", False)))
+    index_path = Path(args["export_dir"]) / ".cache" / "pix-tool-set" / "index.json"
+    output_paths = [str(index_path)]
+    if index.get("database_path"):
+        output_paths.append(str(index["database_path"]))
     return ToolResult.success(
         {
             "export_dir": index["export_dir"],
             "cache_hit": index.get("cache_hit", False),
             "diagnostics": index["diagnostics"],
-            "index_path": str(__import__("pathlib").Path(args["export_dir"]) / ".cache" / "pix-tool-set" / "index.json"),
+            "index_path": str(index_path),
+            "database_path": index.get("database_path"),
+            "database_cache_hit": index.get("database_cache_hit", False),
+            "database_schema_version": index.get("database_schema_version"),
+            "database_table_counts": index.get("database_table_counts", {}),
         },
-        output_paths=[str(__import__("pathlib").Path(args["export_dir"]) / ".cache" / "pix-tool-set" / "index.json")],
+        output_paths=output_paths,
     )

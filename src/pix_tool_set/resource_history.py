@@ -4,6 +4,13 @@ from pathlib import Path
 from typing import Any
 import re
 
+from .capture_db import (
+    load_event_bound_resources,
+    load_resource_references,
+    load_resource_shader_accesses,
+    load_same_named_resource_ids,
+    replace_event_bound_resources,
+)
 from .errors import PixToolError
 from .indexer import build_index
 from .shader_source import get_event_shader_source
@@ -1002,6 +1009,71 @@ def _dedupe_access_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return deduped
 
 
+def _database_path_from_index(index: dict[str, Any]) -> str | None:
+    database_path = index.get("database_path")
+    return str(database_path) if database_path else None
+
+
+def _database_event_resources(index: dict[str, Any], global_id: int | str, pdb_search_paths: list[str] | None, refresh: bool) -> tuple[list[dict[str, Any]], str | None]:
+    database_path = _database_path_from_index(index)
+    if refresh or not database_path:
+        return [], "database unavailable" if not database_path else "refresh requested"
+    try:
+        resources = load_event_bound_resources(database_path, global_id)
+    except Exception as exc:
+        return [], str(exc)
+    if not resources:
+        return [], "no event-bound resources in database"
+    has_runtime_resolved = any(str(resource.get("database_source") or resource.get("source") or "") == "runtime_resolved" for resource in resources)
+    if pdb_search_paths and not has_runtime_resolved:
+        return [], "database only has precomputed bindings without shader declaration names"
+    return resources, None
+
+
+def _event_order(index: dict[str, Any], global_id: int | str) -> int:
+    for position, event in enumerate(index.get("events", [])):
+        if str(event.get("global_id")) == str(global_id):
+            return position
+    return -1
+
+
+def _cache_event_resources(index: dict[str, Any], global_id: int | str, resources: list[dict[str, Any]]) -> None:
+    database_path = _database_path_from_index(index)
+    if not database_path or not resources:
+        return
+    event_order = _event_order(index, global_id)
+    cached_resources = [dict(resource, global_id=str(global_id), event_order=event_order, source="runtime_resolved", confidence=1.0) for resource in resources]
+    try:
+        replace_event_bound_resources(database_path, global_id, cached_resources)
+    except Exception:
+        return
+
+
+def _resource_diagnostics(
+    index: dict[str, Any],
+    event: dict[str, Any],
+    descriptor_scan_count: int,
+    bound_resources: list[dict[str, Any]],
+    shader_binding_counts: dict[str, Any],
+    *,
+    database_hit: bool,
+    query_mode: str,
+    fallback_reason: str | None = None,
+) -> dict[str, Any]:
+    database_path = _database_path_from_index(index)
+    return {
+        "cache_hit": index.get("cache_hit", False),
+        "descriptor_scan_count": max(1, descriptor_scan_count),
+        "root_descriptor_table_count": len(event.get("root_descriptor_tables", {})),
+        "shader_binding_counts": shader_binding_counts,
+        "database_hit": database_hit,
+        "database_path": database_path,
+        "query_mode": query_mode,
+        "fallback_reason": fallback_reason,
+        "reason": None if bound_resources else "No bound descriptor resources were resolved for the event.",
+    }
+
+
 def _get_event_resource_from_index(
     index: dict[str, Any],
     export_dir: str | Path,
@@ -1013,30 +1085,56 @@ def _get_event_resource_from_index(
     stage: str,
 ) -> dict[str, Any]:
     event = _get_event(index, global_id, stage)
-    shader_bindings_by_stage = _resolve_shader_bindings_by_stage(export_dir, global_id, pdb_search_paths, refresh)
-    if event.get("shader_stage_group") == "graphics_or_indirect" and shader_bindings_by_stage:
+    database_resources, database_miss_reason = _database_event_resources(index, global_id, pdb_search_paths, refresh)
+    if database_resources:
+        return {
+            "status": "success",
+            "event": event,
+            "resources": database_resources,
+            "diagnostics": _resource_diagnostics(
+                index,
+                event,
+                descriptor_scan_count,
+                database_resources,
+                {},
+                database_hit=True,
+                query_mode="sqlite",
+            ),
+        }
+
+    if event.get("shader_stage_group") == "graphics_or_indirect":
+        shader_bindings_by_stage = _resolve_shader_bindings_by_stage(export_dir, global_id, pdb_search_paths, refresh)
+    else:
+        shader_bindings_by_stage = {}
+    if shader_bindings_by_stage:
         shader_bindings = {"CBV": [], "SRV": [], "UAV": [], "Sampler": []}
         bound_resources = [
             *_resolve_input_assembler_resources(index, event),
             *_resolve_graphics_shader_resources(index, event, shader_bindings_by_stage, descriptor_scan_count=max(1, descriptor_scan_count)),
             *_resolve_output_merger_resources(index, event),
         ]
+        shader_binding_counts: dict[str, Any] = {stage: {key: len(value) for key, value in bindings.items()} for stage, bindings in shader_bindings_by_stage.items()}
     else:
         shader_bindings = _resolve_shader_bindings(export_dir, global_id, pdb_search_paths, refresh)
         bound_resources = _resolve_shader_declared_resources(index, event, shader_bindings, descriptor_scan_count=max(1, descriptor_scan_count))
+        shader_binding_counts = {key: len(value) for key, value in shader_bindings.items()}
     if not bound_resources:
         bound_resources = _resolve_bound_resources(index, event, descriptor_scan_count=max(1, descriptor_scan_count))
+    _cache_event_resources(index, global_id, bound_resources)
     return {
         "status": "success" if bound_resources else "partial",
         "event": event,
         "resources": bound_resources,
-        "diagnostics": {
-            "cache_hit": index.get("cache_hit", False),
-            "descriptor_scan_count": max(1, descriptor_scan_count),
-            "root_descriptor_table_count": len(event.get("root_descriptor_tables", {})),
-            "shader_binding_counts": {stage: {key: len(value) for key, value in bindings.items()} for stage, bindings in shader_bindings_by_stage.items()} if event.get("shader_stage_group") == "graphics_or_indirect" and shader_bindings_by_stage else {key: len(value) for key, value in shader_bindings.items()},
-            "reason": None if bound_resources else "No bound descriptor resources were resolved for the event.",
-        },
+        "diagnostics": _resource_diagnostics(
+            index,
+            event,
+            descriptor_scan_count,
+            bound_resources,
+            shader_binding_counts,
+            database_hit=False,
+            query_mode="fallback_scan",
+            fallback_reason=database_miss_reason,
+        ),
     }
 
 
@@ -1059,15 +1157,15 @@ def get_event_resource(
     )
 
 
-def get_resource_access_history(
+def _resource_access_history_from_index(
+    index: dict[str, Any],
     export_dir: str | Path,
     global_id: int | str,
     resource: str | int,
-    descriptor_scan_count: int = DEFAULT_DESCRIPTOR_SCAN_COUNT,
-    pdb_search_paths: list[str] | None = None,
-    refresh: bool = False,
+    descriptor_scan_count: int,
+    pdb_search_paths: list[str] | None,
+    refresh: bool,
 ) -> dict[str, Any]:
-    index = build_index(export_dir, refresh=refresh)
     events = index["events"]
     events_by_global_id = index.get("events_by_global_id", {})
     event = _get_event(index, global_id, "resource_access_history")
@@ -1092,95 +1190,153 @@ def get_resource_access_history(
             if coarse_error.code == "resource_not_bound":
                 raise resolved_error from coarse_error
             raise
-    history_resource_ids = _same_named_resource_ids(index, target)
+
+    database_path = _database_path_from_index(index)
+    if database_path and not refresh:
+        history_resource_ids = load_same_named_resource_ids(database_path, target.get("resource_name"), target.get("resource_id"))
+    else:
+        history_resource_ids = _same_named_resource_ids(index, target)
 
     rows: list[dict[str, Any]] = []
-    refs_by_resource_id = index.get("resource_refs_by_resource_id", {})
     event_positions = {str(item.get("global_id")): position for position, item in enumerate(events)}
-    if refs_by_resource_id:
-        indexed_refs: list[tuple[int, int, str, dict[str, Any]]] = []
-        for resource_id in history_resource_ids:
-            for ref in refs_by_resource_id.get(str(resource_id), []):
-                event_position = event_positions.get(str(ref.get("global_id")))
-                if event_position is None:
+    database_hit = False
+    database_fallback_reason: str | None = None
+    resource_ref_index_hit = False
+    shader_event_candidates: list[dict[str, Any]] = []
+    shader_events_scanned = 0
+
+    if database_path and not refresh:
+        try:
+            database_refs = load_resource_references(database_path, history_resource_ids)
+            database_shader_accesses = load_resource_shader_accesses(database_path, history_resource_ids)
+            database_hit = True
+            resource_ref_index_hit = True
+            for ref in database_refs:
+                item = ref.get("event") or events_by_global_id.get(str(ref.get("global_id")))
+                if item is None:
                     continue
-                line = int(ref.get("line") or 0)
-                indexed_refs.append((event_position, line, str(resource_id), ref))
-        for _, _, resource_id, ref in sorted(indexed_refs, key=lambda item: (item[0], item[1])):
-            item = events_by_global_id.get(str(ref.get("global_id")))
-            if item is None:
-                continue
-            text = str(ref.get("text") or "")
-            row_target = _access_row_target_for_resource_id(index, target, resource_id)
-            rows.append(
-                _make_access_row(
-                    item,
-                    row_target,
-                    binding=_binding_for_resource_ref(text, resource_id),
-                    read_write=_read_write_for_text(text, resource_id),
-                    states=_states_for_text(text, resource_id, "STATE_COMMON"),
-                    resource_ref=ref,
-                )
-            )
-    else:
-        for item in events:
-            for ref in item.get("resource_refs", []):
+                resource_id = str(ref.get("resource_id"))
                 text = str(ref.get("text") or "")
-                ids = {match.group(1) for match in RESOURCE_ID_RE.finditer(text)}
-                matched_resource_id = _first_matching_resource_id(history_resource_ids, ids)
-                if matched_resource_id is None:
-                    continue
-                row_target = _access_row_target_for_resource_id(index, target, matched_resource_id)
+                row_target = _access_row_target_for_resource_id(index, target, resource_id)
                 rows.append(
                     _make_access_row(
                         item,
                         row_target,
-                        binding=_binding_for_resource_ref(text, matched_resource_id),
-                        read_write=_read_write_for_text(text, matched_resource_id),
-                        states=_states_for_text(text, matched_resource_id, "STATE_COMMON"),
+                        binding=_binding_for_resource_ref(text, resource_id),
+                        read_write=_read_write_for_text(text, resource_id),
+                        states=_states_for_text(text, resource_id, "STATE_COMMON"),
                         resource_ref=ref,
                     )
                 )
-
-    shader_event_candidates: list[dict[str, Any]] = []
-    coarse_resources_by_global_id: dict[str, list[dict[str, Any]]] = {}
-    for item in events:
-        if not item.get("is_shader_event"):
-            continue
-        if str(item.get("global_id")) == str(global_id):
-            shader_event_candidates.append(item)
-            coarse_resources_by_global_id[str(item.get("global_id"))] = event_resources
-            continue
-        coarse_resources = _resolve_bound_resources(index, item, descriptor_scan_count=descriptor_scan_count)
-        matching_resources = [
-            bound_resource
-            for bound_resource in coarse_resources
-            if str(bound_resource.get("resource_id") or "") in history_resource_ids
-            and bound_resource.get("view_type") in {"SRV", "UAV"}
-        ]
-        if matching_resources:
-            shader_event_candidates.append(item)
-            coarse_resources_by_global_id[str(item.get("global_id"))] = matching_resources
-
-    shader_events_scanned = 0
-    for item in shader_event_candidates:
-        shader_events_scanned += 1
-        item_resources = coarse_resources_by_global_id.get(str(item.get("global_id")), [])
-        for bound_resource in item_resources:
-            if str(bound_resource.get("resource_id") or "") not in history_resource_ids:
-                continue
-            if bound_resource.get("view_type") not in {"SRV", "UAV"}:
-                continue
-            rows.append(
-                _make_access_row(
-                    item,
-                    bound_resource,
-                    binding=_shader_binding(bound_resource),
-                    read_write=_read_write_for_text("", str(bound_resource.get("resource_id")), bound_resource.get("view_type")),
-                    states=_shader_state(bound_resource),
+            for access in database_shader_accesses:
+                item = access.get("event") or {}
+                bound_resource = access.get("resource") or {}
+                if str(bound_resource.get("resource_id") or "") not in history_resource_ids:
+                    continue
+                if bound_resource.get("view_type") not in {"SRV", "UAV"}:
+                    continue
+                shader_event_candidates.append(item)
+                rows.append(
+                    _make_access_row(
+                        item,
+                        bound_resource,
+                        binding=_shader_binding(bound_resource),
+                        read_write=_read_write_for_text("", str(bound_resource.get("resource_id")), bound_resource.get("view_type")),
+                        states=_shader_state(bound_resource),
+                    )
                 )
-            )
+        except Exception as exc:
+            database_hit = False
+            database_fallback_reason = str(exc)
+            rows = []
+            shader_event_candidates = []
 
+    if not database_hit:
+        refs_by_resource_id = index.get("resource_refs_by_resource_id", {})
+        resource_ref_index_hit = bool(refs_by_resource_id)
+        if refs_by_resource_id:
+            indexed_refs: list[tuple[int, int, str, dict[str, Any]]] = []
+            for resource_id in history_resource_ids:
+                for ref in refs_by_resource_id.get(str(resource_id), []):
+                    event_position = event_positions.get(str(ref.get("global_id")))
+                    if event_position is None:
+                        continue
+                    line = int(ref.get("line") or 0)
+                    indexed_refs.append((event_position, line, str(resource_id), ref))
+            for _, _, resource_id, ref in sorted(indexed_refs, key=lambda item: (item[0], item[1])):
+                item = events_by_global_id.get(str(ref.get("global_id")))
+                if item is None:
+                    continue
+                text = str(ref.get("text") or "")
+                row_target = _access_row_target_for_resource_id(index, target, resource_id)
+                rows.append(
+                    _make_access_row(
+                        item,
+                        row_target,
+                        binding=_binding_for_resource_ref(text, resource_id),
+                        read_write=_read_write_for_text(text, resource_id),
+                        states=_states_for_text(text, resource_id, "STATE_COMMON"),
+                        resource_ref=ref,
+                    )
+                )
+        else:
+            for item in events:
+                for ref in item.get("resource_refs", []):
+                    text = str(ref.get("text") or "")
+                    ids = {match.group(1) for match in RESOURCE_ID_RE.finditer(text)}
+                    matched_resource_id = _first_matching_resource_id(history_resource_ids, ids)
+                    if matched_resource_id is None:
+                        continue
+                    row_target = _access_row_target_for_resource_id(index, target, matched_resource_id)
+                    rows.append(
+                        _make_access_row(
+                            item,
+                            row_target,
+                            binding=_binding_for_resource_ref(text, matched_resource_id),
+                            read_write=_read_write_for_text(text, matched_resource_id),
+                            states=_states_for_text(text, matched_resource_id, "STATE_COMMON"),
+                            resource_ref=ref,
+                        )
+                    )
+
+        coarse_resources_by_global_id: dict[str, list[dict[str, Any]]] = {}
+        for item in events:
+            if not item.get("is_shader_event"):
+                continue
+            if str(item.get("global_id")) == str(global_id):
+                shader_event_candidates.append(item)
+                coarse_resources_by_global_id[str(item.get("global_id"))] = event_resources
+                continue
+            coarse_resources = _resolve_bound_resources(index, item, descriptor_scan_count=descriptor_scan_count)
+            matching_resources = [
+                bound_resource
+                for bound_resource in coarse_resources
+                if str(bound_resource.get("resource_id") or "") in history_resource_ids
+                and bound_resource.get("view_type") in {"SRV", "UAV"}
+            ]
+            if matching_resources:
+                shader_event_candidates.append(item)
+                coarse_resources_by_global_id[str(item.get("global_id"))] = matching_resources
+
+        for item in shader_event_candidates:
+            shader_events_scanned += 1
+            item_resources = coarse_resources_by_global_id.get(str(item.get("global_id")), [])
+            for bound_resource in item_resources:
+                if str(bound_resource.get("resource_id") or "") not in history_resource_ids:
+                    continue
+                if bound_resource.get("view_type") not in {"SRV", "UAV"}:
+                    continue
+                rows.append(
+                    _make_access_row(
+                        item,
+                        bound_resource,
+                        binding=_shader_binding(bound_resource),
+                        read_write=_read_write_for_text("", str(bound_resource.get("resource_id")), bound_resource.get("view_type")),
+                        states=_shader_state(bound_resource),
+                    )
+                )
+
+    unique_shader_candidates = {str(item.get("global_id")) for item in shader_event_candidates if item}
     rows.sort(key=lambda row: (event_positions.get(str(row.get("global_id")), len(events)), int(row.get("line") or 0)))
     rows = _dedupe_access_rows(rows)
     return {
@@ -1192,12 +1348,28 @@ def get_resource_access_history(
             "cache_hit": index.get("cache_hit", False),
             "descriptor_scan_count": descriptor_scan_count,
             "access_count": len(rows),
-            "shader_event_candidate_count": len(shader_event_candidates),
+            "shader_event_candidate_count": len(unique_shader_candidates),
             "shader_event_scan_count": shader_events_scanned,
-            "resource_ref_index_hit": bool(refs_by_resource_id),
+            "resource_ref_index_hit": resource_ref_index_hit,
+            "database_hit": database_hit,
+            "database_path": database_path,
+            "query_mode": "sqlite" if database_hit else "fallback_scan",
+            "fallback_reason": database_fallback_reason,
             "reason": None if rows else "No access history rows were resolved for the selected resource.",
         },
     }
+
+
+def get_resource_access_history(
+    export_dir: str | Path,
+    global_id: int | str,
+    resource: str | int,
+    descriptor_scan_count: int = DEFAULT_DESCRIPTOR_SCAN_COUNT,
+    pdb_search_paths: list[str] | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    index = build_index(export_dir, refresh=refresh)
+    return _resource_access_history_from_index(index, export_dir, global_id, resource, descriptor_scan_count, pdb_search_paths, refresh)
 
 
 
