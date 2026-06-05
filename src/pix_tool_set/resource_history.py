@@ -228,17 +228,32 @@ def _latest_descriptor_write(index: dict[str, Any], descriptor_index: int) -> di
     return writes[-1] if writes else None
 
 
+def _same_source_file(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    try:
+        return Path(str(left)).resolve() == Path(str(right)).resolve()
+    except OSError:
+        return str(left) == str(right)
+
+
+def _descriptor_write_is_visible_to_root(write: dict[str, Any], root_binding: dict[str, Any]) -> bool:
+    root_line = root_binding.get("line")
+    if root_line is None or not _same_source_file(write.get("file"), root_binding.get("file")):
+        return True
+    try:
+        return int(write.get("line") or 0) <= int(root_line)
+    except (TypeError, ValueError):
+        return True
+
+
 def _latest_matching_descriptor_write(index: dict[str, Any], descriptor_index: int, root_binding: dict[str, Any]) -> dict[str, Any] | None:
     writes = index.get("descriptor_index", {}).get(str(descriptor_index), [])
     heap_id = root_binding.get("heap_id")
     if heap_id is not None:
         writes = [write for write in writes if str(write.get("heap_id")) == str(heap_id)]
-    root_line = root_binding.get("line")
-    if root_line is not None:
-        writes_before_binding = [write for write in writes if int(write.get("line") or 0) <= int(root_line)]
-        if writes_before_binding:
-            writes = writes_before_binding
-    return writes[-1] if writes else None
+    visible_writes = [write for write in writes if _descriptor_write_is_visible_to_root(write, root_binding)]
+    return visible_writes[-1] if visible_writes else None
 
 
 def _resource_name(index: dict[str, Any], resource_id: str | None) -> str | None:
@@ -644,8 +659,6 @@ def _table_stage_score(index: dict[str, Any], event: dict[str, Any], table: dict
     for view_type in ("SRV", "UAV"):
         declared = bindings.get(view_type, [])
         if not declared:
-            if resources_by_view_type.get(view_type):
-                score -= 100.0
             continue
         declared_dimensions = {binding.get("resource_dimension") for binding in declared}
         for resolved in resources_by_view_type.get(view_type, []):

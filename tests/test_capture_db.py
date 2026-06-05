@@ -5,6 +5,7 @@ from pathlib import Path
 from pix_tool_set.capture_db import (
     DATABASE_SCHEMA_VERSION,
     build_capture_database,
+    connect_database,
     database_path,
     is_database_current,
     load_event,
@@ -242,3 +243,83 @@ def test_shader_source_cache_round_trips_resolved_sources(tmp_path: Path) -> Non
     assert stages[0]["stage"] == "CS"
     assert stages[0]["resolver_result"]["status"] == "cached"
     assert stages[0]["resolver_result"]["result"]["sources"][0]["content"] == "RWStructuredBuffer<uint> RWSharedBuffer;"
+
+
+def test_build_database_writes_queryable_tables(tmp_path: Path) -> None:
+    index = _sample_index(tmp_path)
+    result = build_capture_database(tmp_path, index)
+    db_path = result["database_path"]
+
+    event = load_event(db_path, "2")
+    aliases = load_same_named_resource_ids(db_path, "SharedBuffer", "100")
+    refs = load_resource_references(db_path, aliases)
+    bound = load_event_bound_resources(db_path, "2")
+    shader_accesses = load_resource_shader_accesses(db_path, aliases)
+
+    assert event is not None
+    assert event["global_id"] == "2"
+    assert aliases == {"100", "101"}
+    assert [ref["global_id"] for ref in refs] == ["1"]
+    assert any(item["view_type"] == "CBV" and item["resource_id"] == "200" for item in bound)
+    assert any(item["view_type"] == "UAV" and item["resource_id"] == "100" for item in bound)
+    assert [item["event"]["global_id"] for item in shader_accesses] == ["2"]
+
+
+def test_build_database_persists_optional_shader_bindings(tmp_path: Path) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    index = _sample_index(export_dir)
+    index["shader_bindings"] = [
+        {
+            "pso_id": "99",
+            "stage": "CS",
+            "shader_binding_name": "InputTexture",
+            "register_type": "t",
+            "shader_binding_slot": 0,
+            "register_space": 0,
+            "view_type": "SRV",
+            "resource_dimension": "Texture",
+            "declaration_type": "Texture2D",
+        }
+    ]
+
+    result = build_capture_database(export_dir, index, refresh=True)
+
+    assert result["table_counts"]["shader_bindings"] == 1
+    with connect_database(result["database_path"]) as connection:
+        row = connection.execute("SELECT pso_id, stage, binding_name, register_type, register_slot, view_type FROM shader_bindings").fetchone()
+        resource_count = connection.execute("SELECT COUNT(*) FROM event_bound_resources").fetchone()[0]
+    assert row["pso_id"] == "99"
+    assert row["stage"] == "CS"
+    assert row["binding_name"] == "InputTexture"
+    assert row["register_type"] == "t"
+    assert row["register_slot"] == 0
+    assert row["view_type"] == "SRV"
+    assert resource_count > 0
+
+
+def test_resource_access_history_uses_event_bound_resources(tmp_path: Path) -> None:
+    (tmp_path / "CommandLists_000.cpp").write_text(
+        """
+// GlobalId = 1
+Use(GetResource(100).Get());
+// GlobalId = 2
+GetCommandList(1)->SetComputeRootDescriptorTable(0, GetGpuDescriptor(g_descriptorHeap_1.Get(), 400));
+GetCommandList(1)->Dispatch(1, 1, 1);
+""".strip(),
+        encoding="utf-8",
+    )
+    (tmp_path / "Descriptors.cpp").write_text(
+        "CreateUnorderedAccessView_Buffer(GetResource(100).Get(), nullptr, nullptr, GetCpuDescriptor(g_descriptorHeap_1.Get(), 400));\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "FrameResources.cpp").write_text('GetObject(100)->SetName(L"(SharedBuffer)");\n', encoding="utf-8")
+    (tmp_path / "CreatePSOs.cpp").write_text("", encoding="utf-8")
+
+    result = resource_history.get_resource_access_history(tmp_path, 2, "SharedBuffer")
+
+    assert result["diagnostics"]["database_hit"] is True
+    assert result["diagnostics"]["query_mode"] == "sqlite"
+    assert result["diagnostics"]["shader_event_scan_count"] == 0
+    assert [row["global_id"] for row in result["access_history"]] == ["1", "2"]
+    assert [row["binding"] for row in result["access_history"]] == ["API Parameters [0]", "CS UAV 0"]

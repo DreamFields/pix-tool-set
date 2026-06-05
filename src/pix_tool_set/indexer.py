@@ -8,8 +8,10 @@ from typing import Any
 
 from .capture_db import build_capture_database, database_path
 from .errors import PixToolError
+from .event_list_csv import parse_event_list_csv
+from .event_list_export import CommandRunner, export_event_list_csv
 
-INDEX_VERSION = 5
+INDEX_VERSION = 7
 SHADER_CALLS = {
     "Dispatch": "->Dispatch(",
     "DispatchIndirect": "->DispatchIndirect(",
@@ -41,6 +43,14 @@ ROOT_CBV_RE = re.compile(
     r"GetGpuva\((?P<resource_id>\d+),\s*(?P<offset>\d+)\)\)"
 )
 ROOT_SIGNATURE_RE = re.compile(r"Set(?P<stage>Compute|Graphics)RootSignature\(GetRootSignature\((?P<root_signature_id>\d+)\)\)")
+API_OBJECT_RE = re.compile(r"//\s*ApiObjectId\s*=\s*(?P<object_id>\d+)")
+ROOT_PARAMETER_TYPE_RE = re.compile(r"rootParameters\[(?P<root_index>\d+)\]\.ParameterType\s*=\s*D3D12_ROOT_PARAMETER_TYPE_(?P<parameter_type>[A-Z_]+)")
+ROOT_DESCRIPTOR_RE = re.compile(r"rootParameters\[(?P<root_index>\d+)\]\.Descriptor\s*=\s*\{\s*(?P<register_slot>\d+),\s*(?P<register_space>\d+),")
+DESCRIPTOR_RANGE_RE = re.compile(
+    r"descriptorRanges\[(?P<range_index>\d+)\]\s*=\s*\{\s*D3D12_DESCRIPTOR_RANGE_TYPE_(?P<range_type>[A-Z]+),\s*"
+    r"(?P<descriptor_count>\d+),\s*(?P<base_register>\d+),\s*(?P<register_space>\d+),.*?,\s*(?P<offset>\d+)\s*\}"
+)
+ROOT_DESCRIPTOR_TABLE_ASSIGN_RE = re.compile(r"rootParameters\[(?P<root_index>\d+)\]\.DescriptorTable\s*=\s*\{\s*(?P<range_count>\d+),\s*descriptorRanges\s*\}")
 IBV_DESC_RE = re.compile(
     r"D3D12_INDEX_BUFFER_VIEW\s+\w+\s*\{\s*GetGpuva\((?P<resource_id>\d+),\s*(?P<offset>\d+)\),\s*"
     r"(?P<size>\d+),\s*(?P<format>[^}\s]+)"
@@ -121,6 +131,7 @@ def _parse_command_lists(files: list[Path]) -> tuple[list[dict[str, Any]], dict[
     by_gid: dict[str, dict[str, Any]] = {}
     marker_stack: list[dict[str, str]] = []
     current_pso: str | None = None
+    current_root_signature: str | None = None
     current_root_tables: dict[str, dict[str, str]] = {}
     current_root_cbvs: dict[str, dict[str, str]] = {}
     current_ia: dict[str, Any] = {"vertex_buffers": [], "index_buffer": None}
@@ -158,6 +169,7 @@ def _parse_command_lists(files: list[Path]) -> tuple[list[dict[str, Any]], dict[
                     "parent_global_id": marker_stack[-1]["global_id"] if marker_stack else None,
                     "marker_path": [item["name"] for item in marker_stack],
                     "pso_id": current_pso,
+                    "root_signature_id": current_root_signature,
                     "root_descriptor_tables": dict(current_root_tables),
                     "root_constant_buffer_views": dict(current_root_cbvs),
                     "input_assembler": dict(current_ia),
@@ -236,6 +248,7 @@ def _parse_command_lists(files: list[Path]) -> tuple[list[dict[str, Any]], dict[
                 root_binding = {
                     "stage": root_table.group("stage"),
                     "root_index": root_table.group("root_index"),
+                    "root_signature_id": current_root_signature,
                     "heap_id": root_table.group("heap_id"),
                     "descriptor_index": root_table.group("descriptor_index"),
                     "line": index,
@@ -251,6 +264,7 @@ def _parse_command_lists(files: list[Path]) -> tuple[list[dict[str, Any]], dict[
                 root_binding = {
                     "stage": root_cbv.group("stage"),
                     "root_index": root_cbv.group("root_index"),
+                    "root_signature_id": current_root_signature,
                     "resource_id": root_cbv.group("resource_id"),
                     "offset": root_cbv.group("offset"),
                     "line": index,
@@ -263,10 +277,12 @@ def _parse_command_lists(files: list[Path]) -> tuple[list[dict[str, Any]], dict[
 
             root_signature = ROOT_SIGNATURE_RE.search(line)
             if root_signature:
+                current_root_signature = root_signature.group("root_signature_id")
                 current_root_tables.clear()
                 current_root_cbvs.clear()
                 pending_vbvs.clear()
                 if current is not None:
+                    current["root_signature_id"] = current_root_signature
                     current["root_descriptor_tables"] = {}
                     current["root_constant_buffer_views"] = {}
                     current["calls"].append(
@@ -274,7 +290,7 @@ def _parse_command_lists(files: list[Path]) -> tuple[list[dict[str, Any]], dict[
                             "line": index,
                             "text": line.strip(),
                             "kind": "SetRootSignature",
-                            "root_signature_id": root_signature.group("root_signature_id"),
+                            "root_signature_id": current_root_signature,
                             "stage": root_signature.group("stage"),
                         }
                     )
@@ -390,6 +406,76 @@ def _parse_descriptors(files: list[Path]) -> dict[str, list[dict[str, Any]]]:
     return descriptors
 
 
+def _parse_root_signatures(files: list[Path]) -> dict[str, Any]:
+    root_signatures: dict[str, Any] = {}
+    for path in files:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        current_id: str | None = None
+        current_parameters: dict[str, dict[str, Any]] = {}
+        pending_ranges: list[dict[str, Any]] = []
+        for line in lines:
+            api_object = API_OBJECT_RE.search(line)
+            if api_object:
+                current_id = api_object.group("object_id")
+                current_parameters = {}
+                pending_ranges = []
+                continue
+            if current_id is None:
+                continue
+            parameter_type = ROOT_PARAMETER_TYPE_RE.search(line)
+            if parameter_type:
+                root_index = parameter_type.group("root_index")
+                current_parameters.setdefault(root_index, {"root_index": root_index})["parameter_type"] = parameter_type.group("parameter_type")
+                continue
+            descriptor = ROOT_DESCRIPTOR_RE.search(line)
+            if descriptor:
+                root_index = descriptor.group("root_index")
+                current_parameters.setdefault(root_index, {"root_index": root_index}).update(
+                    {
+                        "register_slot": int(descriptor.group("register_slot")),
+                        "register_space": int(descriptor.group("register_space")),
+                    }
+                )
+                continue
+            descriptor_range = DESCRIPTOR_RANGE_RE.search(line)
+            if descriptor_range:
+                pending_ranges.append(
+                    {
+                        "range_index": int(descriptor_range.group("range_index")),
+                        "range_type": descriptor_range.group("range_type"),
+                        "descriptor_count": int(descriptor_range.group("descriptor_count")),
+                        "base_register": int(descriptor_range.group("base_register")),
+                        "register_space": int(descriptor_range.group("register_space")),
+                        "offset": int(descriptor_range.group("offset")),
+                    }
+                )
+                continue
+            descriptor_table = ROOT_DESCRIPTOR_TABLE_ASSIGN_RE.search(line)
+            if descriptor_table:
+                root_index = descriptor_table.group("root_index")
+                range_count = int(descriptor_table.group("range_count"))
+                current_parameters.setdefault(root_index, {"root_index": root_index}).update(
+                    {
+                        "parameter_type": "DESCRIPTOR_TABLE",
+                        "ranges": pending_ranges[-range_count:] if range_count else [],
+                    }
+                )
+                continue
+            if "CreateAndTrackRootSignature" in line and current_id is not None:
+                root_signatures[current_id] = {
+                    "root_signature_id": current_id,
+                    "source_file": str(path),
+                    "parameters": current_parameters,
+                }
+                current_id = None
+                current_parameters = {}
+                pending_ranges = []
+    return root_signatures
+
+
 def _parse_pso_files(export_dir: Path) -> dict[str, Any]:
     pso_file = export_dir / "CreatePSOs.cpp"
     pso_index: dict[str, Any] = {}
@@ -403,6 +489,139 @@ def _parse_pso_files(export_dir: Path) -> dict[str, Any]:
             entry = pso_index.setdefault(pso_id, {"pso_id": pso_id, "source_file": str(pso_file), "stages": []})
             entry["stages"].append({"stage": stage, "blob_path": str(blob)})
     return pso_index
+
+
+def _attach_root_signature_layouts(events: list[dict[str, Any]], root_signatures: dict[str, Any]) -> None:
+    for event in events:
+        for binding_group in ("root_descriptor_tables", "root_constant_buffer_views"):
+            for binding in (event.get(binding_group) or {}).values():
+                root_signature_id = binding.get("root_signature_id") or event.get("root_signature_id")
+                root_index = binding.get("root_index")
+                layout = ((root_signatures.get(str(root_signature_id)) or {}).get("parameters") or {}).get(str(root_index))
+                if layout:
+                    binding["root_signature_layout"] = layout
+
+
+def _event_match_name(event: dict[str, Any]) -> str:
+    return str(event.get("event_type") or event.get("name") or "")
+
+
+def _build_event_id_map(csv_events: list[dict[str, Any]], cpp_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cpp_by_id = {str(event.get("global_id")): event for event in cpp_events if event.get("global_id") is not None}
+    matched_cpp_ids: set[str] = set()
+    rows: list[dict[str, Any]] = []
+
+    for csv_event in csv_events:
+        queue_id = str(csv_event.get("global_id"))
+        cpp_event = cpp_by_id.get(queue_id)
+        if cpp_event is None:
+            continue
+        matched_cpp_ids.add(str(cpp_event.get("global_id")))
+        rows.append(
+            {
+                "queue_id": queue_id,
+                "cpp_global_id": str(cpp_event.get("global_id")),
+                "event_name": csv_event.get("name"),
+                "cpp_event_name": cpp_event.get("name"),
+                "match_strategy": "exact_id",
+                "confidence": 1.0,
+                "status": "matched",
+                "diagnostics": {},
+            }
+        )
+
+    cpp_by_name: dict[str, list[dict[str, Any]]] = {}
+    for cpp_event in cpp_events:
+        cpp_id = str(cpp_event.get("global_id"))
+        if cpp_id in matched_cpp_ids:
+            continue
+        cpp_by_name.setdefault(_event_match_name(cpp_event), []).append(cpp_event)
+
+    csv_by_name: dict[str, list[dict[str, Any]]] = {}
+    mapped_queue_ids = {row["queue_id"] for row in rows}
+    for csv_event in csv_events:
+        queue_id = str(csv_event.get("global_id"))
+        if queue_id in mapped_queue_ids:
+            continue
+        csv_by_name.setdefault(_event_match_name(csv_event), []).append(csv_event)
+
+    for name, csv_group in csv_by_name.items():
+        cpp_group = cpp_by_name.get(name, [])
+        if not cpp_group:
+            for csv_event in csv_group:
+                rows.append(
+                    {
+                        "queue_id": str(csv_event.get("global_id")),
+                        "cpp_global_id": None,
+                        "event_name": csv_event.get("name"),
+                        "cpp_event_name": None,
+                        "match_strategy": "name_order",
+                        "confidence": 0.0,
+                        "status": "missing",
+                        "diagnostics": {"reason": "No C++ export event with the same event name."},
+                    }
+                )
+            continue
+        if len(csv_group) != len(cpp_group):
+            for csv_event in csv_group:
+                rows.append(
+                    {
+                        "queue_id": str(csv_event.get("global_id")),
+                        "cpp_global_id": None,
+                        "event_name": csv_event.get("name"),
+                        "cpp_event_name": name,
+                        "match_strategy": "name_order",
+                        "confidence": 0.0,
+                        "status": "conflict",
+                        "diagnostics": {"reason": "CSV and C++ export event counts differ for this event name.", "csv_count": len(csv_group), "cpp_count": len(cpp_group)},
+                    }
+                )
+            continue
+        for csv_event, cpp_event in zip(csv_group, cpp_group, strict=True):
+            rows.append(
+                {
+                    "queue_id": str(csv_event.get("global_id")),
+                    "cpp_global_id": str(cpp_event.get("global_id")),
+                    "event_name": csv_event.get("name"),
+                    "cpp_event_name": cpp_event.get("name"),
+                    "match_strategy": "name_order",
+                    "confidence": 0.75,
+                    "status": "matched",
+                    "diagnostics": {},
+                }
+            )
+    return sorted(rows, key=lambda item: int(item["queue_id"]) if str(item["queue_id"]).isdigit() else str(item["queue_id"]))
+
+
+def _events_with_cpp_resource_facts(csv_events: list[dict[str, Any]], cpp_events_by_global_id: dict[str, dict[str, Any]], event_id_map: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cpp_id_by_queue_id = {
+        str(item.get("queue_id")): str(item.get("cpp_global_id"))
+        for item in event_id_map
+        if item.get("status") == "matched" and item.get("cpp_global_id") is not None
+    }
+    merged_events: list[dict[str, Any]] = []
+    for csv_event in csv_events:
+        event = dict(csv_event)
+        queue_id = str(csv_event.get("global_id"))
+        cpp_event = cpp_events_by_global_id.get(cpp_id_by_queue_id.get(queue_id, ""))
+        if cpp_event:
+            event.update(
+                {
+                    "pso_id": cpp_event.get("pso_id"),
+                    "root_signature_id": cpp_event.get("root_signature_id"),
+                    "root_descriptor_tables": cpp_event.get("root_descriptor_tables") or {},
+                    "root_constant_buffer_views": cpp_event.get("root_constant_buffer_views") or {},
+                    "input_assembler": cpp_event.get("input_assembler") or {"vertex_buffers": [], "index_buffer": None},
+                    "output_merger": cpp_event.get("output_merger") or {"render_targets": [], "depth_stencil": None},
+                    "resource_refs": cpp_event.get("resource_refs") or [],
+                    "calls": cpp_event.get("calls") or [],
+                    "cpp_global_id": cpp_event.get("global_id"),
+                    "cpp_file": cpp_event.get("file"),
+                    "cpp_line": cpp_event.get("line"),
+                }
+            )
+        merged_events.append(event)
+    return merged_events
 
 
 def _attach_database_info(root: Path, payload: dict[str, Any], refresh: bool) -> dict[str, Any]:
@@ -420,6 +639,13 @@ def _attach_database_info(root: Path, payload: dict[str, Any], refresh: bool) ->
     return payload
 
 
+def _capture_fingerprints(capture_path: Path, csv_path: Path | None = None) -> list[dict[str, Any]]:
+    files = [capture_path]
+    if csv_path is not None and csv_path.exists():
+        files.append(csv_path)
+    return _fingerprints(files)
+
+
 def build_index(export_dir: str | Path, refresh: bool = False) -> dict[str, Any]:
     root = Path(export_dir).resolve()
     if not root.exists():
@@ -434,8 +660,11 @@ def build_index(export_dir: str | Path, refresh: bool = False) -> dict[str, Any]
     command_files = [path for path in files if path.name.startswith("CommandLists")]
     descriptor_files = [path for path in files if path.name.startswith("Descriptors") or path.name.startswith("ModifyDescriptors")]
     resource_name_files = [path for path in files if path.name.startswith("FrameResources")]
+    root_signature_files = [path for path in files if path.name.startswith("FrameResources")]
     events, by_gid = _parse_command_lists(command_files)
     shader_events = [event for event in events if event.get("is_shader_event")]
+    root_signatures = _parse_root_signatures(root_signature_files)
+    _attach_root_signature_layouts(events, root_signatures)
     payload = {
         "version": INDEX_VERSION,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
@@ -445,10 +674,101 @@ def build_index(export_dir: str | Path, refresh: bool = False) -> dict[str, Any]
         "events_by_global_id": by_gid,
         "shader_event_global_ids": [event["global_id"] for event in shader_events],
         "pso_index": _parse_pso_files(root),
+        "root_signatures": root_signatures,
         "descriptor_index": _parse_descriptors(descriptor_files),
         "resource_names": _parse_resource_names(resource_name_files),
         "resource_refs_by_resource_id": _build_resource_refs_by_resource_id(events),
         "diagnostics": {"source_file_count": len(files), "event_count": len(events), "shader_event_count": len(shader_events)},
+        "cache_hit": False,
+    }
+    payload = _attach_database_info(root, payload, refresh=True)
+    _write_cached(root, payload)
+    return payload
+
+
+def build_index_from_capture(
+    *,
+    capture_path: str | Path | None,
+    export_dir: str | Path | None = None,
+    refresh: bool = False,
+    pixtool_path: str | Path | None = None,
+    counters: str | None = None,
+    workspace: str | Path | None = None,
+    runner: CommandRunner | None = None,
+) -> dict[str, Any]:
+    if capture_path is None:
+        raise PixToolError(
+            code="capture_path_required",
+            message="capture_path is required to build the event-list database.",
+            stage="index",
+            suggestion="Pass capture_path to build-index so save-event-list can export the event CSV.",
+        )
+    event_list = export_event_list_csv(
+        capture_path=capture_path,
+        export_dir=export_dir,
+        workspace=workspace,
+        refresh=refresh,
+        pixtool_path=pixtool_path,
+        counters=counters,
+        runner=runner,
+    )
+    root = event_list.paths.export_dir
+    cpp_files = _source_files(root)
+    cached_fingerprints = _fingerprints([event_list.paths.capture_path, event_list.paths.csv_path, *cpp_files])
+    if not refresh and event_list.cache_hit:
+        cached = _load_cached(root, cached_fingerprints)
+        if cached is not None:
+            cached["cache_hit"] = True
+            cached["event_list_csv_path"] = str(event_list.paths.csv_path)
+            cached["event_list_cache_hit"] = True
+            cached["event_list_refreshed"] = False
+            return _attach_database_info(root, cached, refresh=False)
+
+    parsed = parse_event_list_csv(event_list.paths.csv_path)
+    cpp_files = _source_files(root)
+    command_files = [path for path in cpp_files if path.name.startswith("CommandLists")]
+    descriptor_files = [path for path in cpp_files if path.name.startswith("Descriptors") or path.name.startswith("ModifyDescriptors")]
+    resource_name_files = [path for path in cpp_files if path.name.startswith("FrameResources")]
+    root_signature_files = [path for path in cpp_files if path.name.startswith("FrameResources")]
+    cpp_events, cpp_events_by_global_id = _parse_command_lists(command_files) if command_files else ([], {})
+    root_signatures = _parse_root_signatures(root_signature_files)
+    _attach_root_signature_layouts(cpp_events, root_signatures)
+    event_id_map = _build_event_id_map(parsed["events"], cpp_events) if cpp_events else []
+    events = _events_with_cpp_resource_facts(parsed["events"], cpp_events_by_global_id, event_id_map)
+    shader_events = [event for event in events if event.get("is_shader_event")]
+    payload = {
+        "version": INDEX_VERSION,
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "capture_path": str(event_list.paths.capture_path),
+        "export_dir": str(root),
+        "fingerprints": cached_fingerprints,
+        "events": events,
+        "events_by_global_id": {event["global_id"]: event for event in events},
+        "event_id_map": event_id_map,
+        "shader_event_global_ids": [event["global_id"] for event in shader_events],
+        "pso_index": _parse_pso_files(root),
+        "root_signatures": root_signatures,
+        "descriptor_index": _parse_descriptors(descriptor_files),
+        "resource_names": _parse_resource_names(resource_name_files),
+        "resource_refs_by_resource_id": _build_resource_refs_by_resource_id(events),
+        "event_list_csv_path": str(event_list.paths.csv_path),
+        "event_list_cache_hit": event_list.cache_hit,
+        "event_list_refreshed": event_list.refreshed,
+        "diagnostics": {
+            "source": "save_event_list_csv",
+            "capture_path": str(event_list.paths.capture_path),
+            "event_list_csv_path": str(event_list.paths.csv_path),
+            "event_list_cache_hit": event_list.cache_hit,
+            "event_list_refreshed": event_list.refreshed,
+            "event_count": len(parsed["events"]),
+            "shader_event_count": len(shader_events),
+            "cpp_export_source_file_count": len(cpp_files),
+            "cpp_export_event_count": len(cpp_events),
+            "event_id_map_count": len(event_id_map),
+            "event_id_map_matched_count": sum(1 for item in event_id_map if item.get("status") == "matched"),
+            "save_event_list": event_list.diagnostics(),
+            "event_list_csv": parsed.get("diagnostics", {}),
+        },
         "cache_hit": False,
     }
     payload = _attach_database_info(root, payload, refresh=True)

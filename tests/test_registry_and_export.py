@@ -5,21 +5,32 @@ from pathlib import Path
 from pix_tool_set.context import ToolContext
 from pix_tool_set.cpp_export import validate_cpp_export
 from pix_tool_set import resource_history
+from pix_tool_set import indexer
 from pix_tool_set.registry import get_registry
 from pix_tool_set.tools import load_builtin_tools
 from pix_tool_set.tools import event_analysis_tools
 from pix_tool_set.tools import resource_history_tools
+from pix_tool_set.tools import database_query_tools
+
 
 
 def test_builtin_tools_are_registered() -> None:
     load_builtin_tools()
     names = {tool.name for tool in get_registry().list_tools()}
-    assert "extract-shader-events-tree" in names
-    assert "analyze-events" in names
-    assert "get-event-shader-source" in names
-    assert "get-event-resource" in names
-    assert "get-resource-access-history" in names
-    assert "get-event-resource-history" not in names
+    assert names == {
+        "check-cpp-export",
+        "build-index",
+        "db-extract-shader-events-tree",
+        "db-analyze-events",
+        "db-get-event-resource",
+        "db-get-resource-access-history",
+        "db-get-event-shader-source",
+        "get-event-shader-source",
+        "export-to-cpp",
+    }
+    assert "analyze-events" not in names
+    assert "get-event-resource" not in names
+    assert "get-resource-access-history" not in names
 
 
 def test_cli_and_mcp_names_are_unified() -> None:
@@ -28,10 +39,118 @@ def test_cli_and_mcp_names_are_unified() -> None:
         assert tool.cli_name() == tool.mcp_name() == tool.name
 
 
+def test_database_resource_tool_parameters_stay_minimal() -> None:
+    load_builtin_tools()
+    build_index = get_registry().get("build-index")
+    event_resource = get_registry().get("db-get-event-resource")
+
+    assert set(build_index.parameters["properties"]) == {"capture_path", "export_dir", "refresh", "pixtool_path", "counters"}
+    assert build_index.parameters["required"] == ["capture_path"]
+    assert set(event_resource.parameters["properties"]) == {"capture_path", "export_dir", "global_id", "output_path", "refresh", "pixtool_path", "counters"}
+    assert event_resource.parameters["required"] == ["global_id"]
+    assert "pdb_search_paths" not in event_resource.parameters["properties"]
+    assert "resolver_path" not in event_resource.parameters["properties"]
+
+
 def test_cpp_export_validation_accepts_minimal_export(tmp_path: Path) -> None:
     for name in ("CMakeLists.txt", "CreatePSOs.cpp", "resources.bin", "RenderFrame.cpp", "CommandLists_000.cpp"):
         (tmp_path / name).write_text("", encoding="utf-8")
     assert validate_cpp_export(tmp_path) == []
+
+
+def test_indexer_records_root_signature_layouts(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "FrameResources_000.cpp").write_text(
+        """
+    // ApiObjectId     = 3256
+    {
+        static D3D12_ROOT_PARAMETER1 rootParameters[2];
+        rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        {
+            static D3D12_DESCRIPTOR_RANGE1 descriptorRanges[1];
+            descriptorRanges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 64, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 4294967295 };
+            rootParameters[0].DescriptorTable = { 1, descriptorRanges };
+        }
+        rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rootParameters[1].Descriptor = { 0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC };
+        CreateAndTrackRootSignature(3256, g_device.Get(), 1, signature.Get());
+    }
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "CommandLists_000.cpp").write_text(
+        """
+    // GlobalId        = 10
+    GetCommandList(1)->SetComputeRootSignature(GetRootSignature(3256));
+    GetCommandList(1)->SetComputeRootDescriptorTable(0, GetGpuDescriptor(g_descriptorHeap_32.Get(), 100));
+    GetCommandList(1)->SetComputeRootConstantBufferView(1, GetGpuva(200, 0));
+    // GlobalId        = 11
+    GetCommandList(1)->Dispatch(1, 1, 1);
+""",
+        encoding="utf-8",
+    )
+    for name in ("CMakeLists.txt", "CreatePSOs.cpp", "resources.bin", "RenderFrame.cpp"):
+        (tmp_path / name).write_text("", encoding="utf-8")
+    monkeypatch.setattr(indexer, "build_capture_database", lambda export_dir, payload, refresh=False: {"database_path": str(tmp_path / "capture.sqlite"), "cache_hit": False, "schema_version": 2, "table_counts": {}, "diagnostics": {}})
+
+    payload = indexer.build_index(tmp_path, refresh=True)
+    event = payload["events_by_global_id"]["11"]
+
+    assert event["root_signature_id"] == "3256"
+    assert event["root_descriptor_tables"]["0"]["root_signature_layout"]["ranges"][0]["range_type"] == "SRV"
+    assert event["root_descriptor_tables"]["0"]["root_signature_layout"]["ranges"][0]["descriptor_count"] == 64
+    assert event["root_constant_buffer_views"]["1"]["root_signature_layout"]["register_slot"] == 0
+
+
+def test_compute_resources_use_root_signature_layout_without_shader_bindings(monkeypatch) -> None:
+    event = {
+        "global_id": "42",
+        "file": "CommandLists_000.cpp",
+        "root_descriptor_tables": {
+            "0": {
+                "stage": "Compute",
+                "root_index": "0",
+                "heap_id": "32",
+                "descriptor_index": "100",
+                "line": 50,
+                "root_signature_layout": {
+                    "parameter_type": "DESCRIPTOR_TABLE",
+                    "ranges": [
+                        {"range_type": "SRV", "descriptor_count": 2, "base_register": 0, "register_space": 0, "offset": 0},
+                        {"range_type": "UAV", "descriptor_count": 1, "base_register": 0, "register_space": 0, "offset": 2},
+                    ],
+                },
+            }
+        },
+        "root_constant_buffer_views": {},
+    }
+    writes = {
+        100: {"descriptor_index": "100", "heap_id": "32", "resource_id": "700", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer", "line": 10},
+        101: {"descriptor_index": "101", "heap_id": "32", "resource_id": "701", "view_type": "SRV", "call": "CreateShaderResourceView_Texture2D", "line": 11},
+        102: {"descriptor_index": "102", "heap_id": "32", "resource_id": "800", "view_type": "UAV", "call": "CreateUnorderedAccessView_Texture2D", "line": 12},
+    }
+    names = {"700": "LightGridData", "701": "SceneDepthZ", "800": "OutPageFlags"}
+
+    def fake_latest_write(db_path, descriptor_index, heap_id, line, root_file=None):
+        assert heap_id == "32"
+        assert line == 50
+        assert root_file == "CommandLists_000.cpp"
+        return writes.get(descriptor_index)
+
+    monkeypatch.setattr(database_query_tools, "_latest_descriptor_write_from_database", fake_latest_write)
+    monkeypatch.setattr(database_query_tools, "_resource_name_from_database", lambda db_path, resource_id: names.get(str(resource_id)))
+
+    resources = database_query_tools._resolve_compute_shader_resources_from_database(
+        Path("capture.sqlite"),
+        {"events": [event], "events_by_global_id": {"42": event}, "descriptor_index": {}, "resource_names": {}},
+        event,
+        {"CBV": [], "SRV": [], "UAV": [], "Sampler": []},
+    )
+
+    assert [(resource["view_type"], resource["resource_name"], resource["shader_binding_slot"]) for resource in resources] == [
+        ("SRV", "LightGridData", 0),
+        ("SRV", "SceneDepthZ", 1),
+        ("UAV", "OutPageFlags", 0),
+    ]
 
 
 def test_analyze_events_accepts_nullable_limits(tmp_path: Path, monkeypatch) -> None:
@@ -121,6 +240,120 @@ def test_resource_access_history_accepts_nullable_descriptor_scan_count(tmp_path
     assert result.data["resource"] == "RayTracing.LightGrid:RWLightGrid"
     assert result.data["resource_id"] == "839"
     assert result.data["access_count"] == 1
+
+
+
+def test_db_get_event_resource_reads_database_resolved_resources_only(tmp_path: Path, monkeypatch) -> None:
+    event = {"global_id": "3854", "pso_id": "3078"}
+
+    monkeypatch.setattr(database_query_tools, "_ensure_database", lambda export_dir, refresh=False: (tmp_path / "capture.sqlite", {}))
+    monkeypatch.setattr(database_query_tools, "load_event", lambda db_path, global_id: event)
+    monkeypatch.setattr(
+        database_query_tools,
+        "_refresh_event_shader_source_cache",
+        lambda args, source_event: (_ for _ in ()).throw(AssertionError("db-get-event-resource must not refresh shader source")),
+    )
+    monkeypatch.setattr(
+        database_query_tools,
+        "_refresh_event_bound_resources_from_database",
+        lambda db_path, source_event: (_ for _ in ()).throw(AssertionError("db-get-event-resource must not recompute resources")),
+    )
+    monkeypatch.setattr(
+        database_query_tools,
+        "load_event_bound_resources",
+        lambda db_path, global_id: [
+            {"display_name": "Resolved", "database_source": "database_resolved"},
+            {"display_name": "Old", "database_source": "descriptor_table_scan"},
+        ],
+    )
+    monkeypatch.setattr(database_query_tools, "write_json_file", lambda output_path, payload: str(output_path))
+
+    result = database_query_tools.db_get_event_resource(
+        {
+            "export_dir": "export",
+            "global_id": 3854,
+            "output_path": str(tmp_path / "resources.json"),
+        },
+        ToolContext(workspace=tmp_path),
+    )
+
+    assert result.status == "success"
+    assert result.data["resource_count"] == 1
+    assert result.data["resources"] == [{"display_name": "Resolved", "database_source": "database_resolved"}]
+    assert result.data["diagnostics"]["query_source"] == "event_bound_resources"
+    assert result.data["diagnostics"]["refreshed_source_cache"] is False
+    assert result.data["diagnostics"]["refreshed_from_database"] is False
+
+
+def test_db_get_event_resource_discards_precomputed_cache_when_refresh_fails(tmp_path: Path, monkeypatch) -> None:
+    event = {"global_id": "3968", "pso_id": "4010"}
+
+    monkeypatch.setattr(database_query_tools, "_ensure_database", lambda export_dir, refresh=False: (tmp_path / "capture.sqlite", {}))
+    monkeypatch.setattr(database_query_tools, "load_event", lambda db_path, global_id: event)
+    monkeypatch.setattr(database_query_tools, "_refresh_event_shader_source_cache", lambda args, source_event: False)
+    monkeypatch.setattr(database_query_tools, "_refresh_event_bound_resources_from_database", lambda db_path, source_event: False)
+    monkeypatch.setattr(
+        database_query_tools,
+        "load_event_bound_resources",
+        lambda db_path, global_id: [
+            {"display_name": "SRV Buffer 0 : Old", "database_source": "descriptor_table_scan"},
+            {"display_name": "SRV Buffer 1 : Old", "database_source": "precomputed"},
+        ],
+    )
+    monkeypatch.setattr(database_query_tools, "write_json_file", lambda output_path, payload: str(output_path))
+
+    result = database_query_tools.db_get_event_resource(
+        {
+            "export_dir": "export",
+            "global_id": 3968,
+            "output_path": str(tmp_path / "resources.json"),
+        },
+        ToolContext(workspace=tmp_path),
+    )
+
+    assert result.status == "partial"
+    assert result.data["resource_count"] == 0
+    assert result.data["resources"] == []
+    assert result.data["diagnostics"]["discarded_precomputed_resource_count"] == 2
+    assert result.data["diagnostics"]["reason"] == "Only non-database-resolved resources were found; rebuild the database so resource facts can be precomputed."
+
+
+def test_contiguous_descriptor_count_uses_root_binding_file_and_line(monkeypatch) -> None:
+    calls: list[tuple[int | None, str | None]] = []
+
+    def fake_latest_write(db_path: Path, descriptor_index: int, heap_id: str | None, line: int | None, root_file: str | None = None) -> dict | None:
+        calls.append((line, root_file))
+        return {"view_type": "SRV"}
+
+    monkeypatch.setattr(database_query_tools, "_latest_descriptor_write_from_database", fake_latest_write)
+
+    count = database_query_tools._contiguous_descriptor_count(
+        Path("capture.sqlite"),
+        {"descriptor_index": "100", "heap_id": "7", "line": "42", "file": "CommandLists_001.cpp"},
+        "SRV",
+        2,
+    )
+
+    assert count == 2
+    assert calls == [(42, "CommandLists_001.cpp"), (42, "CommandLists_001.cpp")]
+
+
+def test_descriptor_write_visibility_filters_line_only_within_same_file() -> None:
+    assert database_query_tools._descriptor_write_is_visible_to_root(
+        {"file": "Descriptors_020.cpp", "line": 5900},
+        "CommandLists_001.cpp",
+        1675,
+    ) is True
+    assert database_query_tools._descriptor_write_is_visible_to_root(
+        {"file": "CommandLists_001.cpp", "line": 1700},
+        "CommandLists_001.cpp",
+        1675,
+    ) is False
+    assert database_query_tools._descriptor_write_is_visible_to_root(
+        {"file": "CommandLists_001.cpp", "line": 1600},
+        "CommandLists_001.cpp",
+        1675,
+    ) is True
 
 
 def test_resource_access_history_tracks_same_named_resource_aliases_and_shader_reads(monkeypatch) -> None:
@@ -753,3 +986,66 @@ SamplerState OpaqueBasePass_DBufferATextureSampler;
         "BlackAlphaOneDummy:OpaqueBasePass_DBufferCTexture",
         "OpaqueBasePass_DBufferATextureSampler",
     ]
+
+
+def test_get_event_resource_keeps_graphics_srv_table_with_trailing_uavs(monkeypatch) -> None:
+    event = {
+        "global_id": "2864",
+        "shader_stage_group": "graphics_or_indirect",
+        "input_assembler": {},
+        "output_merger": {},
+        "root_descriptor_tables": {
+            "0": {"stage": "Graphics", "root_index": "0", "heap_id": "32", "descriptor_index": "195632", "line": 10},
+        },
+        "root_constant_buffer_views": {
+            "1": {"stage": "Graphics", "root_index": "1", "resource_id": "2956", "offset": "2031616", "line": 11},
+            "2": {"stage": "Graphics", "root_index": "2", "resource_id": "2956", "offset": "2052352", "line": 12},
+        },
+    }
+    fake_index = {
+        "events_by_global_id": {"2864": event},
+        "descriptor_index": {
+            "195632": [{"descriptor_index": "195632", "heap_id": "32", "resource_id": "683", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer"}],
+            "195633": [{"descriptor_index": "195633", "heap_id": "32", "resource_id": "1968", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer"}],
+            "195634": [{"descriptor_index": "195634", "heap_id": "32", "resource_id": "1456", "view_type": "SRV", "call": "CreateShaderResourceView_Buffer"}],
+            "195635": [{"descriptor_index": "195635", "heap_id": "32", "resource_id": "2367", "view_type": "UAV", "call": "CreateUnorderedAccessView_Buffer"}],
+            "195636": [{"descriptor_index": "195636", "heap_id": "32", "resource_id": "904", "view_type": "UAV", "call": "CreateUnorderedAccessView_Buffer"}],
+        },
+        "resource_names": {
+            "2956": {"name": "Resource Allocator Underlying Buffer"},
+            "683": {"name": "InstanceCulling.InstanceIdsBuffer"},
+            "1968": {"name": "GPUScene.InstanceSceneData"},
+            "1456": {"name": "GPUScene.PrimitiveData"},
+            "2367": {"name": "InstanceCulling.DrawIndirectArgsBuffer"},
+            "904": {"name": "Shadow.Virtual.PhysicalPageMetaData"},
+        },
+        "cache_hit": False,
+    }
+    vs_source = """
+cbuffer View { float4 View_TranslatedWorldToClip; }
+cbuffer Scene { float4 Scene_GPUScene_GPUSceneFrameNumber; }
+StructuredBuffer<uint> InstanceCulling_InstanceIdsBuffer;
+StructuredBuffer<uint> Scene_GPUScene_GPUSceneInstanceSceneData;
+StructuredBuffer<uint> Scene_GPUScene_GPUScenePrimitiveSceneData;
+"""
+
+    monkeypatch.setattr(resource_history, "build_index", lambda export_dir, refresh=False: fake_index)
+    monkeypatch.setattr(
+        resource_history,
+        "get_event_shader_source",
+        lambda export_dir, global_id, pdb_search_paths=None, refresh=False: {
+            "stages": [{"stage": "VS", "resolver_result": {"result": {"sources": [{"content": vs_source}]}}}]
+        },
+    )
+
+    result = resource_history.get_event_resource("export", 2864, pdb_search_paths=["shader.pdb"])
+
+    assert [item["display_name"] for item in result["resources"]] == [
+        "Resource Allocator Underlying Buffer:View",
+        "Resource Allocator Underlying Buffer:Scene",
+        "InstanceCulling.InstanceIdsBuffer:InstanceCulling_InstanceIdsBuffer",
+        "GPUScene.InstanceSceneData:Scene_GPUScene_GPUSceneInstanceSceneData",
+        "GPUScene.PrimitiveData:Scene_GPUScene_GPUScenePrimitiveSceneData",
+    ]
+    assert [item["view_type"] for item in result["resources"]] == ["CBV", "CBV", "SRV", "SRV", "SRV"]
+    assert all(item["stage"] == "VS" for item in result["resources"])

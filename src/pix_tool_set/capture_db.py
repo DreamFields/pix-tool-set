@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 from .errors import PixToolError
 
-DATABASE_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 4
 DATABASE_FILENAME = "capture.sqlite"
 
 
@@ -57,12 +57,34 @@ def _execute_schema(connection: sqlite3.Connection) -> None:
             parent_global_id TEXT,
             marker_path_json TEXT NOT NULL DEFAULT '[]',
             pso_id TEXT,
+            root_signature_id TEXT,
+            event_depth INTEGER,
+            start_time TEXT,
+            duration TEXT,
+            counters_json TEXT NOT NULL DEFAULT '{}',
             event_json TEXT NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_events_order ON events(event_order);
         CREATE INDEX IF NOT EXISTS idx_events_shader ON events(is_shader_event, event_order);
         CREATE INDEX IF NOT EXISTS idx_events_pso ON events(pso_id);
+        CREATE INDEX IF NOT EXISTS idx_events_root_signature ON events(root_signature_id);
+
+        CREATE TABLE IF NOT EXISTS event_id_map (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_id TEXT NOT NULL,
+            cpp_global_id TEXT,
+            event_name TEXT,
+            cpp_event_name TEXT,
+            match_strategy TEXT,
+            confidence REAL,
+            status TEXT NOT NULL,
+            diagnostics_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(queue_id, cpp_global_id, match_strategy)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_id_map_queue ON event_id_map(queue_id, status);
+        CREATE INDEX IF NOT EXISTS idx_event_id_map_cpp_global ON event_id_map(cpp_global_id, status);
 
         CREATE TABLE IF NOT EXISTS resources (
             resource_id TEXT PRIMARY KEY,
@@ -138,6 +160,24 @@ def _execute_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_root_bindings_event ON root_bindings(global_id, binding_type, root_index);
         CREATE INDEX IF NOT EXISTS idx_root_bindings_resource ON root_bindings(resource_id);
+
+        CREATE TABLE IF NOT EXISTS root_signature_layout (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_signature_id TEXT NOT NULL,
+            root_index TEXT NOT NULL,
+            parameter_type TEXT,
+            range_index INTEGER,
+            range_type TEXT,
+            base_register INTEGER,
+            register_space INTEGER,
+            descriptor_count INTEGER,
+            offset INTEGER,
+            layout_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(root_signature_id, root_index, range_index, range_type, base_register, register_space)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_root_signature_layout_root ON root_signature_layout(root_signature_id, root_index);
+        CREATE INDEX IF NOT EXISTS idx_root_signature_layout_range ON root_signature_layout(root_signature_id, range_type, base_register, register_space);
 
         CREATE TABLE IF NOT EXISTS event_bound_resources (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,11 +281,13 @@ def is_database_current(path: str | Path, fingerprints: list[dict[str, Any]]) ->
 def table_counts(path: str | Path) -> dict[str, int]:
     tables = [
         "events",
+        "event_id_map",
         "resources",
         "resource_aliases",
         "resource_references",
         "descriptor_writes",
         "root_bindings",
+        "root_signature_layout",
         "event_bound_resources",
         "shader_metadata",
         "shader_bindings",
@@ -301,9 +343,68 @@ def _resource_dimension_from_descriptor(write: dict[str, Any] | None) -> str | N
     return None
 
 
+def _descriptor_ranges_from_binding(index: dict[str, Any], binding: dict[str, Any]) -> list[dict[str, Any]]:
+    layout = binding.get("root_signature_layout") or _root_parameter_layout(index, binding)
+    ranges = layout.get("ranges") if isinstance(layout, dict) else None
+    return [item for item in ranges or [] if isinstance(item, dict)]
+
+
+def _descriptor_range_offset(descriptor_range: dict[str, Any], append_offset: int) -> int:
+    offset = _int_or_none(descriptor_range.get("offset"))
+    if offset is None:
+        return append_offset
+    # D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND (0xFFFFFFFF) means use the append_offset.
+    if offset == 4294967295:
+        return append_offset
+    return offset
+
+
+def _append_descriptor_table_resources(rows: list[dict[str, Any]], index: dict[str, Any], event: dict[str, Any], event_order: int, root_binding: dict[str, Any], start: int) -> bool:
+    ranges = _descriptor_ranges_from_binding(index, root_binding)
+    if not ranges:
+        return False
+    append_offset = 0
+    resolved_any = False
+    for descriptor_range in ranges:
+        range_type = str(descriptor_range.get("range_type") or descriptor_range.get("type") or "").upper()
+        descriptor_count = _int_or_none(descriptor_range.get("descriptor_count")) or 0
+        offset = _descriptor_range_offset(descriptor_range, append_offset)
+        append_offset = offset + descriptor_count
+        if range_type not in {"CBV", "SRV", "UAV", "SAMPLER"}:
+            continue
+        for slot in range(descriptor_count):
+            descriptor_index = start + offset + slot
+            write = _latest_descriptor_write(index, descriptor_index, root_binding.get("heap_id"), root_binding.get("line"))
+            expected_view_type = "Sampler" if range_type == "SAMPLER" else range_type
+            if write is None or write.get("view_type") != expected_view_type:
+                continue
+            item = {
+                "resource_id": write.get("resource_id"),
+                "resource_name": _resource_name(index, write.get("resource_id")),
+                "view_type": expected_view_type,
+                "shader_stage": root_binding.get("stage"),
+                "root_index": root_binding.get("root_index"),
+                "root_descriptor_index": root_binding.get("descriptor_index"),
+                "descriptor_index": str(descriptor_index),
+                "binding_slot": _int_or_none(descriptor_range.get("base_register")) or slot,
+                "register_space": _int_or_none(descriptor_range.get("register_space")),
+                "source": "database_resolved",
+                "confidence": 1.0,
+                "resource_dimension": _resource_dimension_from_descriptor(write),
+                "descriptor_write": write,
+                "root_binding": root_binding,
+                "root_signature_range": descriptor_range,
+                "diagnostics": {},
+            }
+            _append_event_bound_resource(rows, index, event, event_order, item)
+            resolved_any = True
+    return resolved_any
+
+
 def _insert_events(connection: sqlite3.Connection, index: dict[str, Any]) -> None:
     rows = []
     for order, event in enumerate(index.get("events", [])):
+        event_list = event.get("event_list") or {}
         rows.append(
             (
                 str(event.get("global_id")),
@@ -317,14 +418,49 @@ def _insert_events(connection: sqlite3.Connection, index: dict[str, Any]) -> Non
                 event.get("parent_global_id"),
                 _json_dumps(event.get("marker_path") or []),
                 event.get("pso_id"),
+                event.get("root_signature_id"),
+                _int_or_none(event_list.get("depth")),
+                event_list.get("start_time"),
+                event_list.get("duration"),
+                _json_dumps(event_list.get("counters") or {}),
                 _json_dumps(event),
             )
         )
     connection.executemany(
         """
         INSERT INTO events(global_id, event_order, name, event_type, is_shader_event, shader_stage_group, file, line,
-                           parent_global_id, marker_path_json, pso_id, event_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           parent_global_id, marker_path_json, pso_id, root_signature_id,
+                           event_depth, start_time, duration, counters_json, event_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def _insert_event_id_map(connection: sqlite3.Connection, index: dict[str, Any]) -> None:
+    rows = []
+    for item in index.get("event_id_map", []) or []:
+        queue_id = item.get("queue_id") or item.get("global_id")
+        if queue_id is None:
+            continue
+        diagnostics = item.get("diagnostics") or item.get("diagnostics_json") or {}
+        rows.append(
+            (
+                str(queue_id),
+                str(item.get("cpp_global_id")) if item.get("cpp_global_id") is not None else None,
+                item.get("event_name"),
+                item.get("cpp_event_name"),
+                item.get("match_strategy"),
+                item.get("confidence"),
+                item.get("status") or "missing",
+                _json_dumps(diagnostics if isinstance(diagnostics, dict) else {"raw": diagnostics}),
+            )
+        )
+    connection.executemany(
+        """
+        INSERT OR IGNORE INTO event_id_map(queue_id, cpp_global_id, event_name, cpp_event_name,
+                                           match_strategy, confidence, status, diagnostics_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -404,11 +540,28 @@ def _insert_descriptor_writes(connection: sqlite3.Connection, index: dict[str, A
     )
 
 
+def _root_parameter_layout(index: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
+    root_signature_id = binding.get("root_signature_id")
+    root_index = binding.get("root_index")
+    if root_signature_id is None or root_index is None:
+        return {}
+    root_signature = (index.get("root_signatures") or {}).get(str(root_signature_id)) or {}
+    parameters = root_signature.get("parameters") or {}
+    layout = parameters.get(str(root_index)) or {}
+    return dict(layout) if isinstance(layout, dict) else {}
+
+
+def _binding_with_root_layout(index: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
+    layout = _root_parameter_layout(index, binding)
+    return dict(binding, root_signature_layout=layout) if layout else dict(binding)
+
+
 def _insert_root_bindings(connection: sqlite3.Connection, index: dict[str, Any]) -> None:
     rows = []
     for event_order, event in enumerate(index.get("events", [])):
         global_id = str(event.get("global_id"))
         for binding in (event.get("root_descriptor_tables") or {}).values():
+            binding_payload = _binding_with_root_layout(index, binding)
             rows.append(
                 (
                     global_id,
@@ -422,10 +575,11 @@ def _insert_root_bindings(connection: sqlite3.Connection, index: dict[str, Any])
                     None,
                     _int_or_none(binding.get("line")),
                     binding.get("text"),
-                    _json_dumps(binding),
+                    _json_dumps(binding_payload),
                 )
             )
         for binding in (event.get("root_constant_buffer_views") or {}).values():
+            binding_payload = _binding_with_root_layout(index, binding)
             rows.append(
                 (
                     global_id,
@@ -439,7 +593,7 @@ def _insert_root_bindings(connection: sqlite3.Connection, index: dict[str, Any])
                     binding.get("offset"),
                     _int_or_none(binding.get("line")),
                     binding.get("text"),
-                    _json_dumps(binding),
+                    _json_dumps(binding_payload),
                 )
             )
     connection.executemany(
@@ -447,6 +601,59 @@ def _insert_root_bindings(connection: sqlite3.Connection, index: dict[str, Any])
         INSERT INTO root_bindings(global_id, event_order, binding_type, stage, root_index, descriptor_index, heap_id,
                                   resource_id, offset, line, text, binding_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def _insert_root_signature_layout(connection: sqlite3.Connection, index: dict[str, Any]) -> None:
+    rows = []
+    for root_signature_id, root_signature in (index.get("root_signatures") or {}).items():
+        parameters = (root_signature or {}).get("parameters") or {}
+        for root_index, layout in parameters.items():
+            if not isinstance(layout, dict):
+                continue
+            parameter_type = layout.get("type") or layout.get("parameter_type")
+            ranges = layout.get("ranges") or []
+            if ranges:
+                for range_index, descriptor_range in enumerate(ranges):
+                    if not isinstance(descriptor_range, dict):
+                        continue
+                    rows.append(
+                        (
+                            str(root_signature_id),
+                            str(root_index),
+                            parameter_type,
+                            range_index,
+                            descriptor_range.get("range_type") or descriptor_range.get("type"),
+                            _int_or_none(descriptor_range.get("base_register")),
+                            _int_or_none(descriptor_range.get("register_space")),
+                            _int_or_none(descriptor_range.get("descriptor_count")),
+                            _int_or_none(descriptor_range.get("offset")),
+                            _json_dumps(dict(layout, range=descriptor_range)),
+                        )
+                    )
+            else:
+                rows.append(
+                    (
+                        str(root_signature_id),
+                        str(root_index),
+                        parameter_type,
+                        None,
+                        None,
+                        _int_or_none(layout.get("base_register")),
+                        _int_or_none(layout.get("register_space")),
+                        None,
+                        None,
+                        _json_dumps(layout),
+                    )
+                )
+    connection.executemany(
+        """
+        INSERT OR IGNORE INTO root_signature_layout(root_signature_id, root_index, parameter_type, range_index,
+                                                    range_type, base_register, register_space, descriptor_count,
+                                                    offset, layout_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -524,6 +731,8 @@ def _precompute_event_bound_resources(index: dict[str, Any]) -> list[dict[str, A
         for root_binding in (event.get("root_descriptor_tables") or {}).values():
             start = _int_or_none(root_binding.get("descriptor_index"))
             if start is None:
+                continue
+            if _append_descriptor_table_resources(rows, index, event, event_order, root_binding, start):
                 continue
             for descriptor_index in range(start, start + 32):
                 write = _latest_descriptor_write(index, descriptor_index, root_binding.get("heap_id"), root_binding.get("line"))
@@ -635,15 +844,45 @@ def _insert_shader_metadata(connection: sqlite3.Connection, index: dict[str, Any
     )
 
 
+def _insert_shader_bindings(connection: sqlite3.Connection, index: dict[str, Any]) -> None:
+    rows = []
+    for binding in index.get("shader_bindings", []) or []:
+        rows.append(
+            (
+                str(binding.get("pso_id")) if binding.get("pso_id") is not None else None,
+                binding.get("stage"),
+                binding.get("binding_name") or binding.get("shader_binding_name"),
+                binding.get("register_type"),
+                _int_or_none(binding.get("register_slot") if binding.get("register_slot") is not None else binding.get("shader_binding_slot")),
+                _int_or_none(binding.get("register_space")),
+                binding.get("view_type"),
+                binding.get("resource_dimension"),
+                binding.get("declaration_type"),
+                _json_dumps(binding),
+            )
+        )
+    connection.executemany(
+        """
+        INSERT INTO shader_bindings(pso_id, stage, binding_name, register_type, register_slot, register_space,
+                                    view_type, resource_dimension, declaration_type, binding_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
 def _populate_database(connection: sqlite3.Connection, index: dict[str, Any]) -> None:
     _execute_schema(connection)
     _insert_events(connection, index)
+    _insert_event_id_map(connection, index)
     _insert_resources(connection, index)
     _insert_resource_references(connection, index)
     _insert_descriptor_writes(connection, index)
     _insert_root_bindings(connection, index)
+    _insert_root_signature_layout(connection, index)
     _insert_event_bound_resources(connection, index)
     _insert_shader_metadata(connection, index)
+    _insert_shader_bindings(connection, index)
     _set_metadata(
         connection,
         {

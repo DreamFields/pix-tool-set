@@ -1,0 +1,54 @@
+{
+  "scenario_name": "Graphics Pipeline with DB and PDB Resolution",
+  "description": "A graphics rendering scenario with Vertex Shader and Pixel Shader, featuring vertex buffers, index buffer, constant buffer views, shader resource views (buffers and textures), samplers, render targets, depth/stencil, and PDB-resolved shader source. Based on GlobalID=3854 resource bindings.",
+  "capture_db": "capture_db/capture.db",
+  "test_cases": [
+    {
+      "id": "s3_tc01",
+      "tool": "db-get-event-resource",
+      "description": "Retrieve all bound resources for a graphics draw event (GlobalID=3854). Expects VB, IB, CBV, SRV Buffer, SRV Texture, Sampler, RTV, Depth, Stencil.",
+      "input": {
+        "global_id": 3854
+      },
+      "expected_output_file": "expected_output/s3_tc01_event_resources.json",
+      "assertions": [
+        "status == success",
+        "resource_count == 26",
+        "resources contain view_type == 'VB'",
+        "resources contain view_type == 'IB'",
+        "resources contain view_type == 'CBV'",
+        "resources contain view_type == 'SRV'",
+        "resources contain view_type == 'Sampler'",
+        "resources contain view_type == 'RTV'",
+        "resources contain view_type == 'Depth'",
+        "resources contain view_type == 'Stencil'",
+        "resources contain display_name == 'VB 0'",
+        "resources contain display_name == 'VB 4'",
+        "resources contain display_name == 'VB 5'",
+        "resources contain display_name == 'IB'",
+        "resources contain display_name == 'CBV 0 : View'",
+        "resources contain display_name == 'CBV 1 : Scene'",
+        "resources contain display_name == 'CBV 2 : LocalVF'",
+        "resources contain display_name == 'SRV Buffer 0 : InstanceCulling_InstanceIdsBuffer'",
+        "resources contain display_name == 'SRV Buffer 1 : Scene_GPUScene_GPUSceneInstanceSceneData'",
+        "resources contain display_name == 'SRV Buffer 2 : Scene_GPUScene_GPUScenePrimitiveSceneData'",
+        "resources contain display_name == 'SRV Buffer 3 : LocalVF_VertexFetch_PackedTangentsBuffer'",
+        "resources contain display_name == 'CBV 0 : View'",
+        "resources contain display_name == 'CBV 1 : Material'",
+        "resources contain display_name == 'SRV Buffer 0 : Scene_GPUScene_GPUScenePrimitiveSceneData'",
+        "resources contain display_name == 'SRV Texture 1 : OpaqueBasePass_DBufferATexture'",
+        "resources contain display_name == 'SRV Texture 2 : OpaqueBasePass_DBufferBTexture'",
+        "resources contain display_name == 'SRV Texture 3 : OpaqueBasePass_DBufferCTexture'",
+        "resources contain display_name == 'Sampler 0 : OpaqueBasePass_DBufferATextureSampler'",
+        "resources contain display_name == 'RTV 0 : SceneColor'",
+        "resources contain display_name == 'RTV 1 : GBufferA'",
+        "resources contain display_name == 'RTV 2 : GBufferB'",
+        "resources contain display_name == 'RTV 3 : GBufferC'",
+        "resources contain display_name == 'RTV 4 : GBufferD'",
+        "resources contain display_name == 'RTV 5 : GBufferG'",
+        "resources contain display_name == 'Depth : SceneDepthZ'",
+        "resources contain display_name == 'Stencil : SceneDepthZ'"
+      ]
+    }
+  ]
+}

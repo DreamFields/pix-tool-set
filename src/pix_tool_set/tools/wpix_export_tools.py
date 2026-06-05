@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,11 @@ from pix_tool_set.results import ToolResult
 
 @tool(
     name="export-to-cpp",
-    description="Export a PIX .wpix capture file to a C++ project directory using pixtool.exe.",
+    description=(
+        "Export a PIX .wpix capture file to a C++ project directory using pixtool.exe. "
+        "This is a long-running synchronous operation that may take several minutes for large captures; "
+        "callers should wait for completion instead of retrying or assuming the tool is stuck."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -45,6 +50,7 @@ from pix_tool_set.results import ToolResult
     requires_cpp_export=False,
 )
 def export_to_cpp(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    start_time = time.monotonic()
     capture_path = Path(args["capture_path"]).expanduser().resolve()
     if not capture_path.exists():
         raise PixToolError(
@@ -81,6 +87,7 @@ def export_to_cpp(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     "capture_path": str(capture_path),
                     "export_dir": str(export_dir),
                     "created": False,
+                    "duration_seconds": round(time.monotonic() - start_time, 3),
                     "skipped_reason": "C++ export already exists and is valid. Use force=true to re-export.",
                 }
             )
@@ -138,7 +145,9 @@ def export_to_cpp(args: dict[str, Any], context: ToolContext) -> ToolResult:
         )
 
     export_info = CppExportInfo(capture_path=capture_path, export_dir=export_dir, created=True)
+    result = export_info.to_dict()
+    result["duration_seconds"] = round(time.monotonic() - start_time, 3)
     return ToolResult.success(
-        export_info.to_dict(),
+        result,
         output_paths=[str(export_dir)],
     )

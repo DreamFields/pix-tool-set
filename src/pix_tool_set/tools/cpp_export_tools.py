@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any
 
@@ -28,33 +28,48 @@ def check_cpp_export(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
 @tool(
     name="build-index",
-    description="Build or refresh the reusable index for a PIX C++ export directory.",
+    description="Build or refresh the capture database from a PIX save-event-list CSV export.",
     parameters={
         "type": "object",
         "properties": {
-            "capture_path": {"type": "string", "description": "Optional PIX .wpix capture path."},
-            "export_dir": {"type": "string", "description": "PIX C++ export directory."},
-            "auto_export": {"type": "boolean", "description": "Export C++ project with pixtool when missing."},
-            "refresh": {"type": "boolean", "description": "Rebuild the index even if cache is valid."},
+            "capture_path": {"type": "string", "description": "PIX .wpix capture path used by pixtool save-event-list."},
+            "export_dir": {"type": "string", "description": "Output root directory for event-list CSV, index.json, and capture.sqlite. Defaults from capture_path."},
+            "refresh": {"type": "boolean", "description": "Regenerate the event-list CSV and database even if cache is valid."},
+            "pixtool_path": {"type": "string", "description": "Optional path to pixtool.exe. Defaults to Microsoft PIX 2603.25."},
+            "counters": {"type": "string", "description": "Optional save-event-list counters pattern passed as --counters=<pattern>."},
         },
+        "required": ["capture_path"],
         "additionalProperties": False,
     },
-    requires_cpp_export=True,
+    requires_cpp_export=False,
 )
 def build_export_index(args: dict[str, Any], context: ToolContext) -> ToolResult:
     from pathlib import Path
 
-    from pix_tool_set.indexer import build_index
+    from pix_tool_set.indexer import build_index_from_capture
 
-    index = build_index(args["export_dir"], refresh=bool(args.get("refresh", False)))
-    index_path = Path(args["export_dir"]) / ".cache" / "pix-tool-set" / "index.json"
+    index = build_index_from_capture(
+        capture_path=args["capture_path"],
+        export_dir=args.get("export_dir"),
+        refresh=bool(args.get("refresh", False)),
+        pixtool_path=args.get("pixtool_path"),
+        counters=args.get("counters"),
+        workspace=context.workspace,
+    )
+    index_path = Path(index["export_dir"]) / ".cache" / "pix-tool-set" / "index.json"
     output_paths = [str(index_path)]
+    if index.get("event_list_csv_path"):
+        output_paths.append(str(index["event_list_csv_path"]))
     if index.get("database_path"):
         output_paths.append(str(index["database_path"]))
     return ToolResult.success(
         {
+            "capture_path": index.get("capture_path"),
             "export_dir": index["export_dir"],
             "cache_hit": index.get("cache_hit", False),
+            "event_list_csv_path": index.get("event_list_csv_path"),
+            "event_list_cache_hit": index.get("event_list_cache_hit", False),
+            "event_list_refreshed": index.get("event_list_refreshed", False),
             "diagnostics": index["diagnostics"],
             "index_path": str(index_path),
             "database_path": index.get("database_path"),

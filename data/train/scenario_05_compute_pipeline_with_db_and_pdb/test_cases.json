@@ -1,0 +1,38 @@
+{
+  "scenario_name": "Compute Pipeline with DB and PDB Resolution",
+  "description": "A compute dispatch scenario (GlobalID=3968) with CS stage featuring constant buffer views, shader resource views (buffers and textures), and unordered access views.",
+  "capture_db": "capture_db/capture.db",
+  "test_cases": [
+    {
+      "id": "s5_tc01",
+      "tool": "db-get-event-resource",
+      "description": "Retrieve all bound resources for a compute dispatch event (GlobalID=3968). Expects CBV, SRV Buffer, SRV Texture, UAV Texture.",
+      "input": {
+        "global_id": 3968
+      },
+      "expected_output_file": "expected_output/s5_tc01_event_resources.json",
+      "assertions": [
+        "status == success",
+        "resource_count == 15",
+        "resources contain view_type == 'CBV'",
+        "resources contain view_type == 'SRV'",
+        "resources contain view_type == 'UAV'",
+        "resources contain display_name == 'CBV 0 : _RootShaderParameters'",
+        "resources contain display_name == 'CBV 1 : View'",
+        "resources contain display_name == 'CBV 2 : VirtualShadowMap'",
+        "resources contain display_name == 'CBV 3 : ForwardLightStruct'",
+        "resources contain display_name == 'SRV Buffer 0 : VirtualShadowMap_LightGridData'",
+        "resources contain display_name == 'SRV Buffer 1 : VirtualShadowMap_NumCulledLightsGrid'",
+        "resources contain display_name == 'SRV Buffer 2 : VirtualShadowMap_DirectionalLightIds'",
+        "resources contain display_name == 'SRV Buffer 3 : VirtualShadowMap_ProjectionData'",
+        "resources contain display_name == 'SRV Buffer 4 : ForwardLightStruct_ForwardLightBuffer'",
+        "resources contain display_name == 'SRV Buffer 5 : ForwardLightStruct_NumCulledLightsGrid'",
+        "resources contain display_name == 'SRV Texture 6 : SceneTexturesStruct_SceneDepthTexture'",
+        "resources contain display_name == 'SRV Texture 7 : SceneTexturesStruct_GBufferATexture'",
+        "resources contain display_name == 'SRV Texture 8 : SceneTexturesStruct_GBufferBTexture'",
+        "resources contain display_name == 'UAV Texture 0 : OutPageRequestFlags'",
+        "resources contain display_name == 'UAV Texture 1 : OutPageReceiverMasks'"
+      ]
+    }
+  ]
+}

@@ -7,6 +7,13 @@ from .context import ToolContext
 from .errors import PixToolError
 from .results import ToolResult
 
+RESTORED_NON_DB_TOOLS = {
+    "check-cpp-export",
+    "build-index",
+    "export-to-cpp",
+    "get-event-shader-source",
+}
+
 Exposure = Literal["cli", "mcp", "both"]
 ToolHandler = Callable[[dict[str, Any], ToolContext], ToolResult]
 
@@ -59,6 +66,8 @@ class ToolRegistry:
         requires_cpp_export: bool = False,
     ) -> Callable[[ToolHandler], ToolHandler]:
         def _decorate(handler: ToolHandler) -> ToolHandler:
+            if not name.startswith("db-") and name not in RESTORED_NON_DB_TOOLS:
+                return handler
             self.register(
                 ToolDefinition(
                     name=name,

@@ -1,0 +1,241 @@
+{
+  "global_id": "3553",
+  "status": "success",
+  "event": {
+    "global_id": 3553,
+    "event_type": "Draw",
+    "name": "DrawIndexed",
+    "is_shader_event": true,
+    "pso_id": null,
+    "shader_stage_group": "CS"
+  },
+  "resource_count": 15,
+  "resources": [
+    {
+      "root_index": 0,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "Resource Allocator Underlying Buffer",
+      "view_type": "CBV",
+      "shader_binding_name": "_RootShaderParameters",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "CBV 0 : _RootShaderParameters",
+      "descriptor_write": null,
+      "root_binding": {
+        "slot": 0
+      }
+    },
+    {
+      "root_index": 1,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "Resource Allocator Underlying Buffer",
+      "view_type": "CBV",
+      "shader_binding_name": "View",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "CBV 1 : View",
+      "descriptor_write": null,
+      "root_binding": {
+        "slot": 1
+      }
+    },
+    {
+      "root_index": 2,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "Resource Allocator Underlying Buffer",
+      "view_type": "CBV",
+      "shader_binding_name": "ReflectionCaptureSM5",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "CBV 2 : ReflectionCaptureSM5",
+      "descriptor_write": null,
+      "root_binding": {
+        "slot": 2
+      }
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "HZBFurthest",
+      "view_type": "SRV",
+      "shader_binding_name": "HZBTexture",
+      "shader_declaration_type": null,
+      "resource_dimension": "Texture",
+      "register_space": null,
+      "display_name": "SRV Texture 0 : HZBTexture",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "ViewSpacePosAndRadiusData",
+      "view_type": "SRV",
+      "shader_binding_name": "LightViewSpacePositionAndRadius",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "SRV Buffer 1 : LightViewSpacePositionAndRadius",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "ViewSpaceDirAndPreprocAngleData",
+      "view_type": "SRV",
+      "shader_binding_name": "LightViewSpaceDirAndPreprocAngle",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "SRV Buffer 2 : LightViewSpaceDirAndPreprocAngle",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "ViewSpaceRectPlanesData",
+      "view_type": "SRV",
+      "shader_binding_name": "LightViewSpaceRectPlanes",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "SRV Buffer 3 : LightViewSpaceRectPlanes",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "ViewSpaceClipBoxData",
+      "view_type": "SRV",
+      "shader_binding_name": "LightViewSpaceClipBoxData",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "SRV Buffer 4 : LightViewSpaceClipBoxData",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "IndirectionIndices",
+      "view_type": "SRV",
+      "shader_binding_name": "IndirectionIndices",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "SRV Buffer 5 : IndirectionIndices",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "NumCulledLightsGrid",
+      "view_type": "UAV",
+      "shader_binding_name": "RWNumCulledLightsGrid",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "UAV Buffer 0 : RWNumCulledLightsGrid",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "CulledLightDataGrid",
+      "view_type": "UAV",
+      "shader_binding_name": "RWCulledLightDataGrid16Bit",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "UAV Buffer 1 : RWCulledLightDataGrid16Bit",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "CulledLightDataAllocator",
+      "view_type": "UAV",
+      "shader_binding_name": "RWCulledLightDataAllocator",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "UAV Buffer 2 : RWCulledLightDataAllocator",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "CulledLightLinkAllocator",
+      "view_type": "UAV",
+      "shader_binding_name": "RWCulledLightLinkAllocator",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "UAV Buffer 3 : RWCulledLightLinkAllocator",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "CulledLightLinks",
+      "view_type": "UAV",
+      "shader_binding_name": "RWCulledLightLinks",
+      "shader_declaration_type": null,
+      "resource_dimension": "Buffer",
+      "register_space": null,
+      "display_name": "UAV Buffer 4 : RWCulledLightLinks",
+      "descriptor_write": null,
+      "root_binding": {}
+    },
+    {
+      "root_index": null,
+      "stage": "CS",
+      "root_descriptor_index": null,
+      "resource_name": "D3DStaticPointClampedSampler",
+      "view_type": "Sampler",
+      "shader_binding_name": null,
+      "shader_declaration_type": null,
+      "resource_dimension": "Sampler",
+      "register_space": 1000,
+      "display_name": "Static Sampler [1, space=1000] : D3DStaticPointClampedSampler",
+      "descriptor_write": null,
+      "root_binding": {
+        "slot": 0
+      }
+    }
+  ],
+  "diagnostics": {
+    "database_hit": true,
+    "database_path": "capture_db/capture.db",
+    "query_mode": "sqlite",
+    "refreshed_source_cache": false,
+    "refreshed_from_database": false,
+    "reason": null
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "scenario_name": "Graphics Pipeline with DB and PDB Resolution (GlobalID=3553)",
+  "description": "A compute shader dispatch scenario with multiple constant buffers, shader resource views (textures and buffers), unordered access views, and a static sampler. Based on GlobalID=3553 resource bindings.",
+  "capture_db": "capture_db/capture.db",
+  "test_cases": [
+    {
+      "id": "s4_tc01",
+      "tool": "db-get-event-resource",
+      "description": "Retrieve all bound resources for a compute dispatch event (GlobalID=3553). Expects CBV, SRV Texture, SRV Buffer, UAV Buffer, and Sampler.",
+      "input": {
+        "global_id": 3553
+      },
+      "expected_output_file": "expected_output/s4_tc01_event_resources.json",
+      "assertions": [
+        "status == success",
+        "resource_count >= 15",
+        "resources contain view_type == 'CBV'",
+        "resources contain view_type == 'SRV'",
+        "resources contain view_type == 'UAV'",
+        "resources contain view_type == 'Sampler'",
+        "one resource has display_name == 'CBV 0 : _RootShaderParameters'",
+        "one resource has display_name == 'CBV 1 : View'",
+        "one resource has display_name == 'CBV 2 : ReflectionCaptureSM5'",
+        "one resource has display_name == 'SRV Texture 0 : HZBTexture'",
+        "one resource has display_name == 'SRV Buffer 1 : LightViewSpacePositionAndRadius'",
+        "one resource has display_name == 'SRV Buffer 2 : LightViewSpaceDirAndPreprocAngle'",
+        "one resource has display_name == 'SRV Buffer 3 : LightViewSpaceRectPlanes'",
+        "one resource has display_name == 'SRV Buffer 4 : LightViewSpaceClipBoxData'",
+        "one resource has display_name == 'SRV Buffer 5 : IndirectionIndices'",
+        "one resource has display_name == 'UAV Buffer 0 : RWNumCulledLightsGrid'",
+        "one resource has display_name == 'UAV Buffer 1 : RWCulledLightDataGrid16Bit'",
+        "one resource has display_name == 'UAV Buffer 2 : RWCulledLightDataAllocator'",
+        "one resource has display_name == 'UAV Buffer 3 : RWCulledLightLinkAllocator'",
+        "one resource has display_name == 'UAV Buffer 4 : RWCulledLightLinks'",
+        "one resource has display_name == 'Static Sampler [1, space=1000] : D3DStaticPointClampedSampler'"
+      ]
+    },
+    {
+      "id": "s4_tc02",
+      "tool": "db-get-event-shader-source",
+      "description": "Retrieve shader source for a compute dispatch event (GlobalID=3553). Expects CS stage.",
+      "input": {
+        "global_id": 3553
+      },
+      "expected_output_file": "expected_output/s4_tc02_shader_source.json",
+      "assertions": [
+        "status == success",
+        "stage_count >= 1",
+        "stages[0].stage == 'CS'",
+        "CS source contains 'RWStructuredBuffer' or 'RWBuffer'"
+      ]
+    }
+  ]
+}
