@@ -1,0 +1,509 @@
+"""Requirement section 5: shader analysis."""
+
+from __future__ import annotations
+
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+from ..context import ToolContext
+from ..engine.model import ShaderStage
+from ..errors import invalid_argument, not_found
+from ..results import ToolResult
+from ._common import (
+    DRAW_SELECTOR,
+    PAGE_PARAMS,
+    page_args,
+    page_envelope,
+    tool,
+    with_session,
+)
+
+_STAGES = [stage.value for stage in ShaderStage]
+
+_SOURCE_NOTE = (
+    "PIX captures store compiled bytecode. Original HLSL text survives only when the "
+    "shader was built with embedded debug info (/Zi /Qembed_debug). When it is absent, "
+    "these tools return the DXIL disassembly, which carries the full signature, resource "
+    "binding table, entry point and IR. The `has_embedded_source` flag tells you which "
+    "case you are in."
+)
+
+_SHADER_SELECTOR: dict[str, Any] = {
+    "pso_id": {"type": "integer", "description": "Pipeline state that owns the shader."},
+    "stage": {"type": "string", "enum": _STAGES, "description": "Shader stage to select."},
+    "shader_hash": {"type": "string", "description": "Shader hash or PDB debug name."},
+    **DRAW_SELECTOR,
+}
+
+
+def _resolve_shader(capture, args: dict[str, Any]):
+    shader = capture.find_shader(
+        pso_id=args.get("pso_id"),
+        stage=args.get("stage"),
+        shader_hash=args.get("shader_hash"),
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+    )
+    if shader is None:
+        raise not_found(
+            "shader",
+            args.get("shader_hash") or args.get("pso_id") or args.get("draw_index"),
+            "Use list-shaders to find a pso_id + stage pair, or pass --draw-index.",
+        )
+    return shader
+
+
+@tool(
+    name="shader-stats",
+    summary=(
+        "Shader inventory: counts per stage, unique shaders after de-duplication by hash, "
+        "size distribution, and how many draws each stage serves."
+    ),
+    category="shaders",
+    parameters=with_session(
+        used_only={"type": "boolean", "description": "Only count shaders bound by a draw."},
+        top={"type": "integer", "description": "How many largest shaders to list. Default 10."},
+    ),
+    returns="Per-stage counts, byte totals and the largest shaders.",
+    examples=["pix-tool-set shader-stats", "pix-tool-set shader-stats --used-only"],
+    notes=_SOURCE_NOTE,
+)
+def shader_stats(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    used_only = bool(args.get("used_only"))
+    shaders, _total = capture.find_shaders(used_only=used_only)
+
+    by_stage: dict[str, dict[str, Any]] = {}
+    for shader in shaders:
+        entry = by_stage.setdefault(
+            shader.stage.value,
+            {"stage": shader.stage.value, "count": 0, "unique": set(), "bytes": 0},
+        )
+        entry["count"] += 1
+        entry["unique"].add(shader.key)
+        entry["bytes"] += shader.byte_size
+    stage_rows = []
+    for entry in by_stage.values():
+        stage_rows.append(
+            {
+                "stage": entry["stage"],
+                "count": entry["count"],
+                "unique_count": len(entry["unique"]),
+                "total_bytes": entry["bytes"],
+            }
+        )
+    stage_rows.sort(key=lambda row: -row["count"])
+
+    draw_stage_counter: Counter[str] = Counter()
+    for draw in capture.draw_calls:
+        for shader in draw.shaders:
+            draw_stage_counter[shader.stage.value] += 1
+
+    top_count = int(args.get("top") or 10)
+    largest = sorted(shaders, key=lambda s: -s.byte_size)[:top_count]
+
+    result = ToolResult.success(
+        {
+            "totals": {
+                "shaders": len(shaders),
+                "unique_shaders": len({s.key for s in shaders}),
+                "total_bytes": sum(s.byte_size for s in shaders),
+                "pipeline_states": len(capture.pipeline_states),
+            },
+            "by_stage": stage_rows,
+            "stage_bindings_per_draw": dict(draw_stage_counter),
+            "largest": [s.to_dict() for s in largest],
+            "capabilities": {"disassembly_available": capture.disassembly_available},
+        }
+    )
+    if not capture.disassembly_available:
+        result.degrade(
+            "dxcompiler.dll is unavailable, so disassembly-derived fields stay empty.",
+            reason=capture.disassembly_unavailable_reason,
+        )
+    return result
+
+
+@tool(
+    name="list-shaders",
+    summary="List shaders with stage, owning PSO, size, hash and PDB debug name.",
+    category="shaders",
+    parameters=with_session(
+        PAGE_PARAMS,
+        stage={"type": "string", "enum": _STAGES, "description": "Restrict to one stage."},
+        name={"type": "string", "description": "Substring match on hash or debug name."},
+        used_only={"type": "boolean", "description": "Only shaders bound by a draw."},
+        unique={"type": "boolean", "description": "Collapse duplicates by stage+hash."},
+    ),
+    returns="Paged shader list.",
+    examples=[
+        "pix-tool-set list-shaders --stage CS --unique --limit 30",
+    ],
+)
+def list_shaders(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    offset, limit = page_args(args)
+    window, total = capture.find_shaders(
+        stage=args.get("stage"),
+        name=args.get("name"),
+        used_only=bool(args.get("used_only")),
+        unique=bool(args.get("unique")),
+        offset=offset,
+        limit=limit,
+    )
+    return ToolResult.success(
+        {
+            "shaders": [shader.to_dict() for shader in window],
+            **page_envelope(total, offset, limit, len(window)),
+        }
+    )
+
+
+@tool(
+    name="shader-info",
+    summary=(
+        "Detail for one shader: stage, size, hash, DXBC chunk inventory, entry point, "
+        "thread group size and which draws use it."
+    ),
+    category="shaders",
+    parameters=with_session(
+        _SHADER_SELECTOR,
+        max_draws={"type": "integer", "description": "Cap on listed consumer draws. Default 10."},
+    ),
+    returns="Shader metadata plus consumer draw list.",
+    examples=[
+        "pix-tool-set shader-info --pso-id 3184 --stage PS",
+        "pix-tool-set shader-info --draw-index 2461 --stage VS",
+    ],
+    notes=_SOURCE_NOTE,
+)
+def shader_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    shader = _resolve_shader(capture, args)
+    max_draws = int(args.get("max_draws") or 10)
+
+    consumers = [
+        {
+            "draw_index": draw.index,
+            "global_id": draw.global_id,
+            "api": draw.api,
+            "pass_name": draw.pass_name,
+        }
+        for draw in capture.draw_calls
+        if draw.pso_id == shader.pso_id
+    ]
+
+    data = {
+        "shader": shader.to_dict(detail=True),
+        "pipeline_state": (
+            capture.pipeline_states[shader.pso_id].to_dict()
+            if shader.pso_id in capture.pipeline_states
+            else None
+        ),
+        "consumers": consumers[:max_draws],
+        "consumer_count": len(consumers),
+        "has_embedded_source": shader.has_embedded_source,
+    }
+    result = ToolResult.success(data)
+    if not capture.disassembly_available:
+        result.degrade("Disassembly unavailable; entry point and thread size are unknown.")
+    return result
+
+
+@tool(
+    name="disassemble-shader",
+    summary=(
+        "Disassemble a shader to DXIL/DXBC text. Optionally write it to a file and/or "
+        "dump the raw bytecode."
+    ),
+    category="shaders",
+    parameters=with_session(
+        _SHADER_SELECTOR,
+        output={"type": "string", "description": "Write the disassembly text here."},
+        bytecode_output={"type": "string", "description": "Write the raw .dxbc blob here."},
+        max_lines={
+            "type": "integer",
+            "description": "Trim the inline text to this many lines. Default 400; 0 means no limit.",
+        },
+        prefer_source={
+            "type": "boolean",
+            "description": "Return embedded HLSL when the shader carries it.",
+        },
+    ),
+    returns="Disassembly text (possibly trimmed) and any written file paths.",
+    examples=[
+        "pix-tool-set disassemble-shader --pso-id 2972 --stage CS",
+        "pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt --max-lines 0",
+    ],
+    notes=_SOURCE_NOTE,
+    aliases=["shader-source"],
+)
+def disassemble_shader(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    shader = _resolve_shader(capture, args)
+
+    prefer_source = bool(args.get("prefer_source"))
+    embedded = shader.embedded_source if prefer_source else ""
+    text = embedded or shader.disassembly
+    kind = "hlsl" if embedded else "dxil-disassembly"
+
+    output_paths: list[str] = []
+    if args.get("output") and text:
+        path = context.resolve_output(args.get("output"), f"{shader.key.replace(':', '_')}.txt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", errors="replace")
+        output_paths.append(str(path))
+    if args.get("bytecode_output"):
+        blob = shader.bytecode
+        if blob:
+            path = context.resolve_output(
+                args.get("bytecode_output"), f"{shader.key.replace(':', '_')}.dxbc"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(blob)
+            output_paths.append(str(path))
+
+    max_lines = args.get("max_lines")
+    max_lines = 400 if max_lines is None else int(max_lines)
+    lines = text.splitlines()
+    truncated = bool(max_lines) and len(lines) > max_lines
+    inline = "\n".join(lines[:max_lines]) if truncated else text
+
+    data = {
+        "shader": shader.to_dict(),
+        "content_kind": kind,
+        "line_count": len(lines),
+        "truncated": truncated,
+        "text": inline,
+    }
+    if not text:
+        result = ToolResult.partial(data, output_paths=output_paths)
+        result.degrade(
+            "No disassembly could be produced for this shader.",
+            reason=capture.disassembly_unavailable_reason or "empty bytecode",
+        )
+        return result
+    result = ToolResult.success(data, output_paths=output_paths)
+    if truncated:
+        result.add_diagnostic(
+            "info",
+            f"Inline text trimmed to {max_lines} of {len(lines)} lines; pass --max-lines 0 or -o to get everything.",
+        )
+    if prefer_source and not embedded:
+        result.degrade(
+            "This shader has no embedded HLSL, so the DXIL disassembly is returned instead."
+        )
+    return result
+
+
+@tool(
+    name="shader-reflection",
+    summary=(
+        "Reflection data for a shader: input and output signature elements, declared "
+        "resource bindings, thread group size and pipeline validation info."
+    ),
+    category="shaders",
+    parameters=with_session(_SHADER_SELECTOR),
+    returns="Signatures, resource declarations and metadata.",
+    examples=["pix-tool-set shader-reflection --pso-id 3184 --stage VS"],
+    notes=_SOURCE_NOTE,
+)
+def shader_reflection(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    shader = _resolve_shader(capture, args)
+
+    inputs = [element.to_dict() for element in shader.input_signature]
+    outputs = [element.to_dict() for element in shader.output_signature]
+    bindings = shader.resource_bindings
+
+    data = {
+        "shader": shader.to_dict(detail=True),
+        "input_signature": inputs,
+        "output_signature": outputs,
+        "resource_bindings": bindings,
+        "constant_buffers": shader.constant_buffers,
+        "metadata": shader.metadata,
+        "counts": {
+            "inputs": len(inputs),
+            "outputs": len(outputs),
+            "declared_resources": len(bindings),
+        },
+    }
+    result = ToolResult.success(data)
+    if not bindings and not inputs:
+        result.degrade(
+            "Reflection came back empty; the shader may be a stub or disassembly is unavailable.",
+            reason=capture.disassembly_unavailable_reason,
+        )
+    return result
+
+
+@tool(
+    name="shader-bindings",
+    summary=(
+        "What a shader actually has bound at a given draw: the declared HLSL registers "
+        "matched against the concrete resources the root signature supplies."
+    ),
+    category="shaders",
+    parameters=with_session(
+        DRAW_SELECTOR,
+        stage={"type": "string", "enum": _STAGES, "description": "Shader stage to inspect."},
+        max_views={"type": "integer", "description": "Cap on views listed per table. Default 16."},
+    ),
+    returns="Declared registers, root parameter mapping and resolved resources.",
+    examples=["pix-tool-set shader-bindings --draw-index 2461 --stage PS"],
+)
+def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    draw = capture.resolve_draw(
+        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+    )
+    if draw is None:
+        raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
+
+    stage = args.get("stage")
+    shaders = [draw.shader(stage)] if stage else draw.shaders
+    shaders = [shader for shader in shaders if shader is not None]
+    if not shaders:
+        raise not_found("shader", stage or "any", "This draw has no shader for that stage.")
+
+    max_views = int(args.get("max_views") or 16)
+    signature = capture.root_signatures.get(draw.root_signature_id or -1)
+
+    stage_rows: list[dict[str, Any]] = []
+    for shader in shaders:
+        declared = shader.resource_bindings
+        stage_rows.append(
+            {
+                "stage": shader.stage.value,
+                "shader": shader.to_dict(),
+                "declared_registers": declared,
+                "declared_count": len(declared),
+            }
+        )
+
+    binding_rows: list[dict[str, Any]] = []
+    for binding in draw.bindings:
+        row = binding.to_dict(max_views=max_views)
+        parameter = signature.parameter(binding.root_index) if signature else None
+        if parameter is not None:
+            row["root_parameter"] = parameter.to_dict()
+        resolved = []
+        for view in binding.resolved_views[:max_views]:
+            entry = view.to_dict()
+            resource = (
+                capture.resource(view.resource_id) if view.resource_id is not None else None
+            )
+            if resource is not None:
+                entry["resource"] = resource.to_dict()
+            resolved.append(entry)
+        row["resolved"] = resolved
+        binding_rows.append(row)
+
+    return ToolResult.success(
+        {
+            "draw_index": draw.index,
+            "global_id": draw.global_id,
+            "pass_name": draw.pass_name,
+            "pso_id": draw.pso_id,
+            "root_signature": signature.to_dict() if signature else None,
+            "stages": stage_rows,
+            "root_bindings": binding_rows,
+            "descriptor_heap_ids": draw.descriptor_heap_ids,
+        }
+    )
+
+
+@tool(
+    name="constant-buffer",
+    summary=(
+        "Constant buffer layout and, when the backing bytes are recoverable, the values "
+        "bound at a draw."
+    ),
+    category="shaders",
+    parameters=with_session(
+        DRAW_SELECTOR,
+        stage={"type": "string", "enum": _STAGES, "description": "Shader stage to inspect."},
+        slot={"type": "integer", "description": "cbuffer register index (b#) to focus on."},
+        max_bytes={"type": "integer", "description": "Cap on dumped bytes per buffer. Default 512."},
+    ),
+    returns="cbuffer layouts, the root parameter that supplies them, and raw bytes when available.",
+    examples=["pix-tool-set constant-buffer --draw-index 2461 --stage PS"],
+    notes=(
+        "PIX C++ export records the GPU virtual address a root CBV points at, and the backing "
+        "buffer contents live in resources.bin only when the exporter captured that upload. "
+        "When bytes are unavailable the layout is still returned so the caller knows the field "
+        "structure."
+    ),
+)
+def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    draw = capture.resolve_draw(
+        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+    )
+    if draw is None:
+        raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
+
+    stage = args.get("stage")
+    shaders = [draw.shader(stage)] if stage else draw.shaders
+    shaders = [shader for shader in shaders if shader is not None]
+
+    layouts: list[dict[str, Any]] = []
+    for shader in shaders:
+        for buffer in shader.constant_buffers:
+            layouts.append({"stage": shader.stage.value, **buffer})
+
+    wanted_slot = args.get("slot")
+    declared: list[dict[str, Any]] = []
+    for shader in shaders:
+        for entry in shader.resource_bindings:
+            if entry.get("type") != "cbuffer":
+                continue
+            if wanted_slot is not None:
+                bind = entry.get("hlsl_bind", "")
+                if not bind.startswith(f"cb{wanted_slot}"):
+                    continue
+            declared.append({"stage": shader.stage.value, **entry})
+
+    from ..engine.model import RootParameterKind
+
+    suppliers: list[dict[str, Any]] = []
+    for binding in draw.bindings:
+        if binding.kind is not RootParameterKind.CBV:
+            continue
+        entry: dict[str, Any] = {
+            "root_index": binding.root_index,
+            "resource_id": binding.resource_id,
+            "byte_offset": binding.va_offset,
+        }
+        resource = (
+            capture.resource(binding.resource_id) if binding.resource_id is not None else None
+        )
+        if resource is not None:
+            entry["resource"] = resource.to_dict()
+        suppliers.append(entry)
+
+    result = ToolResult.success(
+        {
+            "draw_index": draw.index,
+            "global_id": draw.global_id,
+            "stages": [shader.stage.value for shader in shaders],
+            "declared_cbuffers": declared,
+            "layouts": layouts,
+            "root_cbv_suppliers": suppliers,
+            "values_available": False,
+        }
+    )
+    if not layouts:
+        result.degrade(
+            "No cbuffer layout could be recovered; disassembly may be unavailable.",
+            reason=capture.disassembly_unavailable_reason,
+        )
+    else:
+        result.add_diagnostic(
+            "info",
+            "Field layout is reported. Raw values are not read back because PIX resolves root "
+            "CBVs to GPU addresses rather than embedding the bytes for every draw.",
+        )
+    return result

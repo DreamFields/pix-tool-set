@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# local verification artefacts
+verify-out/
+outputs/
+
+# pixtool export caches (can be regenerated from the .wpix)
+*.pixcache/
+*.events.csv
+*.log
