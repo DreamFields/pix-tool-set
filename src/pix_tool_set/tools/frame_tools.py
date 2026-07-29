@@ -186,7 +186,7 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
         pass_name={"type": "string", "description": "Restrict to passes matching this name."},
         sort_by={
             "type": "string",
-            "enum": ["cost", "triangles", "threads", "pixels", "order"],
+            "enum": ["measured", "cost", "triangles", "threads", "pixels", "order"],
             "description": "Ordering. Default 'cost'.",
         },
     ),
@@ -248,13 +248,43 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if needle:
         rows = [row for row in rows if needle in row["name"].lower()]
 
+    # Prefer measured GPU time when the timing event list has been exported.
+    timing = capture.timing
+    measured_total_ns = 0
+    measured_passes = 0
+    if timing is not None:
+        by_pass: dict[int, tuple[int, int]] = {}
+        for sample in timing.by_queue_id.values():
+            entry = capture.find_pass_by_event(
+                global_id=sample.global_id, queue_id=sample.queue_id
+            )
+            if entry is None:
+                continue
+            total_ns, count = by_pass.get(entry["pass_index"], (0, 0))
+            by_pass[entry["pass_index"]] = (total_ns + sample.duration_ns, count + 1)
+        for row in rows:
+            found = by_pass.get(row["pass_index"])
+            if not found:
+                continue
+            total_ns, count = found
+            row["measured_duration_ns"] = total_ns
+            row["measured_duration_ms"] = round(total_ns / 1_000_000.0, 4)
+            row["measured_event_count"] = count
+            measured_total_ns += total_ns
+            measured_passes += 1
+
     total_cost = sum(row["cost_score"] for row in rows)
     for row in rows:
         row["cost_share_percent"] = percent(row["cost_score"], total_cost)
+        if "measured_duration_ns" in row and measured_total_ns:
+            row["measured_share_percent"] = percent(
+                row["measured_duration_ns"], measured_total_ns
+            )
 
-    sort_by = args.get("sort_by") or "cost"
+    sort_by = args.get("sort_by") or ("measured" if measured_passes else "cost")
     sorters = {
         "cost": lambda r: -r["cost_score"],
+        "measured": lambda r: -r.get("measured_duration_ns", -1),
         "triangles": lambda r: -r["triangle_count"],
         "threads": lambda r: -r["thread_count"],
         "pixels": lambda r: -r["render_target_pixels"],
@@ -265,18 +295,30 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     result = ToolResult.success(
         {
-            "model": "workload-estimate",
+            "model": "measured-gpu-time" if measured_passes else "workload-estimate",
             "formula": "triangles + 0.05*threads + 0.001*rt_pixels + 500*pso_changes",
             "counters_available": sorted(counter_names),
+            "measured_timing_available": measured_passes > 0,
+            "measured_pass_count": measured_passes,
+            "measured_total_ms": (
+                round(measured_total_ns / 1_000_000.0, 3) if measured_total_ns else None
+            ),
+            "timing_column": timing.timing_column if timing is not None else None,
             "total_cost_score": round(total_cost, 2),
             "passes": window,
             "sort_by": sort_by,
             **page_envelope(len(rows), offset, limit, len(window)),
         }
     )
-    if not counter_names:
+    if measured_passes:
+        result.add_diagnostic(
+            "info",
+            f"{measured_passes} passes carry measured GPU time from "
+            f"'{timing.timing_column}'; cost_score is kept for passes without a sample.",
+        )
+    elif not counter_names:
         result.degrade(
             "No GPU counters in this capture, so timings are modelled rather than measured.",
-            hint="Re-open with `session-open --counters 'D3D*' --force` if the capture has counters.",
+            hint="Run `export-timing` once to replay the capture and record real durations.",
         )
     return result

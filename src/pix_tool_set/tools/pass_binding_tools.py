@@ -27,11 +27,32 @@ _STAGES = [stage.value for stage in ShaderStage]
 
 
 def _resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a pass from a name, a pass index, or any PIX GUI event id.
+
+    The PIX GUI shows a Global ID (actions only) and a Queue ID (every row), so
+    accepting both means a value copied straight off the GUI works here without
+    the caller first translating it into a draw index.
+    """
+    global_id = args.get("global_id")
+    queue_id = args.get("queue_id")
+    if global_id is not None or queue_id is not None:
+        entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
+        if entry is None:
+            label = f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
+            raise not_found(
+                "pass",
+                label,
+                "Use locate-event to check the id, or list-passes to browse passes.",
+            )
+        return entry
+
     key = args.get("pass_index")
     if key is None:
         key = args.get("pass_name")
     if key is None:
-        raise invalid_argument("pass_name/pass_index", "provide one of them")
+        raise invalid_argument(
+            "pass_name/pass_index/global_id/queue_id", "provide one of them"
+        )
     entry = capture.find_pass(key)
     if entry is None:
         raise not_found("pass", key, "Run list-passes to see valid names and indices.")
@@ -168,6 +189,17 @@ def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[st
     parameters=with_session(
         pass_name={"type": "string", "description": "Pass name (substring match)."},
         pass_index={"type": "integer", "description": "Pass index from list-passes."},
+        global_id={
+            "type": "integer",
+            "description": "PIX GUI 'Global ID' of a draw/dispatch inside the pass.",
+        },
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of any event in the pass, including the pass marker "
+                "itself. Present on every event, unlike Global ID."
+            ),
+        },
         stage={
             "type": "string",
             "enum": _STAGES,
@@ -194,6 +226,8 @@ def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[st
     examples=[
         'pix-tool-set pass-bindings --pass-name TileClassificationBuildLists --stage CS',
         "pix-tool-set pass-bindings --pass-index 270",
+        "pix-tool-set pass-bindings --global-id 3893",
+        "pix-tool-set pass-bindings --queue-id 18704",
         'pix-tool-set pass-bindings --pass-name TileClassification --all-matches',
     ],
     notes=_TRUST_NOTE,
@@ -249,6 +283,9 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "draw_count": entry["draw_count"],
                 "dispatch_count": entry["dispatch_count"],
                 "distinct_pso_ids": entry["pso_ids"],
+                "first_global_id": entry.get("first_global_id"),
+                "first_queue_id": entry.get("first_queue_id"),
+                "marker_queue_id": entry.get("marker_queue_id"),
                 "total_draws_in_pass": len(draws),
                 "draws_reported": len(draw_rows),
                 "draws": draw_rows,
@@ -294,35 +331,71 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         PAGE_PARAMS,
         name={"type": "string", "description": "Pass name or substring to look up."},
-        required=["name"],
+        global_id={
+            "type": "integer",
+            "description": "PIX GUI 'Global ID'; returns the pass containing that action.",
+        },
+        queue_id={
+            "type": "integer",
+            "description": "PIX GUI 'Queue ID'; works for markers as well as actions.",
+        },
     ),
     returns="Every matching pass with the ids needed by draw-state / shader-bindings.",
-    examples=['pix-tool-set find-pass --name TileClassificationBuildLists'],
+    examples=[
+        'pix-tool-set find-pass --name TileClassificationBuildLists',
+        "pix-tool-set find-pass --global-id 3893",
+        "pix-tool-set find-pass --queue-id 18704",
+    ],
 )
 def find_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     offset, limit = page_args(args, default_limit=25)
-    needle = str(args["name"]).lower()
 
-    matches = []
-    for entry in capture.passes:
-        if needle not in entry["name"].lower():
-            continue
-        matches.append(
+    def row(entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "pass_index": entry["pass_index"],
+            "name": entry["name"],
+            "marker_path": entry["marker_path"],
+            "subsystem": entry["marker_path"][-2] if len(entry["marker_path"]) > 1 else "",
+            "draw_index": entry["first_draw_index"],
+            "last_draw_index": entry["last_draw_index"],
+            "global_id": entry["first_global_id"],
+            "queue_id": entry.get("first_queue_id"),
+            "marker_queue_id": entry.get("marker_queue_id"),
+            "event_count": entry["event_count"],
+            "draw_count": entry["draw_count"],
+            "dispatch_count": entry["dispatch_count"],
+            "pso_ids": entry["pso_ids"],
+        }
+
+    global_id = args.get("global_id")
+    queue_id = args.get("queue_id")
+    if global_id is not None or queue_id is not None:
+        entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
+        label = f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
+        if entry is None:
+            raise not_found(
+                "pass",
+                label,
+                "Use locate-event to confirm the id exists in this capture.",
+            )
+        return ToolResult.success(
             {
-                "pass_index": entry["pass_index"],
-                "name": entry["name"],
-                "marker_path": entry["marker_path"],
-                "subsystem": entry["marker_path"][-2] if len(entry["marker_path"]) > 1 else "",
-                "draw_index": entry["first_draw_index"],
-                "last_draw_index": entry["last_draw_index"],
-                "global_id": entry["first_global_id"],
-                "event_count": entry["event_count"],
-                "draw_count": entry["draw_count"],
-                "dispatch_count": entry["dispatch_count"],
-                "pso_ids": entry["pso_ids"],
+                "query": label,
+                "matches": [row(entry)],
+                "next_step": (
+                    "Feed draw_index into `pass-bindings`, `draw-state` or `shader-bindings`, "
+                    "or pass the same --global-id/--queue-id straight to `pass-bindings`."
+                ),
+                **page_envelope(1, 0, limit, 1),
             }
         )
+
+    if not args.get("name"):
+        raise invalid_argument("name/global_id/queue_id", "provide one of them")
+    needle = str(args["name"]).lower()
+
+    matches = [row(e) for e in capture.passes if needle in e["name"].lower()]
 
     total = len(matches)
     window = matches[offset : offset + limit] if limit else matches[offset:]

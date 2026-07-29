@@ -110,7 +110,35 @@ class Capture:
         calls = parser.parse()
         for call in calls:
             call._capture = self
+        self._reconcile_marker_paths(calls)
         return calls
+
+    def _reconcile_marker_paths(self, calls: list[DrawCall]) -> None:
+        """Replace C++-derived marker paths with the event list's authoritative ones.
+
+        The C++ export interleaves command lists, so a single PIX BeginEvent/EndEvent
+        stack tracked while streaming the files drifts: markers that were closed on
+        one command list stay on the stack while another list is being replayed. That
+        produced paths with repeated segments (`Frame N / ... / Frame N / ...`).
+
+        The exported event list carries an explicit parent link per event, so its
+        hierarchy is correct by construction. Where a draw's Global ID is present in
+        that list we take its path verbatim; otherwise the parsed path is kept.
+        """
+        if self.event_csv is None or not self.event_csv.exists():
+            return
+        by_global = self._events_by_global_id
+        if not by_global:
+            return
+        for call in calls:
+            if call.global_id is None:
+                continue
+            event = by_global.get(call.global_id)
+            if event is None:
+                continue
+            authoritative = tuple(event.marker_path)
+            if authoritative and authoritative != call.marker_path:
+                call.marker_path = authoritative
 
     @cached_property
     def events(self) -> list[Event]:
@@ -124,6 +152,26 @@ class Capture:
     @cached_property
     def event_roots(self) -> list[Event]:
         return eventlist.roots(self.events)
+
+    @cached_property
+    def timing(self):
+        """Measured GPU durations, when the timing event list has been exported.
+
+        Returns None when absent; callers must degrade to the estimate rather
+        than fabricate numbers. Produce it with the `export-timing` tool.
+        """
+        from . import timing as timing_mod
+
+        if self.event_csv is None:
+            return None
+        path = timing_mod.timing_csv_path(self.event_csv.parent, self.capture_path.stem)
+        if not path.exists():
+            return None
+        try:
+            table = timing_mod.TimingTable(path)
+        except OSError:
+            return None
+        return table if table.measured_count else None
 
     @cached_property
     def _resource_stream(self):
@@ -183,6 +231,9 @@ class Capture:
                     "last_draw_index": draws[-1].index,
                     "first_global_id": draws[0].global_id,
                     "last_global_id": draws[-1].global_id,
+                    "first_queue_id": self._queue_id_for_global(draws[0].global_id),
+                    "last_queue_id": self._queue_id_for_global(draws[-1].global_id),
+                    "marker_queue_id": self._marker_queue_id(path),
                     "triangle_count": sum(d.triangle_count for d in draws),
                     "thread_count": sum(d.thread_count for d in draws),
                     "render_target_ids": render_targets,
@@ -191,6 +242,33 @@ class Capture:
                 }
             )
         return entries
+
+    def _queue_id_for_global(self, global_id: int | None) -> Optional[int]:
+        """Translate an action's Global ID into the Queue ID the PIX GUI shows."""
+        if global_id is None:
+            return None
+        event = self.event_by_global_id(global_id)
+        return getattr(event, "queue_id", None) if event is not None else None
+
+    def _marker_queue_id(self, path: tuple[str, ...]) -> Optional[int]:
+        """Queue ID of the marker event that opens this pass.
+
+        Markers carry no Global ID, so this is the only id that addresses the
+        pass row itself rather than one of the draws inside it.
+        """
+        if not path:
+            return None
+        cache = getattr(self, "_marker_queue_cache", None)
+        if cache is None:
+            cache = {}
+            for event in self.events:
+                if event.is_draw:
+                    continue
+                key = tuple(event.marker_path) + (event.name,)
+                if key not in cache and getattr(event, "queue_id", None) is not None:
+                    cache[key] = event.queue_id
+            self._marker_queue_cache = cache
+        return cache.get(tuple(path))
 
     @cached_property
     def _pass_by_name(self) -> dict[str, list[dict[str, Any]]]:
@@ -279,6 +357,58 @@ class Capture:
     def event_by_global_id(self, global_id: int) -> Optional[Event]:
         return self._events_by_global_id.get(global_id)
 
+    def event_by_queue_id(self, queue_id: int) -> Optional[Event]:
+        """Look up an event by the Queue ID column of the exported event list.
+
+        Queue ID is present on every row (Global ID only appears on actions), so
+        it is the one identifier that can address markers as well as draws.
+        """
+        cache = getattr(self, "_events_by_queue_id", None)
+        if cache is None:
+            cache = {
+                event.queue_id: event
+                for event in self.events
+                if getattr(event, "queue_id", None) is not None
+            }
+            self._events_by_queue_id = cache
+        return cache.get(queue_id)
+
+    def resolve_event(
+        self, *, global_id: int | None = None, queue_id: int | None = None
+    ) -> Optional[Event]:
+        if global_id is not None:
+            found = self.event_by_global_id(global_id)
+            if found is not None:
+                return found
+        if queue_id is not None:
+            return self.event_by_queue_id(queue_id)
+        return None
+
+    def find_pass_by_event(
+        self, *, global_id: int | None = None, queue_id: int | None = None
+    ) -> Optional[dict[str, Any]]:
+        """Map any event id onto the pass that contains it.
+
+        Works for a draw/dispatch id and for the enclosing marker id alike,
+        because both resolve to the same marker_path.
+        """
+        event = self.resolve_event(global_id=global_id, queue_id=queue_id)
+        if event is None:
+            return None
+        path = tuple(event.marker_path)
+        if not path:
+            return None
+        for entry in self.passes:
+            if tuple(entry["marker_path"]) == path:
+                return entry
+        # The id may name the marker itself rather than a child action, in which
+        # case the pass path is the event path plus the event's own name.
+        extended = path + (event.name,)
+        for entry in self.passes:
+            if tuple(entry["marker_path"]) == extended:
+                return entry
+        return None
+
     def draw_call_by_global_id(self, global_id: int) -> Optional[DrawCall]:
         return self._draws_by_global_id.get(global_id)
 
@@ -288,12 +418,22 @@ class Capture:
         return None
 
     def resolve_draw(
-        self, *, draw_index: int | None = None, global_id: int | None = None
+        self,
+        *,
+        draw_index: int | None = None,
+        global_id: int | None = None,
+        queue_id: int | None = None,
     ) -> Optional[DrawCall]:
         if global_id is not None:
             found = self.draw_call_by_global_id(global_id)
             if found is not None:
                 return found
+        if queue_id is not None:
+            event = self.event_by_queue_id(queue_id)
+            if event is not None and event.global_id is not None:
+                found = self.draw_call_by_global_id(event.global_id)
+                if found is not None:
+                    return found
         if draw_index is not None:
             return self.draw_call(draw_index)
         return None

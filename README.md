@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **57 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **59 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,12 +62,14 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（57 个）
+## 五、工具总览（59 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
 **事件与 Action 导航（6）** `list-actions` `action-info` `search-actions`
 `find-draw-calls` `locate-event` `find-pass`
+
+**实测耗时（2）** `export-timing` `event-timing`
 
 **帧统计（4）** `frame-stats` `list-passes` `pass-info` `pass-cost`
 
@@ -156,7 +158,67 @@ pix-tool-set find-pass --name TileClassificationBuildLists               # 只�
 这是导出格式的边界，不是解析缺陷；此时精确的 register → rid 对应需要用
 `disassemble-shader` 看资源索引指令，或在 PIX GUI 里查看。
 
-## 八、`partial` 的含义（重要）
+## 八、用 PIX GUI 的 Global ID / Queue ID 定位
+
+PIX GUI 事件列表里每行有两个 id，本工具集都能直接接受，不需要先换算成 `draw_index`：
+
+| GUI 列 | 覆盖范围 | 说明 |
+|---|---|---|
+| `Global ID` | 仅 action（draw/dispatch/copy 等），本截帧 5,334 / 22,155 行 | 在 GUI 里选中一次 draw 就能看到 |
+| `Queue ID` | **每一行都有**，22,155 / 22,155 | 唯一全量主键，marker（pass 行）只有这个 |
+
+所以查 pass 时优先用 `Queue ID`：pass 的标记行本身没有 Global ID。
+
+```powershell
+pix-tool-set find-pass --global-id 3893        # -> pass TileClassificationMark
+pix-tool-set find-pass --queue-id 18704        # 同一个 pass
+pix-tool-set pass-bindings --global-id 3893    # 直接出 shader 绑定
+pix-tool-set event-timing --global-id 3893     # 直接出实测耗时
+```
+
+`find-pass` 返回里同时给出 `global_id`、`queue_id`、`marker_queue_id`（pass 标记自身的
+Queue ID）和 `draw_index`，四者互通，可用于和 GUI 交叉核对。
+
+### CSV 是否需要改？
+
+不需要加列 —— `Queue ID`、`Parent`、`Name`、`Global ID` 四列已经够了，`Parent` 链就是
+权威的 marker 层级。真正值得做的是**另外导出一份带 GPU 计数器的事件列表**（见第九章），
+因为基础 CSV 不含耗时。
+
+## 九、实测 GPU 耗时（可选，一次性）
+
+`pass-cost` 默认用工作量模型估算。跑一次 `export-timing` 就能换成**真实测量值**：
+
+```powershell
+pix-tool-set export-timing            # 约 100s，结果缓存，之后秒开
+pix-tool-set pass-cost --limit 10     # model 变为 measured-gpu-time
+pix-tool-set event-timing --group-by pass --limit 15
+pix-tool-set session-open --capture frame.wpix --with-timing   # 开会话时一并导出
+```
+
+实测数据（Tiled.wpix）：5,562 个事件带耗时样本，335 个 pass 有实测值，
+`TileClassificationMark` 的 dispatch 实测 **11.795 ms**。
+
+底层是 `pixtool save-event-list --counters=<glob>`。实测出的两个硬限制：
+
+- 计数器名**含空格时不能直接传**，pixtool 会报 `Unknown option`。必须用 glob，
+  例如 `*Duration*`。
+- `--counters=*` 在大截帧上会失败（约 39s 后报 `E_PIX_PERFORMANCE_ANALYSIS_FAILED`），
+  必须收窄 glob。
+
+注意逐事件耗时之和会超过帧的墙钟时间，因为异步队列的工作是重叠的。
+
+
+### marker 路径以事件列表为准
+
+C++ 导出把多个 command list 交错写在一起，靠流式跟踪 `PIXBeginEvent`/`PIXEndEvent`
+维护的标记栈会串味：在一个 command list 上已闭合的标记，在回放另一个 list 时仍留在栈上。
+这曾导致 pass 路径出现重复段（`Frame N / … / Frame N / …`），419 个 pass 里 416 个受影响。
+
+事件列表 CSV 的 `Parent` 列是显式父链，天然正确。现在 draw 的 marker 路径以事件列表为准
+（2,696 / 2,786 个 draw 可对齐），仅剩 90 个 bundle 内部调用未被 CSV 收录、继续沿用解析值。
+
+## 十、`partial` 的含义（重要）
 
 `partial` 表示**答案可用，但某处被降级**，原因一定写在 `diagnostics` 里。
 这比假装成功或直接报错更有用，因为它区分了「工具坏了」和「数据本就不存在」。
@@ -174,7 +236,7 @@ pix-tool-set find-pass --name TileClassificationBuildLists               # 只�
 资源绑定表、入口函数名、numthreads 与全部 IR）。`has_embedded_source` 字段明确
 告知属于哪种情况。
 
-## 九、Python API
+## 十一、Python API
 
 ```python
 from pix_tool_set import call_tool, list_tools, open_capture
@@ -199,7 +261,7 @@ draw.render_targets, draw.srvs, draw.uavs
 draw.shader("PS").disassembly
 ```
 
-## 十、架构
+## 十二、架构
 
 ```
 src/pix_tool_set/
@@ -233,7 +295,7 @@ draw/dispatch 处快照——这份快照正是 PIX 选中某次 draw 时展示�
 `dxcompiler.dll`（裸 COM vtable），因此零第三方依赖。
 纹理像素读取内置纯 stdlib 的 PNG 解码器。
 
-## 十一、验证
+## 十三、验证
 
 ```powershell
 python tests\verify_live.py                 # 静态分析类工具
@@ -253,7 +315,7 @@ python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类
 解析规模：22,118 events、2,784 draw/dispatch、416 passes、3,293 resources、
 480,958 descriptors、359 shaders、56 root signatures。
 
-## 十二、已知边界
+## 十四、已知边界
 
 - 依赖本机 PIX 安装；纹理与像素类工具需要该截帧能在本机 GPU 上回放。
 - 首次 `session-open` 对 2.3 GB 截帧约需 30–60 秒，缓存约 2.5 GB。

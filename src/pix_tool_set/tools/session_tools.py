@@ -51,6 +51,13 @@ from ._common import SESSION_PARAMS, object_schema, tool, with_session
             "type": "array",
             "description": "GPU counter name patterns to include in the event list, e.g. 'D3D*'.",
         },
+        with_timing={
+            "type": "boolean",
+            "description": (
+                "Also export measured GPU durations per event (a second replay, roughly "
+                "100s on a 2.5 GB capture). Upgrades pass-cost from estimate to measurement."
+            ),
+        },
         timeout={
             "type": "integer",
             "description": "Seconds to allow for the export. Default 10800.",
@@ -132,6 +139,35 @@ def session_open(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 }
             )
 
+    timing_report: dict[str, Any] | None = None
+    if bool(args.get("with_timing")) and events_ok:
+        from ..engine import timing as timing_mod
+
+        timing_csv = timing_mod.timing_csv_path(event_csv.parent, capture_path.stem)
+        if timing_csv.exists() and not force:
+            timing_report = {"ok": True, "reused_cache": True, "path": str(timing_csv)}
+            diagnostics.append(
+                {"level": "info", "message": "Reused the cached GPU timing event list."}
+            )
+        else:
+            exe = pixtool.exe if pixtool is not None else PixTool.locate(
+                args.get("pixtool") or context.pixtool_path
+            ).exe
+            timing_report = timing_mod.export_timing_csv(
+                exe, capture_path, timing_csv, timeout=min(timeout, 3600)
+            )
+            diagnostics.append(
+                {
+                    "level": "info" if timing_report.get("ok") else "warning",
+                    "message": (
+                        "Measured GPU timing exported."
+                        if timing_report.get("ok")
+                        else f"Timing export failed: {timing_report.get('error')}"
+                    ),
+                    "seconds": timing_report.get("elapsed_seconds"),
+                }
+            )
+
     record = SessionRecord(
         name=name,
         capture_path=str(capture_path),
@@ -150,6 +186,7 @@ def session_open(args: dict[str, Any], context: ToolContext) -> ToolResult:
     )
     data = {
         **record.summary(),
+        "timing_export": timing_report,
         "counts": {
             "events": len(capture.events),
             "draw_calls": len(capture.draw_calls),
