@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **55 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **57 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,20 +62,20 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（55 个）
+## 五、工具总览（57 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
-**事件与 Action 导航（5）** `list-actions` `action-info` `search-actions`
-`find-draw-calls` `locate-event`
+**事件与 Action 导航（6）** `list-actions` `action-info` `search-actions`
+`find-draw-calls` `locate-event` `find-pass`
 
 **帧统计（4）** `frame-stats` `list-passes` `pass-info` `pass-cost`
 
 **纹理分析（8）** `list-textures` `texture-stats` `texture-info` `export-texture`
 `export-draw-textures` `read-texture-pixels` `texture-pixel-stats` `pick-pixel`
 
-**Shader 分析（7）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
-`shader-reflection` `shader-bindings` `constant-buffer`
+**Shader 分析（8）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
+`shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -124,7 +124,39 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 }
 ```
 
-## 七、`partial` 的含义（重要）
+## 七、按 pass 查询 shader 绑定
+
+拿某个 pass 的 shader 绑定资源，一条命令即可（不必再手动 pass → draw_index → bindings 三步走）：
+
+```powershell
+pix-tool-set pass-bindings --pass-name TileClassificationBuildLists --stage CS
+pix-tool-set pass-bindings --pass-name TileClassification --all-matches   # 同名多 pass 全列
+pix-tool-set find-pass --name TileClassificationBuildLists               # 只要 id 时用这个
+```
+
+`pass-bindings` 会自动按 PSO 去重挑代表 draw，并把 descriptor table 默认展开到 128 项
+（UE5 的 SRV table 声明 64 项，旧的 16 项默认值会截断）。
+
+返回分两层，可信度不同：
+
+- `stages[].declared_registers` —— 来自 shader 字节码反射，**权威**。这就是
+  「该 pass 绑定了哪些 shader 资源」的答案，含 HLSL 寄存器、资源变量名、格式、维度。
+- `root_descriptors` / `descriptor_tables` —— 从导出的 C++ 重建的运行时绑定，
+  每项带 `trust` 字段：
+
+| trust | 含义 |
+|---|---|
+| `reliable` | 直接来自记录的调用（如 root CBV 的 rid），或槽位数与 shader 声明吻合 |
+| `partial` | 已重建但未经确认，不要依赖 register → resource 的逐项映射 |
+| `filler` | 该窗口是 PIX 的初始化占位，真实描述符未被记录 |
+| `unavailable` | 该 table 完全没有描述符数据 |
+
+出现 `filler` / `unavailable` 时结果为 `partial`，并在 `diagnostics` 里提示改用
+`declared_registers`。原因是 PIX 的 C++ 导出对部分 draw 未记录真实的描述符写入 ——
+这是导出格式的边界，不是解析缺陷；此时精确的 register → rid 对应需要用
+`disassemble-shader` 看资源索引指令，或在 PIX GUI 里查看。
+
+## 八、`partial` 的含义（重要）
 
 `partial` 表示**答案可用，但某处被降级**，原因一定写在 `diagnostics` 里。
 这比假装成功或直接报错更有用，因为它区分了「工具坏了」和「数据本就不存在」。
@@ -134,6 +166,7 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 - `post-vs-data` — 变换后顶点只存在于 PIX 实时回放会话，C++ 导出中没有
 - `read-buffer` / `export-mesh` — GPU 运行期生成的缓冲区内容未被截帧记录
 - `constant-buffer` — root CBV 被解析为 GPU 地址，逐 draw 的字节未内嵌
+- `pass-bindings` — 部分 draw 的真实描述符写入未被导出记录（见第七章 `trust`）
 - `disassemble-shader --prefer-source` — 该 shader 未带嵌入式 HLSL 调试信息
 
 关于 shader 源码：PIX 截帧存的是**编译后字节码**，原始 HLSL 只在编译时带
@@ -141,7 +174,7 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 资源绑定表、入口函数名、numthreads 与全部 IR）。`has_embedded_source` 字段明确
 告知属于哪种情况。
 
-## 八、Python API
+## 九、Python API
 
 ```python
 from pix_tool_set import call_tool, list_tools, open_capture
@@ -149,6 +182,13 @@ from pix_tool_set import call_tool, list_tools, open_capture
 # 工具级（与 CLI 完全一致的信封）
 result = call_tool("list-passes", {"limit": 10})
 result["status"], result["data"]["passes"]
+
+# 按 pass 一步拿 shader 绑定
+data = call_tool("pass-bindings", {"pass_name": "TileClassificationBuildLists",
+                                   "stage": "CS"})["data"]
+for entry in data["passes"][0]["draws"][0]["stages"]:
+    for reg in entry["declared_registers"]:
+        print(reg["hlsl_bind"], reg["type"], reg["name"])
 
 # 引擎级（直接拿到解析对象）
 capture = open_capture(r"D:\caps\frame.wpix")
@@ -159,7 +199,7 @@ draw.render_targets, draw.srvs, draw.uavs
 draw.shader("PS").disassembly
 ```
 
-## 九、架构
+## 十、架构
 
 ```
 src/pix_tool_set/
@@ -193,7 +233,7 @@ draw/dispatch 处快照——这份快照正是 PIX 选中某次 draw 时展示�
 `dxcompiler.dll`（裸 COM vtable），因此零第三方依赖。
 纹理像素读取内置纯 stdlib 的 PNG 解码器。
 
-## 十、验证
+## 十一、验证
 
 ```powershell
 python tests\verify_live.py                 # 静态分析类工具
@@ -213,7 +253,7 @@ python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类
 解析规模：22,118 events、2,784 draw/dispatch、416 passes、3,293 resources、
 480,958 descriptors、359 shaders、56 root signatures。
 
-## 十一、已知边界
+## 十二、已知边界
 
 - 依赖本机 PIX 安装；纹理与像素类工具需要该截帧能在本机 GPU 上回放。
 - 首次 `session-open` 对 2.3 GB 截帧约需 30–60 秒，缓存约 2.5 GB。

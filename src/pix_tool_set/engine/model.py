@@ -251,6 +251,7 @@ class BindingSlot:
     constants: tuple[int, ...] = ()
     resolved_views: list[View] = field(default_factory=list)
     source_line: int = 0
+    table_confidence: str = ""
 
     def to_dict(self, *, max_views: int | None = None) -> dict[str, Any]:
         views = self.resolved_views if max_views is None else self.resolved_views[:max_views]
@@ -263,6 +264,8 @@ class BindingSlot:
             "views": [v.to_dict() for v in views],
             "view_count": len(self.resolved_views),
         }
+        if self.table_confidence:
+            payload["table_confidence"] = self.table_confidence
         if self.num_constants:
             payload["num_constants"] = self.num_constants
         return payload

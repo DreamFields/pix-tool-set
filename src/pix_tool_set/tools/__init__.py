@@ -15,6 +15,7 @@ def load_builtin_tools() -> None:
     from . import frame_tools  # noqa: F401
     from . import texture_tools  # noqa: F401
     from . import shader_tools  # noqa: F401
+    from . import pass_binding_tools  # noqa: F401
     from . import geometry_tools  # noqa: F401
     from . import pipeline_tools  # noqa: F401
     from . import resource_tools  # noqa: F401

@@ -430,6 +430,14 @@ _ROOT_KIND_MAP = {
 
 UNBOUNDED = 0xFFFFFFFF
 
+# D3D12_DESCRIPTOR_RANGE_TYPE_* -> the view kind a slot in that range must hold.
+_RANGE_TYPE_TO_VIEW: dict[str, ViewKind] = {
+    "SRV": ViewKind.SRV,
+    "UAV": ViewKind.UAV,
+    "CBV": ViewKind.CBV,
+    "SAMPLER": ViewKind.SAMPLER,
+}
+
 
 @dataclass(slots=True)
 class RootSignature:
@@ -634,6 +642,32 @@ class CommandListParser:
         self.default_table_span = default_table_span
         self.draw_calls: list[DrawCall] = []
         self._marker_stack: list[str] = []
+        # Every descriptor-table base that any draw binds, per heap. A table can
+        # never legitimately extend into the next bound base, so these act as
+        # hard upper bounds when expanding a table (see _expand_table).
+        self._table_bases: dict[int, set[int]] = {}
+
+    def prescan_table_bases(self) -> dict[int, set[int]]:
+        """Collect every descriptor-table base bound anywhere in the frame.
+
+        UE5 sub-allocates a small window per dispatch out of one huge heap, so
+        consecutive draws bind bases only a few slots apart while the root
+        signature declares a much larger range (e.g. 64 SRVs). Expanding by the
+        declared count alone would read straight into the next draw's table (or
+        into PIX's initialisation filler). Knowing all bases lets us stop early.
+        """
+        bases: dict[int, set[int]] = {}
+        for path in sorted_group(self.root, "CommandLists"):
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if "RootDescriptorTable" not in line:
+                        continue
+                    match = _RE_GPU_DESC.search(line)
+                    if match:
+                        heap = int(match.group(1))
+                        bases.setdefault(heap, set()).add(int(match.group(2)))
+        self._table_bases = bases
+        return bases
 
     def _fresh_state(self) -> dict:
         return {
@@ -661,6 +695,7 @@ class CommandListParser:
         }
 
     def parse(self) -> list[DrawCall]:
+        self.prescan_table_bases()
         for path in sorted_group(self.root, "CommandLists"):
             self._parse_file(path)
         return self.draw_calls
@@ -961,7 +996,7 @@ class CommandListParser:
                 source_line=binding.source_line,
             )
             if copy.heap_id is not None and copy.heap_index is not None:
-                copy.resolved_views = self._expand_table(
+                copy.resolved_views, copy.table_confidence = self._expand_table(
                     copy.heap_id, copy.heap_index, active_rootsig, copy.root_index
                 )
             snapshot.append(copy)
@@ -1019,30 +1054,66 @@ class CommandListParser:
         base_index: int,
         root_signature_id: int | None = None,
         root_index: int | None = None,
-    ) -> list[View]:
-        """Expand a root descriptor table into the views the shader can see."""
-        span = self.default_table_span
+    ) -> tuple[list[View], str]:
+        """Expand a root descriptor table into the views the shader can see.
+
+        Returns (views, confidence). Confidence is:
+          exact    the table is fully bounded by the next bound base and every
+                   slot matches the range type the root signature declares
+          bounded  a hard bound applied, but the window was cut short
+          loose    no neighbouring base was known, so the declared count was used
+        """
         signature = (
             self.root_signatures.get(root_signature_id)
             if root_signature_id is not None
             else None
         )
-        if signature is not None and root_index is not None:
-            declared = signature.table_size(root_index)
-            if declared > 0:
-                span = declared
-            elif declared == -1:
-                span = 4096
+        parameter = (
+            signature.parameter(root_index)
+            if signature is not None and root_index is not None
+            else None
+        )
+
+        declared = 0
+        allowed_kinds: set[ViewKind] = set()
+        if parameter is not None and parameter.kind is RootParameterKind.DESCRIPTOR_TABLE:
+            declared = signature.table_size(root_index) if signature else 0
+            for entry in parameter.ranges:
+                kind = _RANGE_TYPE_TO_VIEW.get(entry.get("range_type", ""))
+                if kind is not None:
+                    allowed_kinds.add(kind)
+
+        span = declared if declared > 0 else self.default_table_span
+        if declared == -1:
+            span = 4096
+
+        # A table cannot run into the next base bound out of the same heap.
+        confidence = "loose"
+        bases = self._table_bases.get(heap_id)
+        if bases:
+            following = [value for value in bases if value > base_index]
+            if following:
+                span = min(span, min(following) - base_index)
+                confidence = "exact"
 
         out: list[View] = []
         misses = 0
-        for offset in range(span):
+        for offset in range(max(span, 0)):
             view = self.views.get((heap_id, base_index + offset))
             if view is None:
                 misses += 1
                 if misses > 4:
                     break
                 continue
+            # Slots whose view type contradicts the declared range belong to a
+            # different table (or to PIX's filler), so stop rather than report them.
+            if allowed_kinds and view.kind not in allowed_kinds:
+                if confidence == "exact":
+                    confidence = "bounded"
+                break
             misses = 0
             out.append(view)
-        return out
+
+        if declared > 0 and len(out) < declared and confidence == "exact":
+            confidence = "bounded"
+        return out, confidence

@@ -157,7 +157,13 @@ def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     category="pipeline",
     parameters=with_session(
         DRAW_SELECTOR,
-        max_views={"type": "integer", "description": "Cap on views per binding. Default 12."},
+        max_views={
+            "type": "integer",
+            "description": (
+                "Cap on views per descriptor table. Default 128, enough for UE5's 64-entry "
+                "SRV tables; lower it only to shrink the response."
+            ),
+        },
     ),
     returns="Complete GPU state snapshot for the selected draw.",
     examples=["pix-tool-set draw-state --draw-index 2461"],
@@ -171,7 +177,7 @@ def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if draw is None:
         raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
 
-    max_views = int(args.get("max_views") or 12)
+    max_views = int(args.get("max_views") or 128)
     pso = draw.pipeline_state
     signature = capture.root_signatures.get(draw.root_signature_id or -1)
 

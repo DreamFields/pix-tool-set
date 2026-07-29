@@ -349,7 +349,13 @@ def shader_reflection(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         DRAW_SELECTOR,
         stage={"type": "string", "enum": _STAGES, "description": "Shader stage to inspect."},
-        max_views={"type": "integer", "description": "Cap on views listed per table. Default 16."},
+        max_views={
+            "type": "integer",
+            "description": (
+                "Cap on views listed per descriptor table. Default 128, which covers UE5's "
+                "64-entry SRV tables; lower it only to shrink the response."
+            ),
+        },
     ),
     returns="Declared registers, root parameter mapping and resolved resources.",
     examples=["pix-tool-set shader-bindings --draw-index 2461 --stage PS"],
@@ -368,7 +374,7 @@ def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if not shaders:
         raise not_found("shader", stage or "any", "This draw has no shader for that stage.")
 
-    max_views = int(args.get("max_views") or 16)
+    max_views = int(args.get("max_views") or 128)
     signature = capture.root_signatures.get(draw.root_signature_id or -1)
 
     stage_rows: list[dict[str, Any]] = []

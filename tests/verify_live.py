@@ -54,6 +54,7 @@ def build_args(name: str, capture) -> dict:
     buffer_res = next((r for r in capture.resources.values() if r.is_buffer), None)
     shader = next((s for s in capture.shaders if s.stage.value == "CS"), None)
     pso_id = draw.pso_id if draw else None
+    chosen_pass_name = capture.passes[0]["name"] if capture.passes else ""
 
     specific: dict[str, dict] = {
         "action-info": {"global_id": draw.global_id} if draw and draw.global_id else {},
@@ -79,6 +80,8 @@ def build_args(name: str, capture) -> dict:
         if draw and draw.index + 1 < len(capture.draw_calls)
         else {},
         "search-actions": {"query": "Draw"},
+        "find-pass": {"name": chosen_pass_name or "Pass"},
+        "pass-bindings": {"pass_index": 0, "max_draws": 2},
         "pixel-history": (
             {"resource_id": texture.api_id, "x": 10, "y": 10} if texture else {"x": 10, "y": 10}
         ),
