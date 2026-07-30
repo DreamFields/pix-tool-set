@@ -294,6 +294,17 @@ class Capture:
             out = out[:length]
         return out
 
+    @cached_property
+    def _footprints(self):
+        """resource id -> subresource footprints recorded for its upload."""
+        from . import footprint
+
+        return footprint.parse_footprints(self.export_dir)
+
+    def resource_footprints(self, resource_id: int) -> list:
+        """Subresource footprints for a texture upload, empty when not a texture."""
+        return list(self._footprints.get(resource_id, []))
+
     def resource_page_status(self, resource_id: int, page: int) -> dict[str, Any]:
         """Whether a specific page's CPU rewrite could actually be applied.
 

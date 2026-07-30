@@ -14,3 +14,4 @@ outputs/
 *.pixcache/
 *.events.csv
 *.log
+depth-out/

@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **62 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **63 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,7 +62,7 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（62 个）
+## 五、工具总览（63 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
@@ -78,7 +78,7 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 
 **Shader 分析（9）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
 `shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
-`pass-shader-source` `session-set-pdb-dirs` `pass-values`
+`pass-shader-source` `session-set-pdb-dirs` `pass-values` `read-resource-texture`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -452,7 +452,75 @@ pix-tool-set pass-values --queue-id 17765 --stage PS --cbuffer Scene
 实测覆盖率：**2,625 个带 root CBV 的 draw 全部可信解码（0 过期）**，
 3,316 个资源中 3,127 个有可读字节（94.3%）。
 
-## 十二、`partial` 的含义（重要）
+## 十二、读取深度缓冲 / 纹理（两条路径）
+
+```powershell
+# 路径 A：直接读截帧字节，不需要 GPU 回放
+pix-tool-set read-resource-texture --queue-id 17765 --target depth --output G:\out --png G:\out
+pix-tool-set read-resource-texture --queue-id 17765 --target depth --at-x 766 --at-y 382
+
+# 路径 B：GPU 回放，拿到 pass 真正写出的结果
+pix-tool-set save-render-target --queue-id 17765 --depth -o depth.png
+```
+
+**两条路径回答的是不同问题**，这是最需要注意的一点。
+
+### 路径 A：截帧里记录的字节
+
+Queue ID 17765 的深度目标是 rid 1985（`R32G8X24_TYPELESS` 1532x764）。
+PIX 用 `CopyTextureRegion` + placed footprint 上传它的初始内容，所以字节在
+`resources.bin` 里，但**不是**扁平像素数组：
+
+```
+subresource 0  R32_TYPELESS  1532x764  row pitch 6144   offset 0          (深度平面)
+subresource 1  R8_TYPELESS   1532x764  row pitch 1536   offset 4,694,016  (模板平面)
+```
+
+必须按 footprint 解析。忽略它、直接用总字节除以像素数会得到 5.013 B/px 这种
+无意义的结果（既不是 4 也不是 8）。按 footprint 解出来是
+**1,170,448 像素 = 1532×764 精确匹配**。
+
+导出会写两个文件（去掉 pitch 填充的紧凑行）加可选的归一化 PNG：
+
+```
+resource1985_sub0_1532x764_R32_TYPELESS.bin   4,681,792 bytes
+resource1985_sub1_1532x764_R8_TYPELESS.bin    1,170,448 bytes
+```
+
+### 关键限制：A 拿到的不是 pass 的输出
+
+对这个 pass，路径 A 解出的深度范围是 `0.00096..0.00139`，看着像合理的反向 Z。
+但工具会标 `content_character: analytic_gradient` 并降级为 `partial`：
+
+```
+neighbour step distinct values : 2
+depth discontinuities          : 0
+```
+
+邻域差值恒为 `2.14262e-07`，全图**没有任何几何不连续点**。渲染出来的深度一定有
+遮挡边缘；这是解析梯度，即截帧初始化时的内容，而非 pass 写入的结果。
+归一化 PNG 一看就是纯渐变，而 GPU 回放那张有清晰的建筑轮廓。
+
+原因很简单：`resources.bin` 只存 PIX 观察到的上传和 CPU 写入。GPU 渲染进深度
+缓冲的内容从未经过上传，所以不在截帧里。
+
+### 路径 B：GPU 回放
+
+`save-render-target --depth` 通过 `pixtool` 重放该帧，拿到的是 pass 执行后的真实
+深度。注意直接导出的 PNG 因反向 Z 值极小会接近全黑，需要自行拉伸对比度才便于
+肉眼查看（路径 A 的 `--png` 会自动做归一化）。
+
+### 选哪条
+
+| 需求 | 路径 |
+|---|---|
+| pass 执行后的深度/RT 内容 | B（`save-render-target`） |
+| 单个像素的精确浮点值 | A（`--at-x --at-y`），若内容标为 rendered |
+| 原始字节、自己做后续处理 | A（`--output`） |
+| `pixtool` 拒绝的资源 | A（不依赖回放） |
+| 纹理的初始上传内容 | A |
+
+## 十三、`partial` 的含义（重要）
 
 `partial` 表示**答案可用，但某处被降级**，原因一定写在 `diagnostics` 里。
 这比假装成功或直接报错更有用，因为它区分了「工具坏了」和「数据本就不存在」。
@@ -470,7 +538,7 @@ pix-tool-set pass-values --queue-id 17765 --stage PS --cbuffer Scene
 资源绑定表、入口函数名、numthreads 与全部 IR）。`has_embedded_source` 字段明确
 告知属于哪种情况。
 
-## 十三、Python API
+## 十四、Python API
 
 ```python
 from pix_tool_set import call_tool, list_tools, open_capture
@@ -495,7 +563,7 @@ draw.render_targets, draw.srvs, draw.uavs
 draw.shader("PS").disassembly
 ```
 
-## 十四、架构
+## 十五、架构
 
 ```
 src/pix_tool_set/
@@ -529,7 +597,7 @@ draw/dispatch 处快照——这份快照正是 PIX 选中某次 draw 时展示�
 `dxcompiler.dll`（裸 COM vtable），因此零第三方依赖。
 纹理像素读取内置纯 stdlib 的 PNG 解码器。
 
-## 十五、验证
+## 十六、验证
 
 ```powershell
 python tests\verify_live.py                 # 静态分析类工具
@@ -549,7 +617,7 @@ python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类
 解析规模：22,118 events、2,784 draw/dispatch、416 passes、3,293 resources、
 480,958 descriptors、359 shaders、56 root signatures。
 
-## 十六、已知边界
+## 十七、已知边界
 
 - 依赖本机 PIX 安装；纹理与像素类工具需要该截帧能在本机 GPU 上回放。
 - 首次 `session-open` 对 2.3 GB 截帧约需 30–60 秒，缓存约 2.5 GB。
