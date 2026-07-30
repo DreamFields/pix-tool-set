@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **60 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **61 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,7 +62,7 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（60 个）
+## 五、工具总览（61 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
@@ -78,7 +78,7 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 
 **Shader 分析（9）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
 `shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
-`pass-shader-source`
+`pass-shader-source` `session-set-pdb-dirs`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -219,66 +219,80 @@ C++ 导出把多个 command list 交错写在一起，靠流式跟踪 `PIXBeginE
 事件列表 CSV 的 `Parent` 列是显式父链，天然正确。现在 draw 的 marker 路径以事件列表为准
 （2,696 / 2,786 个 draw 可对齐），仅剩 90 个 bundle 内部调用未被 CSV 收录、继续沿用解析值。
 
-## 十、查看某个 pass 的 shader 源码
+## 十、查看某个 pass 的 shader 源码（可取到真实 HLSL）
+
+一次性告诉工具引擎的 shader 符号目录，之后按 pass 查源码即可：
 
 ```powershell
+pix-tool-set session-set-pdb-dirs --pdb-dirs "F:\JL_TMR\UnrealEngine\Games\JyGame\Saved\ShaderSymbols\PCD3D_SM6"
 pix-tool-set pass-shader-source --queue-id 18461
-pix-tool-set pass-shader-source --pass-name "Light Grid Create" --stage CS --max-lines 0
-pix-tool-set pass-shader-source --queue-id 18461 --output-dir ./src_dump
 ```
 
-### 先说结论：UE5 截帧里没有原始 HLSL
+实测输出（Queue ID 18461 = `Light Grid Create (1 lights)`）：
 
-实测这份截帧的全部 **363 个 shader**：
+```hlsl
+[numthreads(8, 8, 1)]
+void RayTracingBuildLightGridCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId >= LightGridResolution) || DispatchThreadId.z >= 3)
+	{
+		return;
+	}
+	uint3 VoxelId = 0, VoxelRes = 1;
+	int Axis = DispatchThreadId.z;
+	...
+}
+```
 
-| 容器块 | 数量 | 含义 |
-|---|---|---|
-| `ILDN` | 363 | 只记录外部 PDB 的**文件名** |
-| `ILDB` / `SPDB` | **0** | 嵌入式源码块，一个都没有 |
+真实变量名、缩进、控制流全在 —— 这是原始 HLSL，不是反汇编。
 
-原始 HLSL 只在编译时带 `/Zi /Qembed_debug` 才会进容器。UE5 把调试信息放在独立 PDB 里，
-截帧只留了个文件名（如 `3e92071c09a522dfa4e259e557334efc.pdb`），所以源码文本不在截帧内。
-这不是解析能力问题 —— PIX GUI 打开同一个截帧也看不到 HLSL。
+### 为什么截帧里没有，PDB 里却有
 
-### 能拿到什么
+截帧内每个 shader 的 DXBC 容器只带 `ILDN`（PDB 文件名），不带 `ILDB`/`SPDB`（源码本体）。
+从 PDB 读出的编译参数正好解释了原因：
 
-`pass-shader-source` 返回 `source_tier` 明确标注答案的层级：
+```
+-Zi -Qstrip_debug -E RayTracingBuildLightGridCS -HV 2021 -Zpr -O1 -WX
+```
+
+`-Zi` 生成调试信息、`-Qstrip_debug` 把它从截帧字节码里剥离并单独写进 `<hash>.pdb`。
+所以源码一直存在，只是不在 `.wpix` 里。
+
+### 恢复路径
+
+主路径用官方 `IDxcPdbUtils`（`dxcompiler.dll`，CLSID `54621dfb-…`），通过 ctypes 裸 COM
+调用，无需编译原生模块、无第三方依赖。若某个 DXC 版本拒绝加载该 PDB，回退到自己解
+MSF 容器、取 DXBC 的 `SRCI` 块再 zlib 解压。
+
+`source_tier` 明确标注答案来源：
 
 | tier | 含义 |
 |---|---|
-| `embedded-hlsl` | 真的取到了原始 HLSL（本截帧为 0 个） |
-| `dxil-disassembly` | 无嵌入源码，返回 DXIL 反汇编 + 入口函数名 |
+| `pdb-hlsl` | 从引擎 shader PDB 恢复的真实 HLSL |
+| `embedded-hlsl` | 截帧字节码里就带 HLSL（UE5 默认不会） |
+| `dxil-disassembly` | 没有符号目录，退回 DXIL 反汇编 |
 | `unavailable` | 连反汇编都产不出 |
 
-以 Queue ID 18461 为例，实测输出：
+### 输出范围
 
-```
-pass        : Light Grid Create (1 lights)
-draw_index  : 2470   pso: 3241
-stage       : CS
-source_tier : dxil-disassembly
-entry_point : RayTracingBuildLightGridCS
-num_threads : [8, 8, 1]
-pdb_name    : 3e92071c09a522dfa4e259e557334efc.pdb
-lines       : 2052
-```
-
-### `entry_point` 是找回源码的关键
-
-**363 / 363 个 shader 都能取到入口函数名**（100%）。拿它在引擎源码树里搜就能定位 `.usf`：
+UE5 在真正的 shader 前会注入几百行生成代码（`select_internal` 重载等），
+默认只返回入口函数（`scope=entry-function`）：
 
 ```powershell
-rg -l "RayTracingBuildLightGridCS" D:\UE5\Engine\Shaders
+pix-tool-set pass-shader-source --queue-id 18461                      # 仅入口函数，83 行
+pix-tool-set pass-shader-source --queue-id 18461 --entry-only false   # 整个编译单元，335 行
+pix-tool-set pass-shader-source --queue-id 18461 --body-only false    # 含注入的 cbuffer 前言
+pix-tool-set pass-shader-source --queue-id 18461 --output-dir ./src   # 写文件
 ```
 
-反汇编本身也含完整的输入输出签名、cbuffer 字段布局、资源绑定表和 `numthreads`，
-逆向分析所需的信息基本齐全，只是没有变量名和注释。
+`--body-only false` 时能看到 UE5 生成的
+`MoveShaderParametersToRootConstantBuffer` 段，里面是 `_RootShaderParameters` 的
+`packoffset` 完整布局，对核对常量缓冲很有用。
 
-如果你有 shader PDB 的输出目录，传 `--pdb-dirs` 可以让工具去找对应 PDB：
+### 实测覆盖率
 
-```powershell
-pix-tool-set pass-shader-source --queue-id 18461 --pdb-dirs D:\UE5\Saved\ShaderDebugInfo
-```
+抽样 60 个 shader：PDB 命中 **60/60**，HLSL 恢复 **60/60**，入口函数成功切出 **59/60**。
+该符号目录共 129,989 个 `.pdb`。注意 hash 必须与截帧时的构建一致，换了构建就对不上。
 
 ## 十一、`partial` 的含义（重要）
 
@@ -291,7 +305,7 @@ pix-tool-set pass-shader-source --queue-id 18461 --pdb-dirs D:\UE5\Saved\ShaderD
 - `read-buffer` / `export-mesh` — GPU 运行期生成的缓冲区内容未被截帧记录
 - `constant-buffer` — root CBV 被解析为 GPU 地址，逐 draw 的字节未内嵌
 - `pass-bindings` — 部分 draw 的真实描述符写入未被导出记录（见第七章 `trust`）
-- `disassemble-shader --prefer-source` / `pass-shader-source` — 该 shader 未带嵌入式 HLSL 调试信息
+- `disassemble-shader --prefer-source` / `pass-shader-source` — 未配置 shader PDB 目录，且截帧未嵌入 HLSL（配好 `session-set-pdb-dirs` 后即为 success）
 
 关于 shader 源码：PIX 截帧存的是**编译后字节码**，原始 HLSL 只在编译时带
 `/Zi /Qembed_debug` 才会嵌入。未嵌入时返回 DXIL 反汇编（含完整输入输出签名、

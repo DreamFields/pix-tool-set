@@ -45,6 +45,7 @@ class SessionRecord:
     last_used_at: float = field(default_factory=time.time)
     pixtool_path: str | None = None
     notes: str = ""
+    shader_pdb_dirs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -59,6 +60,7 @@ class SessionRecord:
             "export_dir": self.export_dir,
             "export_exists": Path(self.export_dir).exists(),
             "event_csv": self.event_csv,
+            "shader_pdb_dirs": list(self.shader_pdb_dirs),
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
         }
