@@ -388,6 +388,53 @@ match 21 | differ 0 | missing 0
 
 全截帧 586 个 cbuffer：500 个取到声明大小，330 个含尾部 padding，struct 泄漏 0 个。
 
+### 第二组对照：PS 的 Scene cbuffer（77 行全覆盖）
+
+Queue ID 17765（`Emit Scene Depth/Resolve/Velocity`）的 `Scene` 是个 316 字节、
+76 字段的大缓冲，按 offset 逐行比对（offset 比名字可靠，PIX 的名字列会截断）：
+
+```
+ offset  PIX                      ours
+      0  8                        8                        MATCH
+     32  14150                    14150                    MATCH   BindlessSRV_..._InstanceSceneData
+     72  1.82731e+28              1.82731e+28              MATCH   Scene_Padding72
+     96  {4294967295, 0, 0, 0}    {4294967295, 0, 0, 0}    MATCH   MeshPaint_PackedUniform
+    136  -6.94327e+37             -6.94327e+37             MATCH   Scene_Padding136
+    224  {1, 1}                   {1, 1}                   MATCH   SplineMesh_SplineTextureInvExtent
+    280  5.82588e-10              5.82588e-10              MATCH   Scene_Padding280
+    316  (无值)                   (无值)                   MATCH   pad
+
+match 76 | differ 0 | missing 0
+```
+
+这一组把之前只有内部自洽性支撑的几类都验证了：`uint4` / `float2` 向量、
+全部 bindless 句柄（14150、5210-5213、917、3324、6498…）、以及
+`1.82731e+28` / `-6.94327e+37` 这类极端浮点。
+
+回归脚本：`tests/verify_scene_against_pix_gui.py`。
+
+### 多 cbuffer 的寄存器配对
+
+这个 draw 的 PS 同时绑了三个 cbuffer，是上一组（单 cbuffer 的 compute pass）
+测不出来的场景：
+
+```
+root[1] -> cb0 -> _RootShaderParameters
+root[2] -> cb1 -> View
+root[3] -> cb2 -> Scene       <- Scene 在这里
+```
+
+配对键必须是 `(shader_register, visibility)` 而非仅寄存器号。原因是 root signature
+可以合法地把同一寄存器声明两次、靠阶段区分 —— 这个截帧的 Slate draw 就是
+root[2] 为 `PIXEL` 的 b0、root[3] 为 `VERTEX` 的 b0。
+
+```powershell
+pix-tool-set pass-values --queue-id 17765 --stage PS --cbuffer Scene
+```
+
+抽样 60 个多 CBV draw：每个绑定恰好解码 1 个布局。
+回归脚本：`tests/verify_cbv_register_match.py`。
+
 ### 诚实边界
 
 `pass-values` 为每个绑定单独给出可用性，不做整体断言：
