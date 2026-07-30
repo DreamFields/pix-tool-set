@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **64 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **65 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,7 +62,7 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（64 个）
+## 五、工具总览（65 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
@@ -78,7 +78,7 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 
 **Shader 分析（9）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
 `shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
-`pass-shader-source` `session-set-pdb-dirs` `pass-values` `read-resource-texture` `read-replay-target`
+`pass-shader-source` `session-set-pdb-dirs` `pass-values` `read-resource-texture` `read-replay-target` `find-depth-content`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -557,12 +557,66 @@ Make sure file name for Depth Buffer ends with .png
 同理，17765 那张深度 PNG 有几何，是因为深度在此 pass 之前已被 Nanite 光栅化填充，
 不是这个 pass 的产出。
 
+### 深度：16 位而非 8 位，但只有一个事件有几何
+
+先纠正上一节的一处说法。`pixtool` 导出的深度 PNG 是 **16 位灰度**（`bit_depth=16`），
+不是 8 位。65536 个色阶足以做量化分析，不只是缩略图。
+
+但更关键的是**时点问题**。rid 1985 在全帧有 16 个深度绑定事件，逐个探测后：
+
+| 事件 | 色阶数 | 范围 | 不连续点 | 判定 |
+|---|---|---|---|---|
+| draw 2352 | 439 | 0..1177 | 3 | **rendered** |
+| 其余 13 个可导出事件 | 548 | 738..1439 | 0 | analytic_gradient |
+
+**只有 draw 2352 含真实几何**，其余 15 个返回同一条解析梯度。靠猜事件，16 次里错 15 次。
+所以新增了自动扫描：
+
+```powershell
+pix-tool-set find-depth-content --queue-id 17765
+pix-tool-set read-replay-target --draw-index 2352 --depth --at-x 766 --at-y 382
+```
+
+```
+best event: draw #2352   levels=439 edges=3   character=rendered
+pixel: {'x': 766, 'y': 382, 'level': 908, 'normalised': 0.01385519}
+```
+
+对比同样的读取用在问题里那个 pass 上，会被标 `analytic_gradient` 并降级 `partial`。
+
+### 两条被证伪的思路
+
+**"不指定 `--global-id` 就能拿最终内容"** —— help 里确实写着取"最后一个绑定该资源的
+事件"，但实测导出的是**完全不同的资源**（2243x1119 的 `R10G10B10A2`，而非 rid 771）。
+因为 `--rtv` 只是槽位号，脱离具体事件就失去意义。
+
+**"找后续把深度当 SRV 采样的事件，用 `--rtv` 导成彩色面"** —— 统计下来
+rid 1985 **被当作 render target 的事件数为 0**，`--rtv` 永远到不了它。思路不成立。
+
+### 深度数值的最终结论
+
+`pixtool --help save-resource` 原文：
+
+```
+--depth   Specifies to save a visual representation of
+          a depth buffer. Only PNG files are supported.
+```
+
+官方明确这是"visual representation"且只支持 PNG。因此：
+
+| 想要 | 结论 |
+|---|---|
+| 深度的原始 32 位浮点（pass 产出） | **不可得**，工具链无此导出 |
+| 深度的 16 位量化色阶（pass 产出） | ✅ `read-replay-target --depth`，需先定位事件 |
+| 深度的原始浮点（初始化内容） | ✅ `read-resource-texture`，但非 pass 产出 |
+| RT 的原始数值 | ✅ `read-replay-target`（DDS 保留源格式） |
+
 ### 选哪条
 
 | 需求 | 路径 |
 |---|---|
 | RT 的真实像素数值 | `read-replay-target`（DDS，需选后续事件） |
-| pass 执行后的深度图像 | B（`save-render-target`，仅 8 位 PNG） |
+| pass 执行后的深度 | `find-depth-content` 定位事件 + `read-replay-target --depth`（16 位量化） |
 | 单个像素的精确浮点值 | A（`--at-x --at-y`），若内容标为 rendered |
 | 原始字节、自己做后续处理 | A（`--output`） |
 | `pixtool` 拒绝的资源 | A（不依赖回放） |

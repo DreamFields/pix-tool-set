@@ -37,6 +37,107 @@ _NOTE = (
 )
 
 
+def _read_depth_levels(
+    args: dict[str, Any], context: ToolContext, capture, record, draw
+) -> ToolResult:
+    """Read a replayed depth buffer as 16-bit levels.
+
+    Deliberately not presented as float depth. pixtool documents --depth as a
+    "visual representation" and only writes PNG, so what comes back is a
+    quantisation of the original R32 depth, not the value the shader wrote.
+    """
+    from ..engine import png as png_mod
+
+    resource_id = draw.depth_stencil_resource_id
+    if resource_id is None:
+        raise not_found(
+            "depth target", f"draw {draw.index}", "This draw binds no depth-stencil."
+        )
+
+    keep = args.get("keep")
+    path = (
+        Path(str(keep))
+        if keep
+        else context.resolve_output(None, f"draw{draw.index}_depth.png")
+    )
+    if path.suffix.lower() != ".png":
+        path = path.with_suffix(".png")
+
+    pixtool = context.require_pixtool(args)
+    pixtool.save_resource(
+        Path(record.capture_path), path, global_id=draw.global_id, depth=True
+    )
+
+    try:
+        image = png_mod.parse(path)
+    except ValueError as exc:
+        result = ToolResult.partial(
+            {
+                "draw_index": draw.index,
+                "global_id": draw.global_id,
+                "pass_name": draw.pass_name,
+                "resource_id": resource_id,
+                "png_path": str(path),
+            }
+        )
+        result.degrade("The depth PNG could not be decoded.", reason=str(exc))
+        return result
+
+    resource = capture.resource(resource_id)
+    data: dict[str, Any] = {
+        "draw_index": draw.index,
+        "global_id": draw.global_id,
+        "pass_name": draw.pass_name,
+        "resource_id": resource_id,
+        "resource": resource.to_dict() if resource else None,
+        "image": image.to_dict(),
+        "png_path": str(path),
+        "values_are": (
+            f"{image.bit_depth}-bit greyscale levels (0..{image.max_level}), a "
+            "quantisation of the original 32-bit float depth; pixtool offers no float "
+            "depth export"
+        ),
+    }
+    data.update(png_mod.content_character(image))
+
+    want = int(args.get("pixels") or 0)
+    if want:
+        data["pixels"] = image.channel(0)[:want]
+
+    at_x, at_y = args.get("at_x"), args.get("at_y")
+    if at_x is not None and at_y is not None:
+        try:
+            level = image.pixel(int(at_x), int(at_y))
+            data["pixel"] = {
+                "x": int(at_x),
+                "y": int(at_y),
+                "level": level,
+                "normalised": (
+                    round(level / image.max_level, 8)
+                    if isinstance(level, int)
+                    else None
+                ),
+            }
+        except IndexError as exc:
+            data["pixel"] = {"x": int(at_x), "y": int(at_y), "error": str(exc)}
+
+    if data.get("content_character") == "analytic_gradient":
+        result = ToolResult.partial(data)
+        result.degrade(
+            "This depth image has no geometry discontinuities, so it still holds the "
+            "pre-render state at this event.",
+            reason=(
+                "pixtool samples a resource before the requested event executes."
+            ),
+            alternative=(
+                "Run find-depth-content to locate an event whose depth contains "
+                "rendered geometry."
+            ),
+        )
+        return result
+    return ToolResult.success(data, output_paths=[str(path)])
+
+
 @tool(
     name="read-replay-target",
     summary=(
@@ -50,6 +151,13 @@ _NOTE = (
         queue_id={"type": "integer", "description": "PIX GUI Queue ID."},
         pass_name={"type": "string", "description": "Pass name (substring match)."},
         rtv={"type": "integer", "description": "Render target slot. Default 0."},
+        depth={
+            "type": "boolean",
+            "description": (
+                "Read the depth buffer instead, as 16-bit greyscale levels. No float "
+                "export exists for depth."
+            ),
+        },
         at_x={"type": "integer", "description": "Column of a single pixel to read."},
         at_y={"type": "integer", "description": "Row of a single pixel to read."},
         pixels={
@@ -64,6 +172,7 @@ _NOTE = (
     returns="Format, dimensions, value statistics, optional pixel samples and the DDS path.",
     examples=[
         "pix-tool-set read-replay-target --queue-id 17765 --rtv 1 --at-x 766 --at-y 382",
+        "pix-tool-set read-replay-target --draw-index 2352 --depth --at-x 766 --at-y 382",
         "pix-tool-set read-replay-target --draw-index 231 --pixels 4",
     ],
     notes=_NOTE,
@@ -94,7 +203,12 @@ def read_replay_target(args: dict[str, Any], context: ToolContext) -> ToolResult
         )
 
     slot = int(args.get("rtv") or 0)
+    want_depth = bool(args.get("depth"))
     targets = draw.render_target_resource_ids or []
+
+    if want_depth:
+        return _read_depth_levels(args, context, capture, record, draw)
+
     if slot >= len(targets):
         raise not_found(
             "render target",
@@ -106,9 +220,8 @@ def read_replay_target(args: dict[str, Any], context: ToolContext) -> ToolResult
     if resource is not None and resource.is_depth_stencil:
         raise invalid_argument(
             "rtv",
-            "pixtool cannot write a depth buffer as DDS (PIXTOOL13). Use "
-            "read-resource-texture for recorded depth bytes, or save-render-target "
-            "for an 8-bit depth image.",
+            "pixtool cannot write a depth buffer as DDS (PIXTOOL13). Pass --depth to "
+            "read it as 16-bit levels instead.",
         )
 
     keep = args.get("keep")

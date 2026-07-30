@@ -39,6 +39,7 @@ REPLAY_TOOLS = {
     "sample-pixel-region",
     "save-render-target",
     "read-replay-target",
+    "find-depth-content",
 }
 
 SKIP = {"session-open", "session-close"}

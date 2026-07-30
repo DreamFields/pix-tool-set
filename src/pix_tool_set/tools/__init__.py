@@ -17,6 +17,7 @@ def load_builtin_tools() -> None:
     from . import shader_tools  # noqa: F401
     from . import pass_binding_tools  # noqa: F401
     from . import timing_tools  # noqa: F401
+    from . import depth_probe_tools  # noqa: F401
     from . import replay_value_tools  # noqa: F401
     from . import resource_texture_tools  # noqa: F401
     from . import source_tools  # noqa: F401
