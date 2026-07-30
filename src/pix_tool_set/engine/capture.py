@@ -174,12 +174,148 @@ class Capture:
         return table if table.measured_count else None
 
     @cached_property
+    def _resource_reads(self):
+        """Every resources.bin Read() call, numbered in stream order."""
+        return cppparse.collect_resource_reads(self.export_dir)
+
+    @cached_property
     def _resource_stream(self):
         from .xpress import ResourceStream
 
         stream = ResourceStream(self.export_dir / "resources.bin")
-        stream.build_index(self._pso_parse.read_sizes)
+        reads = self._resource_reads
+        if reads:
+            stream.build_index([read.compressed_size for read in reads])
+        else:
+            # Fall back to the PSO-only sizes, which is all earlier versions had.
+            stream.build_index(self._pso_parse.read_sizes)
         return stream
+
+    @cached_property
+    def _resource_blob_index(self) -> dict[int, int]:
+        """resource id -> index of the blob holding its initial contents.
+
+        A resource may be filled by several Read() calls (one per subresource);
+        the first is what callers want for buffers, and texture mips are handled
+        by the texture tools.
+        """
+        out: dict[int, int] = {}
+        for read in self._resource_reads:
+            if read.owner_kind != "resource" or read.owner_id is None:
+                continue
+            out.setdefault(read.owner_id, read.index)
+        return out
+
+    def resource_blob_indices(self, resource_id: int) -> list[int]:
+        """Every blob index that feeds one resource, in order."""
+        return [
+            read.index
+            for read in self._resource_reads
+            if read.owner_kind == "resource" and read.owner_id == resource_id
+        ]
+
+    @cached_property
+    def _modification_plan(self):
+        """Per-frame CPU page writes recorded for mapped resources."""
+        from . import modifications
+
+        symbol_to_blob = {
+            read.size_symbol: read.index
+            for read in self._resource_reads
+            if read.owner_kind == "modification" and read.size_symbol
+        }
+        if not symbol_to_blob:
+            return None
+        return modifications.build_plan(self.export_dir, symbol_to_blob)
+
+    def read_resource_bytes(
+        self,
+        resource_id: int,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+        apply_modifications: bool = True,
+    ) -> bytes:
+        """Return the contents of a resource as the frame's shaders saw them.
+
+        The initial upload is only half the story: UE5 rewrites its big upload
+        buffers from the CPU during the frame, and PIX records those writes
+        separately. Without replaying them a cbuffer reads back stale bytes, so
+        they are applied by default.
+
+        Raises PixToolError when the export holds no data at all for a resource,
+        so a caller can report "not captured" rather than return zeros.
+        """
+        index = self._resource_blob_index.get(resource_id)
+        plan = self._modification_plan if apply_modifications else None
+        writes = plan.for_resource(resource_id) if plan is not None else []
+
+        if index is None and not writes:
+            raise PixToolError(
+                code="resource_data_unavailable",
+                message=f"No captured contents for resource {resource_id}.",
+                stage="resources.bin",
+                suggestion=(
+                    "PIX only stores data it saw uploaded or written from the CPU. "
+                    "Buffers produced entirely on the GPU have no recorded bytes."
+                ),
+            )
+
+        if index is not None:
+            blob = bytearray(self._load_blob(index))
+        else:
+            resource = self.resources.get(resource_id)
+            blob = bytearray(resource.size_bytes if resource else 0)
+
+        # Later writes win, matching the order the frame performed them. A patch
+        # blob whose stream position is still unresolved is skipped rather than
+        # failing the whole read, so callers keep the initial contents plus
+        # whatever patches did decode.
+        applied = 0
+        skipped = 0
+        for write in writes:
+            try:
+                patch = self._load_blob(write.blob_index)
+            except PixToolError:
+                skipped += 1
+                continue
+            chunk = patch[write.blob_offset : write.blob_offset + write.size]
+            start = write.resource_offset
+            if start + len(chunk) > len(blob):
+                blob.extend(bytes(start + len(chunk) - len(blob)))
+            blob[start : start + len(chunk)] = chunk
+            applied += 1
+        self._last_patch_stats = {"applied": applied, "skipped": skipped}
+
+        out = bytes(blob)
+        if offset:
+            out = out[offset:]
+        if length is not None:
+            out = out[:length]
+        return out
+
+    def resource_written_pages(self, resource_id: int) -> set[int]:
+        """Every page of a resource that the frame rewrote from the CPU."""
+        plan = self._modification_plan
+        if plan is None:
+            return set()
+        return {write.page for write in plan.for_resource(resource_id)}
+
+    def resource_data_sources(self, resource_id: int) -> dict[str, Any]:
+        """Explain where a resource's bytes come from, for honest reporting."""
+        pages = self.resource_written_pages(resource_id)
+        return {
+            "initial_blob_index": self._resource_blob_index.get(resource_id),
+            "cpu_page_writes": len(
+                self._modification_plan.for_resource(resource_id)
+                if self._modification_plan is not None
+                else []
+            ),
+            "written_page_count": len(pages),
+            # Truncated for display only; never use this list for a membership
+            # test, call resource_written_pages() instead.
+            "written_pages_sample": sorted(pages)[:32],
+        }
 
     # ==================================================================
     # indexes

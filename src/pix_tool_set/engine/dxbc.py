@@ -480,7 +480,15 @@ def parse_shader_metadata(disassembly: str) -> dict[str, Any]:
 
 
 def parse_constant_buffers(disassembly: str) -> list[dict[str, Any]]:
-    """Read the ``; Buffer Definitions:`` block (cbuffer layouts)."""
+    """Read the ``; Buffer Definitions:`` block (cbuffer layouts).
+
+    A field line carries its byte offset as a trailing comment on the *same* line::
+
+        ;   uint MaxNumInstances;   ; Offset:  128
+
+    Offsets are not derivable from field order because HLSL packing inserts
+    padding (this shader jumps 24 -> 128), so they must be read, not computed.
+    """
     if not disassembly:
         return []
     buffers: list[dict[str, Any]] = []
@@ -506,19 +514,29 @@ def parse_constant_buffers(disassembly: str) -> list[dict[str, Any]]:
             buffers.append(current)
             current = None
             continue
-        match = re.match(r"([A-Za-z_][\w:<>, ]*?)\s+([A-Za-z_]\w*)(\[[^\]]*\])?\s*;", body)
+
+        size_match = re.search(r"Size:\s*(\d+)", body)
+        if size_match and not re.search(r"[A-Za-z_]\w*\s*;", body.split(";")[0]):
+            current["size"] = int(size_match.group(1))
+            continue
+
+        offset_match = re.search(r";\s*Offset:\s*(\d+)", body)
+        declaration = body.split(";")[0].strip() + ";"
+        match = re.match(
+            r"([A-Za-z_][\w:<>, ]*?)\s+([A-Za-z_]\w*)(\[[^\]]*\])?\s*;", declaration
+        )
         if match:
-            current["fields"].append(
-                {
-                    "type": match.group(1).strip(),
-                    "name": match.group(2),
-                    "array": match.group(3) or "",
-                }
-            )
-        else:
-            offset = re.search(r";\s*Offset:\s*(\d+)", body)
-            if offset and current["fields"]:
-                current["fields"][-1]["offset"] = int(offset.group(1))
+            field: dict[str, Any] = {
+                "type": match.group(1).strip(),
+                "name": match.group(2),
+                "array": match.group(3) or "",
+            }
+            if offset_match:
+                field["offset"] = int(offset_match.group(1))
+            current["fields"].append(field)
+        elif offset_match and current["fields"]:
+            # Offset reported on its own line (older DXC layouts).
+            current["fields"][-1]["offset"] = int(offset_match.group(1))
     if current:
         buffers.append(current)
     return buffers

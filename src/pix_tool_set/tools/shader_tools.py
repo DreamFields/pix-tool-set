@@ -8,7 +8,7 @@ from typing import Any
 
 from ..context import ToolContext
 from ..engine.model import ShaderStage
-from ..errors import invalid_argument, not_found
+from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
 from ._common import (
     DRAW_SELECTOR,
@@ -437,13 +437,14 @@ def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
         slot={"type": "integer", "description": "cbuffer register index (b#) to focus on."},
         max_bytes={"type": "integer", "description": "Cap on dumped bytes per buffer. Default 512."},
     ),
-    returns="cbuffer layouts, the root parameter that supplies them, and raw bytes when available.",
+    returns="cbuffer layouts, the root parameter that supplies them, and decoded values when the bytes were captured.",
     examples=["pix-tool-set constant-buffer --draw-index 2461 --stage PS"],
     notes=(
-        "PIX C++ export records the GPU virtual address a root CBV points at, and the backing "
-        "buffer contents live in resources.bin only when the exporter captured that upload. "
-        "When bytes are unavailable the layout is still returned so the caller knows the field "
-        "structure."
+        "Values come from the captured contents of the buffer the root CBV points at, "
+        "read out of resources.bin at the recorded byte offset and decoded against the "
+        "field offsets in the shader reflection. PIX only stores data it saw uploaded, so "
+        "a buffer produced entirely on the GPU has a layout but no values; that case is "
+        "reported as values_available=false rather than guessed."
     ),
 )
 def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -477,9 +478,13 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     continue
             declared.append({"stage": shader.stage.value, **entry})
 
+    from ..engine import values as values_mod
     from ..engine.model import RootParameterKind
 
+    max_bytes = int(args.get("max_bytes") or 512)
+
     suppliers: list[dict[str, Any]] = []
+    decoded_any = False
     for binding in draw.bindings:
         if binding.kind is not RootParameterKind.CBV:
             continue
@@ -493,6 +498,55 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
         )
         if resource is not None:
             entry["resource"] = resource.to_dict()
+
+        # Read the bytes the root CBV points at and decode them against the layout.
+        if binding.resource_id is not None:
+            sources = capture.resource_data_sources(binding.resource_id)
+            page = binding.va_offset // 4096
+            rewritten = page in capture.resource_written_pages(binding.resource_id)
+            entry["data_sources"] = sources
+            entry["page"] = page
+            entry["page_rewritten_during_frame"] = rewritten
+            try:
+                blob = capture.read_resource_bytes(
+                    binding.resource_id,
+                    offset=binding.va_offset,
+                    length=max(max_bytes, 4096),
+                )
+            except PixToolError as exc:
+                entry["values_available"] = False
+                entry["values_detail"] = exc.message
+            else:
+                entry["bytes_read"] = len(blob)
+                entry["hexdump"] = values_mod.hexdump(blob, limit=min(max_bytes, 256))
+                decoded_blocks = []
+                for layout in layouts:
+                    fields = layout.get("fields") or []
+                    if not fields:
+                        continue
+                    decoded_blocks.append(
+                        {
+                            "cbuffer": layout.get("name"),
+                            "stage": layout.get("stage"),
+                            "fields": values_mod.decode_layout(blob, fields),
+                        }
+                    )
+                if decoded_blocks:
+                    entry["decoded"] = decoded_blocks
+                if rewritten:
+                    # The frame overwrote this page from the CPU, and those patch
+                    # blobs are not yet addressable, so the bytes on hand are the
+                    # pre-frame upload. Reporting them as current would be wrong.
+                    entry["values_available"] = False
+                    entry["values_are_stale"] = True
+                    entry["values_detail"] = (
+                        f"page {page} of resource {binding.resource_id} is rewritten from "
+                        "the CPU during the frame; the decoded values below are the "
+                        "pre-frame upload, not what the shader read"
+                    )
+                else:
+                    entry["values_available"] = True
+                    decoded_any = decoded_any or bool(decoded_blocks)
         suppliers.append(entry)
 
     result = ToolResult.success(
@@ -503,18 +557,32 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "declared_cbuffers": declared,
             "layouts": layouts,
             "root_cbv_suppliers": suppliers,
-            "values_available": False,
+            "values_available": decoded_any,
         }
     )
+    stale = [s for s in suppliers if s.get("values_are_stale")]
     if not layouts:
         result.degrade(
             "No cbuffer layout could be recovered; disassembly may be unavailable.",
             reason=capture.disassembly_unavailable_reason,
         )
-    else:
-        result.add_diagnostic(
-            "info",
-            "Field layout is reported. Raw values are not read back because PIX resolves root "
-            "CBVs to GPU addresses rather than embedding the bytes for every draw.",
+    elif stale:
+        result.degrade(
+            "Layout and bytes were recovered, but this buffer's page is rewritten from the "
+            "CPU during the frame, so the decoded values are the pre-frame upload rather "
+            "than what the shader read.",
+            resource_ids=[s["resource_id"] for s in stale],
+            reason=(
+                "PIX records those writes as separate patch blobs in resources.bin whose "
+                "stream position is not yet resolved."
+            ),
+        )
+    elif not decoded_any:
+        result.degrade(
+            "Layout is known but the backing bytes were not captured for this buffer.",
+            hint=(
+                "PIX stores contents it observed being uploaded; buffers written only on "
+                "the GPU have no recorded bytes."
+            ),
         )
     return result
