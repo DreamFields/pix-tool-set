@@ -138,21 +138,37 @@ def parse_resources(root: Path) -> dict[int, Resource]:
     return resources
 
 
-# resources.bin is one sequential XPRESS stream. Verified against Tiled.wpix by
-# chain-decompressing from candidate offsets: CreatePSOs.cpp consumes the first
-# stretch (376 blobs, 8,762,741 bytes) and the resource init files follow in
-# numeric order. Getting this order wrong makes decompression fail immediately,
-# so it is checked rather than assumed.
-_READ_ORDER = (
+# resources.bin is one sequential XPRESS stream with no index table, so a blob can
+# only be addressed by replaying the Read() calls in execution order.
+#
+# Layout established empirically against Tiled.wpix by chain-decompressing from
+# candidate offsets (a wrong order fails on the first blob):
+#
+#   1. CreatePSOs.cpp                  376 blobs,     8,762,741 bytes
+#   2. CreateAndInitResources_00{0,1,2} 3,127 blobs
+#   3. FrameResources_000.cpp          1 blob,      236,950,490 bytes
+#   4. tail, 231 blobs, 281,342 bytes  -- NOT in file order, see below
+#
+# The tail is produced by two interleaved sources: ModifyResource_* calls in
+# RenderFrameWorker (each preceded by a Read of a named size constant) and Read
+# calls sitting *inside* PopulateCommandList_* bodies, which live in
+# CommandLists_*.cpp but execute whenever RenderFrameWorker invokes them. Walking
+# RenderFrameWorker and splicing in each callee's own reads reproduces the stream
+# exactly: 231/231 blobs decompress and the byte total matches the file size.
+_INIT_ORDER = (
     "CreatePSOs.cpp",
     "CreateAndInitResources_000.cpp",
     "CreateAndInitResources_001.cpp",
     "CreateAndInitResources_002.cpp",
+    "FrameResources_000.cpp",
 )
 
 _RE_INIT_FUNC = re.compile(r"^void\s+CreateAndInitResource_(\d+)\s*\(")
 _RE_PSO_DEF = re.compile(r"^void\s+CreatePipelineState_(\d+)\s*\(")
+_RE_ANY_FUNC = re.compile(r"^void\s+(\w+)\s*\(")
 _RE_READ_NAMED = re.compile(r"g_resourceReader->Read\(\s*\w+\s*,\s*([A-Za-z_]\w*)\s*\)")
+_RE_CALLEE = re.compile(r"^\s*(PopulateCommandList_\w+|ModifyResource_\w+)\s*\(")
+_RE_SIZE_CONST = re.compile(r"static size_t (\w+)\s*=\s*(\d+)")
 
 
 @dataclass(slots=True)
@@ -166,28 +182,76 @@ class ResourceRead:
     owner_id: Optional[int]
     owner_kind: str
     size_symbol: str = ""
+    callee: str = ""
+
+
+def _size_constants(root: Path) -> dict[str, int]:
+    """Named blob sizes declared in the generated headers."""
+    out: dict[str, int] = {}
+    for name in ("ResourceModifications.h", "CapturedAssets.h", "FrameResources.h"):
+        path = root / name
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in _RE_SIZE_CONST.finditer(text):
+            out[match.group(1)] = int(match.group(2))
+    return out
+
+
+def _reads_per_function(
+    root: Path, patterns: tuple[str, ...], sizes: dict[str, int]
+) -> dict[str, list[tuple[int, str, int]]]:
+    """function name -> [(size, file, line)] for Reads inside its body."""
+    out: dict[str, list[tuple[int, str, int]]] = {}
+    for pattern in patterns:
+        for path in sorted(root.glob(pattern)):
+            current: Optional[str] = None
+            for lineno, line in iter_lines(path):
+                match = _RE_ANY_FUNC.match(line)
+                if match:
+                    current = match.group(1)
+                    continue
+                if current is None:
+                    continue
+                match = _RE_READ.search(line)
+                if match:
+                    out.setdefault(current, []).append(
+                        (int(match.group(1)), path.name, lineno)
+                    )
+                    continue
+                match = _RE_READ_NAMED.search(line)
+                if match:
+                    value = sizes.get(match.group(1))
+                    if value is not None:
+                        out.setdefault(current, []).append((value, path.name, lineno))
+    return out
 
 
 def collect_resource_reads(root: Path) -> list[ResourceRead]:
-    """Number every Read() call across the export in stream order.
+    """Number every Read() call across the export in true stream order.
 
-    The generated code never writes an index table, so a blob can only be
-    addressed by replaying the calls. Each init function is named after the
-    object it fills (`CreateAndInitResource_<resourceId>`), which is what lets a
-    blob be attributed to a resource.
-
-    After the init files, RenderFrameWorker_*.cpp keeps consuming the same stream
-    for the per-frame CPU page updates, so those reads must be numbered too or
-    every later index is wrong.
+    Init functions are named after the object they fill
+    (`CreateAndInitResource_<resourceId>`), which is what attributes a blob to a
+    resource. The frame tail is reconstructed by following RenderFrameWorker's
+    call order rather than file order, because its callees consume the same
+    cursor.
     """
     reads: list[ResourceRead] = []
     index = 0
-    for name in _READ_ORDER:
+    sizes = _size_constants(root)
+
+    for name in _INIT_ORDER:
         path = root / name
         if not path.exists():
             continue
         owner: Optional[int] = None
-        kind = "pso" if name == "CreatePSOs.cpp" else "resource"
+        if name == "CreatePSOs.cpp":
+            kind = "pso"
+        elif name.startswith("CreateAndInitResources"):
+            kind = "resource"
+        else:
+            # FrameResources' single large blob is not owned by one resource.
+            kind = "frame"
         for lineno, line in iter_lines(path):
             match = _RE_INIT_FUNC.match(line) or _RE_PSO_DEF.match(line)
             if match:
@@ -201,50 +265,87 @@ def collect_resource_reads(root: Path) -> list[ResourceRead]:
                         compressed_size=int(match.group(1)),
                         source_file=name,
                         source_line=lineno,
-                        owner_id=owner,
+                        owner_id=owner if kind == "resource" else owner,
                         owner_kind=kind,
                     )
                 )
                 index += 1
+                continue
+            match = _RE_READ_NAMED.search(line)
+            if match:
+                value = sizes.get(match.group(1))
+                if value is not None:
+                    reads.append(
+                        ResourceRead(
+                            index=index,
+                            compressed_size=value,
+                            source_file=name,
+                            source_line=lineno,
+                            owner_id=owner,
+                            owner_kind=kind,
+                            size_symbol=match.group(1),
+                        )
+                    )
+                    index += 1
 
-    # Per-frame modification blobs. Their sizes are named constants declared in
-    # ResourceModifications.h, so resolve those names to numbers first.
-    sizes = _modification_sizes(root)
+    bodies = _reads_per_function(
+        root, ("CommandLists_*.cpp", "ResourceModifications_*.cpp"), sizes
+    )
     for path in sorted(root.glob("RenderFrameWorker_*.cpp")):
+        pending: Optional[str] = None
         for lineno, line in iter_lines(path):
             match = _RE_READ_NAMED.search(line)
+            if match and match.group(1) in sizes:
+                pending = match.group(1)
+                continue
+            match = _RE_READ.search(line)
+            if match:
+                reads.append(
+                    ResourceRead(
+                        index=index,
+                        compressed_size=int(match.group(1)),
+                        source_file=path.name,
+                        source_line=lineno,
+                        owner_id=None,
+                        owner_kind="frame",
+                    )
+                )
+                index += 1
+                continue
+            match = _RE_CALLEE.match(line)
             if not match:
                 continue
-            symbol = match.group(1)
-            size = sizes.get(symbol)
-            if size is None:
-                continue
-            reads.append(
-                ResourceRead(
-                    index=index,
-                    compressed_size=size,
-                    source_file=path.name,
-                    source_line=lineno,
-                    owner_id=None,
-                    owner_kind="modification",
-                    size_symbol=symbol,
+            callee = match.group(1)
+            # The Read that feeds ModifyResource sits just above its call.
+            if callee.startswith("ModifyResource_") and pending:
+                reads.append(
+                    ResourceRead(
+                        index=index,
+                        compressed_size=sizes[pending],
+                        source_file=path.name,
+                        source_line=lineno,
+                        owner_id=None,
+                        owner_kind="modification",
+                        size_symbol=pending,
+                        callee=callee,
+                    )
                 )
-            )
-            index += 1
+                index += 1
+                pending = None
+            for size, file_name, body_line in bodies.get(callee, []):
+                reads.append(
+                    ResourceRead(
+                        index=index,
+                        compressed_size=size,
+                        source_file=file_name,
+                        source_line=body_line,
+                        owner_id=None,
+                        owner_kind="command_list",
+                        callee=callee,
+                    )
+                )
+                index += 1
     return reads
-
-
-def _modification_sizes(root: Path) -> dict[str, int]:
-    header = root / "ResourceModifications.h"
-    if not header.exists():
-        return {}
-    text = header.read_text(encoding="utf-8", errors="replace")
-    return {
-        match.group(1): int(match.group(2))
-        for match in re.finditer(
-            r"static size_t (ResourceModificationSize_\w+)\s*=\s*(\d+)", text
-        )
-    }
 
 
 def _apply_resource_desc(resource: Resource, body: str) -> None:

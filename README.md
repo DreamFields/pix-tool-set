@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **61 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **62 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,7 +62,7 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（61 个）
+## 五、工具总览（62 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
@@ -78,7 +78,7 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 
 **Shader 分析（9）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
 `shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
-`pass-shader-source` `session-set-pdb-dirs`
+`pass-shader-source` `session-set-pdb-dirs` `pass-values`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -294,7 +294,85 @@ pix-tool-set pass-shader-source --queue-id 18461 --output-dir ./src   # 写文�
 抽样 60 个 shader：PDB 命中 **60/60**，HLSL 恢复 **60/60**，入口函数成功切出 **59/60**。
 该符号目录共 129,989 个 `.pdb`。注意 hash 必须与截帧时的构建一致，换了构建就对不上。
 
-## 十一、`partial` 的含义（重要）
+## 十一、读取 shader 绑定资源的实际数值
+
+```powershell
+pix-tool-set pass-values --queue-id 18385
+pix-tool-set pass-values --queue-id 18385 --element-type float4
+pix-tool-set constant-buffer --draw-index 2469
+pix-tool-set read-buffer --resource-id 2379 --length-bytes 64 --format R32G32B32_FLOAT
+```
+
+实测 Queue ID 18385（`RayTracingBuildInstanceBuffer`）：
+
+```
+summary: {'values_available': 5, 'values_stale': 0, 'values_unavailable': 0}
+
+cbuffer _RootShaderParameters (CS):
+  +    0 uint    8                            GPUSceneInstanceDataTileSizeLog2
+  +    4 uint    255                          GPUSceneInstanceDataTileSizeMask
+  +    8 uint    768                          GPUSceneInstanceDataTileStride
+  +  128 uint    3                            MaxNumInstances
+  +  160 float3  [-4877.1, -1759.1, -1330.9]  PreViewTranslationHigh
+  +  188 float   15000                        CullingRadius
+  +  192 float   1e+06                        FarFieldCullingRadius
+```
+
+`TileSizeLog2=8` 与 `Mask=255`（= 2⁸−1）自洽，可作为解码正确的旁证。
+
+### resources.bin 的寻址
+
+这个文件是**单条顺序 XPRESS 流，没有索引表**，只能靠重放 `Read()` 调用来定位。
+实测确定的布局（顺序错一位，第一个块就解压失败）：
+
+| 段 | 来源 | 块数 | 字节 |
+|---|---|---|---|
+| 1 | `CreatePSOs.cpp` | 376 | 8,762,741 |
+| 2 | `CreateAndInitResources_00{0,1,2}.cpp` | 3,127 | — |
+| 3 | `FrameResources_000.cpp` | 1 | 236,950,490 |
+| 4 | 帧尾（**非文件序**） | 231 | 281,342 |
+
+第 4 段是难点：它由两个交错的来源产生 —— `RenderFrameWorker` 里的
+`ModifyResource_*` 调用，以及**嵌在 `PopulateCommandList_*` 函数体内**的 `Read`。
+后者虽然写在 `CommandLists_*.cpp`，但执行时机取决于 `RenderFrameWorker` 何时调用它。
+按文件序编号必然错位；沿 `RenderFrameWorker` 走一遍、遇到调用就展开被调函数自身的
+读取，才能复现真实顺序。
+
+结果：**3,735 / 3,735 个块全部解压成功，字节总数与文件大小完全相等（delta = 0）**。
+
+### 帧内 CPU 改写必须重放
+
+初始上传只是一半。UE5 在帧中用 `Map` + `memcpy` 按 4 KB 分页重写大上传缓冲，
+导出代码把它记在 `ResourceModifications_*.cpp`：
+
+```cpp
+Map(resource 2955);
+for (i = 0; i < 4; ++i)
+    memcpy(mappedData + 4096 * PagesIndex_2955_8[i], &data[offset], 4096);
+```
+
+不重放这些写入，读到的就是帧前的旧字节。判断标准很直接 —— 修好之前
+`BaseGroupDescriptorIndex` 读出 `1065353216`，那正是 float `1.0` 的位模式，
+一个索引字段不可能是这个值。
+
+### 诚实边界
+
+`pass-values` 为每个绑定单独给出可用性，不做整体断言：
+
+| 状态 | 含义 |
+|---|---|
+| `values_available: true` | 字节可信，是 shader 实际读到的 |
+| `values_are_stale: true` | 该页被 CPU 改写但补丁未能解码，给出旧值并标注 |
+| `values_available: false` | 没有记录的字节 |
+
+**UAV 输出通常属于第三类**：PIX 记录上传和 CPU 写入，不记录 GPU 产生的内容，
+所以 dispatch 的计算结果读不到，读到的只是它执行前的内容。纹理数据走
+`read-texture-pixels` / `save-render-target`。
+
+实测覆盖率：**2,625 个带 root CBV 的 draw 全部可信解码（0 过期）**，
+3,316 个资源中 3,127 个有可读字节（94.3%）。
+
+## 十二、`partial` 的含义（重要）
 
 `partial` 表示**答案可用，但某处被降级**，原因一定写在 `diagnostics` 里。
 这比假装成功或直接报错更有用，因为它区分了「工具坏了」和「数据本就不存在」。
@@ -312,7 +390,7 @@ pix-tool-set pass-shader-source --queue-id 18461 --output-dir ./src   # 写文�
 资源绑定表、入口函数名、numthreads 与全部 IR）。`has_embedded_source` 字段明确
 告知属于哪种情况。
 
-## 十二、Python API
+## 十三、Python API
 
 ```python
 from pix_tool_set import call_tool, list_tools, open_capture
@@ -337,7 +415,7 @@ draw.render_targets, draw.srvs, draw.uavs
 draw.shader("PS").disassembly
 ```
 
-## 十三、架构
+## 十四、架构
 
 ```
 src/pix_tool_set/
@@ -371,7 +449,7 @@ draw/dispatch 处快照——这份快照正是 PIX 选中某次 draw 时展示�
 `dxcompiler.dll`（裸 COM vtable），因此零第三方依赖。
 纹理像素读取内置纯 stdlib 的 PNG 解码器。
 
-## 十四、验证
+## 十五、验证
 
 ```powershell
 python tests\verify_live.py                 # 静态分析类工具
@@ -391,7 +469,7 @@ python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类
 解析规模：22,118 events、2,784 draw/dispatch、416 passes、3,293 resources、
 480,958 descriptors、359 shaders、56 root signatures。
 
-## 十五、已知边界
+## 十六、已知边界
 
 - 依赖本机 PIX 安装；纹理与像素类工具需要该截帧能在本机 GPU 上回放。
 - 首次 `session-open` 对 2.3 GB 截帧约需 30–60 秒，缓存约 2.5 GB。

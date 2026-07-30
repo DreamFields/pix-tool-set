@@ -503,10 +503,12 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
         if binding.resource_id is not None:
             sources = capture.resource_data_sources(binding.resource_id)
             page = binding.va_offset // 4096
-            rewritten = page in capture.resource_written_pages(binding.resource_id)
+            status = capture.resource_page_status(binding.resource_id, page)
             entry["data_sources"] = sources
             entry["page"] = page
-            entry["page_rewritten_during_frame"] = rewritten
+            entry["page_rewritten_during_frame"] = status["rewritten"]
+            entry["page_patches_applied"] = status.get("patches_applied", 0)
+            stale = status["rewritten"] and not status["patched"]
             try:
                 blob = capture.read_resource_bytes(
                     binding.resource_id,
@@ -533,19 +535,24 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     )
                 if decoded_blocks:
                     entry["decoded"] = decoded_blocks
-                if rewritten:
-                    # The frame overwrote this page from the CPU, and those patch
-                    # blobs are not yet addressable, so the bytes on hand are the
-                    # pre-frame upload. Reporting them as current would be wrong.
+                if stale:
+                    # The frame rewrote this page but the patch blob could not be
+                    # decoded, so the bytes on hand predate the frame.
                     entry["values_available"] = False
                     entry["values_are_stale"] = True
                     entry["values_detail"] = (
                         f"page {page} of resource {binding.resource_id} is rewritten from "
-                        "the CPU during the frame; the decoded values below are the "
-                        "pre-frame upload, not what the shader read"
+                        "the CPU during the frame and that patch could not be decoded; "
+                        "the values below predate the frame"
                     )
                 else:
                     entry["values_available"] = True
+                    if status["rewritten"]:
+                        entry["values_note"] = (
+                            f"page {page} was rewritten from the CPU during the frame; "
+                            f"{status['patches_applied']} patch write(s) applied, so these "
+                            "are the values the shader read"
+                        )
                     decoded_any = decoded_any or bool(decoded_blocks)
         suppliers.append(entry)
 

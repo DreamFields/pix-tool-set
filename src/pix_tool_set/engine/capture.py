@@ -294,6 +294,35 @@ class Capture:
             out = out[:length]
         return out
 
+    def resource_page_status(self, resource_id: int, page: int) -> dict[str, Any]:
+        """Whether a specific page's CPU rewrite could actually be applied.
+
+        A page that the frame rewrote is only trustworthy once the patch blob
+        feeding it decodes. Callers use this to decide between "these are the
+        values the shader read" and "these are stale pre-frame bytes".
+        """
+        plan = self._modification_plan
+        writes = (
+            [w for w in plan.for_resource(resource_id) if w.page == page]
+            if plan is not None
+            else []
+        )
+        if not writes:
+            return {"rewritten": False, "patched": True, "patch_count": 0}
+        applied = 0
+        for write in writes:
+            try:
+                self._load_blob(write.blob_index)
+                applied += 1
+            except PixToolError:
+                pass
+        return {
+            "rewritten": True,
+            "patched": applied == len(writes),
+            "patch_count": len(writes),
+            "patches_applied": applied,
+        }
+
     def resource_written_pages(self, resource_id: int) -> set[int]:
         """Every page of a resource that the frame rewrote from the CPU."""
         plan = self._modification_plan

@@ -59,13 +59,11 @@ def _decode_format(fmt: str, raw: bytes, offset: int) -> list[float] | None:
 
 
 def _resource_blob(capture, resource_id: int) -> bytes | None:
-    """Best-effort fetch of a resource's captured initial bytes."""
-    resource = capture.resource(resource_id)
-    if resource is None or resource.data_blob_index is None:
+    """Fetch a resource's captured contents, CPU page writes included."""
+    try:
+        return capture.read_resource_bytes(resource_id)
+    except PixToolError:
         return None
-    # The export records that a Read() happened for this resource, but the blob
-    # order for resources is separate from the PSO read order we indexed.
-    return None
 
 
 @tool(
