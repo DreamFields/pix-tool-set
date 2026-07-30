@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **63 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **64 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,7 +62,7 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（63 个）
+## 五、工具总览（64 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
@@ -78,7 +78,7 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 
 **Shader 分析（9）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
 `shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
-`pass-shader-source` `session-set-pdb-dirs` `pass-values` `read-resource-texture`
+`pass-shader-source` `session-set-pdb-dirs` `pass-values` `read-resource-texture` `read-replay-target`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -510,11 +510,59 @@ depth discontinuities          : 0
 深度。注意直接导出的 PNG 因反向 Z 值极小会接近全黑，需要自行拉伸对比度才便于
 肉眼查看（路径 A 的 `--png` 会自动做归一化）。
 
+### 从 GPU 回放读取真实数值（DDS 路径）
+
+`save-render-target` 写出的是图片，回答"长什么样"，但回答不了"这个像素的值是多少"
+—— PNG 已经压到 8 位并做过映射。要拿数值必须走无损格式：
+
+```powershell
+pix-tool-set read-replay-target --draw-index 2328 --rtv 0 --at-x 900 --at-y 500
+```
+
+```
+R10G10B10A2_UNORM  1815x1115  dxgi=24
+payload matches dimensions: True
+nonzero bytes: 8,091,074 (99.95%)
+pixel: {'x': 900, 'y': 500, 'value': [0.1017, 0.1017, 0.1017, 1.0]}
+```
+
+`pixtool` 只接受 `.png` 和 `.dds` 两种扩展名（其他一律 PIXTOOL14）。DDS 保留源
+DXGI 格式，所以数值可还原。位域打包的格式会解包成通道值而不是原始整数：
+`R10G10B10A2`、`R11G11B10_FLOAT`（含 11/10 位小浮点与次正规数）都已单元验证，
+见 `tests/verify_dds_formats.py`。
+
+### 两个硬限制（都来自 pixtool，不是解析问题）
+
+**深度不能导出为 DDS。** `pixtool` 直接拒绝：
+
+```
+PIXTOOL13 - Cannot save Depth Buffer as DDS
+save-resource cannot save Depth Buffer (DXGI_FORMAT '40') as a DDS file.
+Make sure file name for Depth Buffer ends with .png
+```
+
+所以**回放的深度只有 8 位 PNG，拿不到浮点值**。要深度的浮点数只能走
+`read-resource-texture`（但那是初始化内容，见上一节）。
+
+**回放采样的是事件执行前的状态。** 这点很容易踩坑。实测 Queue ID 17765：
+
+| 探测点 | 结果 |
+|---|---|
+| 该 pass 自己的 rt0/rt1 | 100% 全零 |
+| 更早 draw 写过的目标（draw 2328） | 99.95% 有内容 |
+
+它自己的 RT 全零不是 bug，而是**正确答案** —— 该 draw 还没执行。工具会标
+`surface_is_empty` 并降级为 `partial`，提示改用后续事件。
+
+同理，17765 那张深度 PNG 有几何，是因为深度在此 pass 之前已被 Nanite 光栅化填充，
+不是这个 pass 的产出。
+
 ### 选哪条
 
 | 需求 | 路径 |
 |---|---|
-| pass 执行后的深度/RT 内容 | B（`save-render-target`） |
+| RT 的真实像素数值 | `read-replay-target`（DDS，需选后续事件） |
+| pass 执行后的深度图像 | B（`save-render-target`，仅 8 位 PNG） |
 | 单个像素的精确浮点值 | A（`--at-x --at-y`），若内容标为 rendered |
 | 原始字节、自己做后续处理 | A（`--output`） |
 | `pixtool` 拒绝的资源 | A（不依赖回放） |

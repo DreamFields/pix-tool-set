@@ -38,6 +38,7 @@ REPLAY_TOOLS = {
     "pick-pixel",
     "sample-pixel-region",
     "save-render-target",
+    "read-replay-target",
 }
 
 SKIP = {"session-open", "session-close"}
