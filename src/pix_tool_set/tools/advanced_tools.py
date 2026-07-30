@@ -422,7 +422,9 @@ def sample_pixel_region(args: dict[str, Any], context: ToolContext) -> ToolResul
 def debug_pixel_shader(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
 
     coverage_note = None

@@ -565,7 +565,9 @@ def export_draw_textures(args: dict[str, Any], context: ToolContext) -> ToolResu
     capture = context.capture(args)
     record = context.session(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None:
         raise not_found("draw call", args.get("draw_index") or args.get("global_id"))

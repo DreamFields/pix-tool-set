@@ -184,7 +184,9 @@ def read_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
 def export_mesh(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None:
         raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
@@ -294,7 +296,9 @@ def save_render_target(args: dict[str, Any], context: ToolContext) -> ToolResult
 
     marker = args.get("marker")
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None and marker is None:
         raise invalid_argument(

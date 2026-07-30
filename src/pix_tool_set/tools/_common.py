@@ -39,7 +39,14 @@ DRAW_SELECTOR: dict[str, Any] = {
     },
     "global_id": {
         "type": "integer",
-        "description": "PIX Global ID of the event. Preferred when you have it.",
+        "description": "PIX GUI 'Global ID' of the event. Preferred when you have it.",
+    },
+    "queue_id": {
+        "type": "integer",
+        "description": (
+            "PIX GUI 'Queue ID' of the event. Present on every row of the PIX event "
+            "list, unlike Global ID, so it also addresses pass markers."
+        ),
     },
 }
 

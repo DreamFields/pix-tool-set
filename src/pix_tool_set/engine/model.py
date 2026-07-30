@@ -399,6 +399,29 @@ class Shader:
     def num_threads(self) -> list[int] | None:
         return self.metadata.get("num_threads")
 
+    @property
+    def entry_point(self) -> str:
+        """HLSL entry function name, e.g. RayTracingBuildLightGridCS.
+
+        This is the most useful handle when the capture has no embedded source:
+        the name is unique enough to locate the original .usf in the engine tree.
+        """
+        cached = self.metadata.get("entry_point")
+        if cached:
+            return str(cached)
+        for line in (self.disassembly or "").splitlines():
+            if "EntryFunctionName:" in line:
+                name = line.split("EntryFunctionName:", 1)[1].strip().rstrip(";").strip()
+                if name:
+                    self.metadata["entry_point"] = name
+                    return name
+            if line.startswith("define ") and "@" in line:
+                candidate = line.split("@", 1)[1].split("(", 1)[0].strip()
+                if candidate and not candidate.startswith("dx."):
+                    self.metadata["entry_point"] = candidate
+                    return candidate
+        return ""
+
     def to_dict(self, *, detail: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "stage": self.stage.value,
@@ -412,6 +435,7 @@ class Shader:
             payload["chunks"] = list(self.chunks)
             payload["metadata"] = self.metadata
             payload["has_embedded_source"] = self.has_embedded_source
+            payload["entry_point"] = self.entry_point
         return payload
 
 

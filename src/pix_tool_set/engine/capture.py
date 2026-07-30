@@ -636,9 +636,12 @@ class Capture:
         shader_hash: str | None = None,
         draw_index: int | None = None,
         global_id: int | None = None,
+        queue_id: int | None = None,
     ) -> Optional[Shader]:
-        if draw_index is not None or global_id is not None:
-            draw = self.resolve_draw(draw_index=draw_index, global_id=global_id)
+        if draw_index is not None or global_id is not None or queue_id is not None:
+            draw = self.resolve_draw(
+                draw_index=draw_index, global_id=global_id, queue_id=queue_id
+            )
             if draw is None:
                 return None
             if stage:

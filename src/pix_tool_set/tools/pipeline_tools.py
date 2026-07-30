@@ -172,7 +172,9 @@ def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
 def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None:
         raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
@@ -216,7 +218,9 @@ def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
 def vertex_input(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None:
         raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
@@ -313,7 +317,9 @@ def vertex_input(args: dict[str, Any], context: ToolContext) -> ToolResult:
 def post_vs_data(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None:
         raise not_found("draw call", args.get("draw_index") or args.get("global_id"))

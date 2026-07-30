@@ -265,18 +265,54 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Position within the frame plus surrounding context.",
     examples=[
         "pix-tool-set locate-event --global-id 3644",
+        "pix-tool-set locate-event --queue-id 18461",
         "pix-tool-set locate-event --draw-index 2461 --neighbours 5",
     ],
 )
 def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None:
+        # The id may name a marker rather than an action. Markers carry no Global
+        # ID in the PIX GUI, so this is the normal case for a Queue ID taken off
+        # a pass row; answer with the marker and the pass it opens.
+        event = capture.resolve_event(
+            global_id=args.get("global_id"), queue_id=args.get("queue_id")
+        )
+        if event is not None:
+            pass_entry = capture.find_pass_by_event(
+                global_id=event.global_id, queue_id=event.queue_id
+            )
+            result = ToolResult.success(
+                {
+                    "is_action": False,
+                    "event": event.to_dict(),
+                    "pass": (
+                        {
+                            "pass_index": pass_entry["pass_index"],
+                            "name": pass_entry["name"],
+                            "marker_path": pass_entry["marker_path"],
+                            "first_draw_index": pass_entry["first_draw_index"],
+                            "first_global_id": pass_entry["first_global_id"],
+                        }
+                        if pass_entry
+                        else None
+                    ),
+                }
+            )
+            result.add_diagnostic(
+                "info",
+                "This id names a marker, not a draw. Use the pass's first_draw_index "
+                "for draw-level tools.",
+            )
+            return result
         raise not_found(
             "event",
-            args.get("global_id") or args.get("draw_index"),
+            args.get("global_id") or args.get("queue_id") or args.get("draw_index"),
             "Use list-draw-calls or list-actions to find a valid identifier.",
         )
 

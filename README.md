@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **59 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **60 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,7 +62,7 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（59 个）
+## 五、工具总览（60 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
@@ -76,8 +76,9 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 **纹理分析（8）** `list-textures` `texture-stats` `texture-info` `export-texture`
 `export-draw-textures` `read-texture-pixels` `texture-pixel-stats` `pick-pixel`
 
-**Shader 分析（8）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
+**Shader 分析（9）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
 `shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
+`pass-shader-source`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -218,7 +219,68 @@ C++ 导出把多个 command list 交错写在一起，靠流式跟踪 `PIXBeginE
 事件列表 CSV 的 `Parent` 列是显式父链，天然正确。现在 draw 的 marker 路径以事件列表为准
 （2,696 / 2,786 个 draw 可对齐），仅剩 90 个 bundle 内部调用未被 CSV 收录、继续沿用解析值。
 
-## 十、`partial` 的含义（重要）
+## 十、查看某个 pass 的 shader 源码
+
+```powershell
+pix-tool-set pass-shader-source --queue-id 18461
+pix-tool-set pass-shader-source --pass-name "Light Grid Create" --stage CS --max-lines 0
+pix-tool-set pass-shader-source --queue-id 18461 --output-dir ./src_dump
+```
+
+### 先说结论：UE5 截帧里没有原始 HLSL
+
+实测这份截帧的全部 **363 个 shader**：
+
+| 容器块 | 数量 | 含义 |
+|---|---|---|
+| `ILDN` | 363 | 只记录外部 PDB 的**文件名** |
+| `ILDB` / `SPDB` | **0** | 嵌入式源码块，一个都没有 |
+
+原始 HLSL 只在编译时带 `/Zi /Qembed_debug` 才会进容器。UE5 把调试信息放在独立 PDB 里，
+截帧只留了个文件名（如 `3e92071c09a522dfa4e259e557334efc.pdb`），所以源码文本不在截帧内。
+这不是解析能力问题 —— PIX GUI 打开同一个截帧也看不到 HLSL。
+
+### 能拿到什么
+
+`pass-shader-source` 返回 `source_tier` 明确标注答案的层级：
+
+| tier | 含义 |
+|---|---|
+| `embedded-hlsl` | 真的取到了原始 HLSL（本截帧为 0 个） |
+| `dxil-disassembly` | 无嵌入源码，返回 DXIL 反汇编 + 入口函数名 |
+| `unavailable` | 连反汇编都产不出 |
+
+以 Queue ID 18461 为例，实测输出：
+
+```
+pass        : Light Grid Create (1 lights)
+draw_index  : 2470   pso: 3241
+stage       : CS
+source_tier : dxil-disassembly
+entry_point : RayTracingBuildLightGridCS
+num_threads : [8, 8, 1]
+pdb_name    : 3e92071c09a522dfa4e259e557334efc.pdb
+lines       : 2052
+```
+
+### `entry_point` 是找回源码的关键
+
+**363 / 363 个 shader 都能取到入口函数名**（100%）。拿它在引擎源码树里搜就能定位 `.usf`：
+
+```powershell
+rg -l "RayTracingBuildLightGridCS" D:\UE5\Engine\Shaders
+```
+
+反汇编本身也含完整的输入输出签名、cbuffer 字段布局、资源绑定表和 `numthreads`，
+逆向分析所需的信息基本齐全，只是没有变量名和注释。
+
+如果你有 shader PDB 的输出目录，传 `--pdb-dirs` 可以让工具去找对应 PDB：
+
+```powershell
+pix-tool-set pass-shader-source --queue-id 18461 --pdb-dirs D:\UE5\Saved\ShaderDebugInfo
+```
+
+## 十一、`partial` 的含义（重要）
 
 `partial` 表示**答案可用，但某处被降级**，原因一定写在 `diagnostics` 里。
 这比假装成功或直接报错更有用，因为它区分了「工具坏了」和「数据本就不存在」。
@@ -229,14 +291,14 @@ C++ 导出把多个 command list 交错写在一起，靠流式跟踪 `PIXBeginE
 - `read-buffer` / `export-mesh` — GPU 运行期生成的缓冲区内容未被截帧记录
 - `constant-buffer` — root CBV 被解析为 GPU 地址，逐 draw 的字节未内嵌
 - `pass-bindings` — 部分 draw 的真实描述符写入未被导出记录（见第七章 `trust`）
-- `disassemble-shader --prefer-source` — 该 shader 未带嵌入式 HLSL 调试信息
+- `disassemble-shader --prefer-source` / `pass-shader-source` — 该 shader 未带嵌入式 HLSL 调试信息
 
 关于 shader 源码：PIX 截帧存的是**编译后字节码**，原始 HLSL 只在编译时带
 `/Zi /Qembed_debug` 才会嵌入。未嵌入时返回 DXIL 反汇编（含完整输入输出签名、
 资源绑定表、入口函数名、numthreads 与全部 IR）。`has_embedded_source` 字段明确
 告知属于哪种情况。
 
-## 十一、Python API
+## 十二、Python API
 
 ```python
 from pix_tool_set import call_tool, list_tools, open_capture
@@ -261,7 +323,7 @@ draw.render_targets, draw.srvs, draw.uavs
 draw.shader("PS").disassembly
 ```
 
-## 十二、架构
+## 十三、架构
 
 ```
 src/pix_tool_set/
@@ -295,7 +357,7 @@ draw/dispatch 处快照——这份快照正是 PIX 选中某次 draw 时展示�
 `dxcompiler.dll`（裸 COM vtable），因此零第三方依赖。
 纹理像素读取内置纯 stdlib 的 PNG 解码器。
 
-## 十三、验证
+## 十四、验证
 
 ```powershell
 python tests\verify_live.py                 # 静态分析类工具
@@ -315,7 +377,7 @@ python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类
 解析规模：22,118 events、2,784 draw/dispatch、416 passes、3,293 resources、
 480,958 descriptors、359 shaders、56 root signatures。
 
-## 十四、已知边界
+## 十五、已知边界
 
 - 依赖本机 PIX 安装；纹理与像素类工具需要该截帧能在本机 GPU 上回放。
 - 首次 `session-open` 对 2.3 GB 截帧约需 30–60 秒，缓存约 2.5 GB。

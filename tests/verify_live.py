@@ -82,6 +82,7 @@ def build_args(name: str, capture) -> dict:
         "search-actions": {"query": "Draw"},
         "find-pass": {"name": chosen_pass_name or "Pass"},
         "pass-bindings": {"pass_index": 0, "max_draws": 2},
+        "pass-shader-source": {"pass_index": 0, "max_lines": 20},
         "pixel-history": (
             {"resource_id": texture.api_id, "x": 10, "y": 10} if texture else {"x": 10, "y": 10}
         ),

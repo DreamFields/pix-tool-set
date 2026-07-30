@@ -44,6 +44,7 @@ def _resolve_shader(capture, args: dict[str, Any]):
         shader_hash=args.get("shader_hash"),
         draw_index=args.get("draw_index"),
         global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if shader is None:
         raise not_found(
@@ -363,7 +364,9 @@ def shader_reflection(args: dict[str, Any], context: ToolContext) -> ToolResult:
 def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None:
         raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
@@ -446,7 +449,9 @@ def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
 def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"), global_id=args.get("global_id")
+        draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
+        queue_id=args.get("queue_id"),
     )
     if draw is None:
         raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
