@@ -355,6 +355,39 @@ for (i = 0; i < 4; ++i)
 `BaseGroupDescriptorIndex` 读出 `1065353216`，那正是 float `1.0` 的位模式，
 一个索引字段不可能是这个值。
 
+### 与 PIX GUI 逐字段对照
+
+拿 PIX 自己的常量缓冲视图当真值，对 Queue ID 18385 做了严格比对
+（整数必须相等，浮点按 PIX 显示的有效位比较）：
+
+```
+ offset  field                                  PIX                    ours
+      0  GPUSceneInstanceDataTileSizeLog2       8                      8            MATCH
+      4  GPUSceneInstanceDataTileSizeMask       255                    255          MATCH
+      8  GPUSceneInstanceDataTileStride         768                    768          MATCH
+     12  GPUSceneFrameNumber                    59369                  59369        MATCH
+    ...
+    160  PreViewTranslationHigh   {-4877.11, -1759.08, -1330.95}  同上              MATCH
+    176  PreViewTranslationLow    {-0.000216702, -2.56451e-05, 5.08402e-05}  同上   MATCH
+    196  AngleThresholdRatioSq                  0.000304679            0.000304679  MATCH
+    240  OutputStatsOffset                      0                      0            MATCH
+    244  pad                                    (无值)                 (无值)        MATCH
+
+match 21 | differ 0 | missing 0
+```
+
+回归脚本：`tests/verify_against_pix_gui.py`。
+
+对照过程中修掉两处解析缺陷：
+
+- **cbuffer 总大小取不到。** DXC 把成员包在一个 struct 里，只在收尾行给出大小
+  （`} _RootShaderParameters;  ; Offset: 0 Size: 244`）。原逻辑把这行当成员处理，
+  于是 `size` 永远是 `None`，外层 struct 还会以一个假字段的形式混进字段列表。
+- **缺尾部 `pad`。** cbuffer 按 16 字节寄存器分配，244 会补齐到 256。PIX 会把这段
+  显示成一行无值的 `pad`，现在与之一致（标 `is_padding`，不编造数值）。
+
+全截帧 586 个 cbuffer：500 个取到声明大小，330 个含尾部 padding，struct 泄漏 0 个。
+
 ### 诚实边界
 
 `pass-values` 为每个绑定单独给出可用性，不做整体断言：

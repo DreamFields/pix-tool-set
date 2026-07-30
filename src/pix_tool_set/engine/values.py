@@ -82,7 +82,13 @@ def decode_layout(
             "offset": offset,
             "size": field.get("size"),
         }
-        if offset is None:
+        if field.get("is_padding"):
+            # PIX lists trailing padding with no value; mirror that instead of
+            # inventing a number for bytes the shader never reads.
+            row["value"] = None
+            row["is_padding"] = True
+            row["note"] = "trailing padding"
+        elif offset is None:
             row["value"] = None
             row["note"] = "reflection did not report an offset"
         else:

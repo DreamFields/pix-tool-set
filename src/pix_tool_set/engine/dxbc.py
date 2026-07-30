@@ -488,12 +488,26 @@ def parse_constant_buffers(disassembly: str) -> list[dict[str, Any]]:
 
     Offsets are not derivable from field order because HLSL packing inserts
     padding (this shader jumps 24 -> 128), so they must be read, not computed.
+
+    DXC wraps a cbuffer's members in a struct and closes it with a line that
+    carries the total size::
+
+        ;   } _RootShaderParameters;   ; Offset:    0 Size:   244
+
+    That line is the only place the size appears, and it must not be mistaken for
+    a member. When the last member ends before that size, PIX shows the remainder
+    as a trailing ``pad`` entry, so it is reproduced here to match.
     """
     if not disassembly:
         return []
     buffers: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     in_block = False
+
+    def close_buffer(entry: dict[str, Any]) -> None:
+        _add_trailing_pad(entry)
+        buffers.append(entry)
+
     for line in disassembly.splitlines():
         if "Buffer Definitions:" in line:
             in_block = True
@@ -505,19 +519,20 @@ def parse_constant_buffers(disassembly: str) -> list[dict[str, Any]]:
         body = line[1:].strip()
         if body.startswith("cbuffer "):
             if current:
-                buffers.append(current)
+                close_buffer(current)
             current = {"name": body[len("cbuffer ") :].strip(), "fields": []}
             continue
         if current is None:
             continue
-        if body.startswith("}"):
-            buffers.append(current)
-            current = None
-            continue
 
-        size_match = re.search(r"Size:\s*(\d+)", body)
-        if size_match and not re.search(r"[A-Za-z_]\w*\s*;", body.split(";")[0]):
-            current["size"] = int(size_match.group(1))
+        # Closing line of the wrapper struct: "} Name;  ; Offset: 0 Size: 244"
+        if body.startswith("}"):
+            size_match = re.search(r"Size:\s*(\d+)", body)
+            if size_match:
+                current["size"] = int(size_match.group(1))
+                continue
+            close_buffer(current)
+            current = None
             continue
 
         offset_match = re.search(r";\s*Offset:\s*(\d+)", body)
@@ -526,8 +541,12 @@ def parse_constant_buffers(disassembly: str) -> list[dict[str, Any]]:
             r"([A-Za-z_][\w:<>, ]*?)\s+([A-Za-z_]\w*)(\[[^\]]*\])?\s*;", declaration
         )
         if match:
+            type_name = match.group(1).strip()
+            # "struct Name" opens the wrapper; it is not a member.
+            if type_name == "struct" or type_name.endswith(" struct"):
+                continue
             field: dict[str, Any] = {
-                "type": match.group(1).strip(),
+                "type": type_name,
                 "name": match.group(2),
                 "array": match.group(3) or "",
             }
@@ -538,8 +557,81 @@ def parse_constant_buffers(disassembly: str) -> list[dict[str, Any]]:
             # Offset reported on its own line (older DXC layouts).
             current["fields"][-1]["offset"] = int(offset_match.group(1))
     if current:
-        buffers.append(current)
+        close_buffer(current)
     return buffers
+
+
+_SCALAR_WIDTH = {
+    "bool": 4,
+    "int": 4,
+    "uint": 4,
+    "dword": 4,
+    "float": 4,
+    "half": 2,
+    "double": 8,
+}
+
+
+def _field_size(field: dict[str, Any]) -> int | None:
+    """Byte size of a plain scalar/vector/matrix member, else None."""
+    name = (field.get("type") or "").strip().lower()
+    for modifier in ("row_major ", "column_major ", "const ", "unorm ", "snorm "):
+        if name.startswith(modifier):
+            name = name[len(modifier) :]
+    for scalar, width in _SCALAR_WIDTH.items():
+        if not name.startswith(scalar):
+            continue
+        suffix = name[len(scalar) :]
+        if not suffix:
+            count = 1
+        elif "x" in suffix:
+            left, _, right = suffix.partition("x")
+            if not (left.isdigit() and right.isdigit()):
+                return None
+            count = int(left) * int(right)
+        elif suffix.isdigit():
+            count = int(suffix)
+        else:
+            return None
+        return count * width
+    return None
+
+
+def _add_trailing_pad(entry: dict[str, Any]) -> None:
+    """Append the trailing pad member PIX displays, when one exists.
+
+    Two cases produce padding at the end of a cbuffer:
+      * members stop short of the declared struct size
+      * the struct size itself is not a multiple of 16, since a cbuffer is
+        allocated in 16-byte registers
+
+    PIX shows either as a final ``pad`` row with no value, so both are covered.
+    """
+    size = entry.get("size")
+    fields = entry.get("fields") or []
+    if not size or not fields:
+        return
+    last = fields[-1]
+    offset = last.get("offset")
+    width = _field_size(last)
+    if offset is None or width is None:
+        return
+    members_end = offset + width
+    # A cbuffer occupies whole 16-byte registers.
+    allocated = ((size + 15) // 16) * 16
+    pad_start = max(members_end, min(size, allocated))
+    if pad_start >= allocated:
+        return
+    fields.append(
+        {
+            "type": "pad",
+            "name": "pad",
+            "array": "",
+            "offset": pad_start,
+            "size": allocated - pad_start,
+            "is_padding": True,
+        }
+    )
 
 
 _HLSL_HINT = re.compile(
