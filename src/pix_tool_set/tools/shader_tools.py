@@ -478,10 +478,13 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     continue
             declared.append({"stage": shader.stage.value, **entry})
 
+    from ..engine import cbvmatch
     from ..engine import values as values_mod
     from ..engine.model import RootParameterKind
 
     max_bytes = int(args.get("max_bytes") or 512)
+    tagged = cbvmatch.collect_cbuffer_layouts(draw, stage=args.get("stage"))
+    root_info = cbvmatch.root_cbv_registers(capture, draw)
 
     suppliers: list[dict[str, Any]] = []
     decoded_any = False
@@ -493,6 +496,13 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "resource_id": binding.resource_id,
             "byte_offset": binding.va_offset,
         }
+        info = root_info.get(binding.root_index)
+        entry["shader_register"] = info[0] if info else None
+        entry["visibility_stage"] = info[1] if info else None
+        matched, known = cbvmatch.layouts_for_root(
+            tagged, root_info, binding.root_index
+        )
+        entry["register_matched"] = known
         resource = (
             capture.resource(binding.resource_id) if binding.resource_id is not None else None
         )
@@ -522,7 +532,7 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 entry["bytes_read"] = len(blob)
                 entry["hexdump"] = values_mod.hexdump(blob, limit=min(max_bytes, 256))
                 decoded_blocks = []
-                for layout in layouts:
+                for layout in matched:
                     fields = layout.get("fields") or []
                     if not fields:
                         continue
@@ -530,6 +540,8 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
                         {
                             "cbuffer": layout.get("name"),
                             "stage": layout.get("stage"),
+                            "shader_register": layout.get("shader_register"),
+                            "declared_size": layout.get("size"),
                             "fields": values_mod.decode_layout(blob, fields),
                         }
                     )

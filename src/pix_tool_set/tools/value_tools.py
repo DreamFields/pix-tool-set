@@ -16,7 +16,9 @@ from __future__ import annotations
 from typing import Any
 
 from ..context import ToolContext
+from ..engine import cbvmatch
 from ..engine import values as values_mod
+from ..engine.model import RootParameterKind
 from ..errors import PixToolError, not_found
 from ..results import ToolResult
 from ._common import tool, with_session
@@ -113,6 +115,17 @@ def _read_values(
             "type": "integer",
             "description": "Bytes to read per resource. Default 256.",
         },
+        stage={
+            "type": "string",
+            "description": "Restrict cbuffer decoding to one stage, e.g. PS, VS, CS.",
+        },
+        cbuffer={
+            "type": "string",
+            "description": (
+                "Only decode the cbuffer with this name, e.g. Scene or View. "
+                "Matched case-insensitively."
+            ),
+        },
         element_type={
             "type": "string",
             "description": (
@@ -132,8 +145,8 @@ def _read_values(
     returns="Per-binding values with an explicit availability flag for each.",
     examples=[
         "pix-tool-set pass-values --queue-id 18385",
+        "pix-tool-set pass-values --queue-id 17765 --stage PS --cbuffer Scene",
         "pix-tool-set pass-values --queue-id 18385 --element-type float4",
-        'pix-tool-set pass-values --pass-name "Light Grid Create" --max-bytes 512',
     ],
     notes=_NOTE,
 )
@@ -174,12 +187,15 @@ def pass_values(args: dict[str, Any], context: ToolContext) -> ToolResult:
     max_views = int(args.get("max_views") or 24)
 
     # cbuffer field values, keyed by the shader's own names.
-    layouts: list[dict[str, Any]] = []
-    for shader in draw.shaders:
-        for cbuffer in shader.constant_buffers:
-            fields = cbuffer.get("fields") or []
-            if fields:
-                layouts.append({"stage": shader.stage.value, **cbuffer})
+    # A graphics draw binds several cbuffers at once, so each layout must be
+    # matched to the root parameter that actually supplies it. The root signature
+    # declares a shader_register per parameter, and the shader's reflection gives
+    # each cbuffer its cbN register, so the two are joined on that number rather
+    # than on the order they appear.
+    layouts = cbvmatch.collect_cbuffer_layouts(
+        draw, stage=args.get("stage"), name=args.get("cbuffer")
+    )
+    root_info = cbvmatch.root_cbv_registers(capture, draw)
 
     root_entries: list[dict[str, Any]] = []
     view_entries: list[dict[str, Any]] = []
@@ -202,6 +218,14 @@ def pass_values(args: dict[str, Any], context: ToolContext) -> ToolResult:
             )
             record["values"] = values
             if kind == "root_cbv" and values.get("bytes_read"):
+                matched, known = cbvmatch.layouts_for_root(
+                    layouts, root_info, binding.root_index
+                )
+                info = root_info.get(binding.root_index)
+                register = info[0] if info else None
+                record["shader_register"] = register
+                record["visibility_stage"] = info[1] if info else None
+                record["register_matched"] = known
                 blob = capture.read_resource_bytes(
                     binding.resource_id,
                     offset=binding.va_offset or 0,
@@ -211,10 +235,17 @@ def pass_values(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     {
                         "cbuffer": layout.get("name"),
                         "stage": layout.get("stage"),
+                        "shader_register": layout.get("shader_register"),
+                        "declared_size": layout.get("size"),
                         "fields": values_mod.decode_layout(blob, layout["fields"]),
                     }
-                    for layout in layouts
+                    for layout in matched
                 ]
+                if register is None:
+                    record["register_note"] = (
+                        "root signature did not report a shader register, so every "
+                        "cbuffer layout is shown and only one of them is correct"
+                    )
             if values.get("values_are_stale"):
                 stale += 1
             elif values.get("values_available"):

@@ -92,12 +92,42 @@ def decode_layout(
             row["value"] = None
             row["note"] = "reflection did not report an offset"
         else:
-            value = decode_field(blob, base_offset + int(offset), type_name)
+            position = base_offset + int(offset)
+            value = decode_field(blob, position, type_name)
             row["value"] = value
             if value is None:
                 row["note"] = "type is not a plain scalar/vector/matrix"
+            else:
+                _annotate_suspicious_float(row, blob, position, value)
         out.append(row)
     return out
+
+
+# A float this small is almost never a real shader value; it is what a small
+# integer looks like when reinterpreted as IEEE-754. UE5 packs reserved slots and
+# bindless handle halves into fields DXC reports as float, so the raw float
+# reading is technically correct but misleading on its own.
+_DENORMAL_LIMIT = 1e-30
+
+
+def _annotate_suspicious_float(
+    row: dict[str, Any], blob: bytes, position: int, value: Any
+) -> None:
+    """Add an integer reading when a float field clearly holds packed bits."""
+    scalar, components, rows = _base_and_count(row.get("type") or "")
+    if scalar != "float" or components != 1 or rows != 1:
+        return
+    if not isinstance(value, float):
+        return
+    if value == 0.0 or abs(value) >= _DENORMAL_LIMIT:
+        return
+    if position + 4 > len(blob):
+        return
+    row["value_as_uint"] = struct.unpack_from("<I", blob, position)[0]
+    row["note"] = (
+        "declared float but the bytes are a small integer; see value_as_uint. "
+        "UE5 uses these slots for reserved padding or packed handle bits."
+    )
 
 
 def hexdump(blob: bytes, *, start: int = 0, limit: int = 256, width: int = 16) -> list[str]:
