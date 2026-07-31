@@ -72,7 +72,29 @@ def _resolve_shader(capture, args: dict[str, Any]):
     """Locate the pass and the one shader stage being edited."""
     global_id = args.get("global_id")
     queue_id = args.get("queue_id")
-    if global_id is not None or queue_id is not None:
+    draw_index = args.get("draw_index")
+    draw = None
+    if draw_index is not None:
+        # A pass can contain many draws using different PSOs, so naming the draw is the
+        # most precise selector. Everything else resolves to a pass and then takes its
+        # first draw, which is not necessarily the one the caller meant.
+        draw = capture.draw_call(int(draw_index))
+        if draw is None:
+            raise not_found(
+                "draw", draw_index, "Run list-draw-calls or find-draw-calls for valid indices."
+            )
+        entry = capture.find_pass_by_event(global_id=draw.global_id)
+        label = f"draw_index={draw_index}"
+        if entry is None:
+            # The draw exists but no marker encloses it; carry on with a minimal entry so
+            # the edit still works rather than refusing over a cosmetic detail.
+            entry = {
+                "pass_index": None,
+                "name": draw.pass_name,
+                "first_draw_index": draw.index,
+                "first_queue_id": None,
+            }
+    elif global_id is not None or queue_id is not None:
         entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
         label = f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
     elif args.get("pass_index") is not None:
@@ -82,11 +104,16 @@ def _resolve_shader(capture, args: dict[str, Any]):
         entry = capture.find_pass(str(args["pass_name"]))
         label = f"pass_name={args['pass_name']!r}"
     else:
-        raise not_found("pass", "<no selector>", "Pass --queue-id/--global-id/--pass-name.")
+        raise not_found(
+            "pass",
+            "<no selector>",
+            "Pass --draw-index, or --queue-id/--global-id/--pass-name.",
+        )
     if entry is None:
         raise not_found("pass", label, "Run find-pass to get a valid selector.")
 
-    draw = capture.draw_call(entry["first_draw_index"])
+    if draw is None:
+        draw = capture.draw_call(entry["first_draw_index"])
     if draw is None:
         raise not_found("draw", entry["first_draw_index"])
 
@@ -142,6 +169,13 @@ def _describe(signature: list[tuple]) -> list[dict[str, Any]]:
         pass_index={"type": "integer", "description": "Pass index from list-passes."},
         queue_id={"type": "integer", "description": "PIX GUI Queue ID inside the pass."},
         global_id={"type": "integer", "description": "PIX GUI Global ID inside the pass."},
+        draw_index={
+            "type": "integer",
+            "description": (
+                "Draw index to edit. The most precise selector, because one pass can "
+                "contain many draws using different PSOs."
+            ),
+        },
         stage={"type": "string", "enum": _STAGES, "description": "Stage to edit."},
         output={
             "type": "string",
@@ -208,7 +242,12 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     directory = context.resolve_output(args.get("output"), "shader-edits")
     directory.mkdir(parents=True, exist_ok=True)
-    stem = f"q{entry.get('first_queue_id')}_{shader.stage.value}_{shader.entry_point or 'shader'}"
+    tag = (
+        f"q{entry['first_queue_id']}"
+        if entry.get("first_queue_id") is not None
+        else f"d{draw.index}"
+    )
+    stem = f"{tag}_{shader.stage.value}_{shader.entry_point or 'shader'}"
     hlsl_path = directory / f"{stem}.hlsl"
     args_path = directory / f"{stem}.args.txt"
     original_path = directory / f"{stem}.original.hlsl"
@@ -245,7 +284,12 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
         },
         "next_step": (
             f"Edit {hlsl_path.name}, then run: pix-tool-set shader-edit-apply "
-            f"--queue-id {entry.get('first_queue_id')} --source \"{hlsl_path}\""
+            + (
+                f"--queue-id {entry['first_queue_id']}"
+                if entry.get("first_queue_id") is not None
+                else f"--draw-index {draw.index}"
+            )
+            + f" --stage {shader.stage.value} --source \"{hlsl_path}\""
         ),
     }
 
@@ -273,6 +317,13 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
         pass_index={"type": "integer", "description": "Pass index from list-passes."},
         queue_id={"type": "integer", "description": "PIX GUI Queue ID inside the pass."},
         global_id={"type": "integer", "description": "PIX GUI Global ID inside the pass."},
+        draw_index={
+            "type": "integer",
+            "description": (
+                "Draw index to edit. The most precise selector, because one pass can "
+                "contain many draws using different PSOs."
+            ),
+        },
         stage={"type": "string", "enum": _STAGES, "description": "Stage being replaced."},
         args={
             "type": "array",
@@ -415,7 +466,12 @@ def shader_edit_apply(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     directory = context.resolve_output(args.get("output"), "shader-edits")
     directory.mkdir(parents=True, exist_ok=True)
-    stem = f"q{entry.get('first_queue_id')}_{shader.stage.value}_edited"
+    tag = (
+        f"q{entry['first_queue_id']}"
+        if entry.get("first_queue_id") is not None
+        else f"d{draw.index}"
+    )
+    stem = f"{tag}_{shader.stage.value}_edited"
     dxil_path = directory / f"{stem}.dxil"
     dxil_path.write_bytes(outcome.blob)
     written = [str(dxil_path)]

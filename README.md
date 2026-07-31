@@ -805,6 +805,60 @@ __UE_FILENAME_SENTINEL:259:32: error: expected expression
 cmake -S <export> -B <export>\build && cmake --build <export>\build --config Release
 ```
 
+### 能不能看到新的渲染结果——能，实测过
+
+导出工程是个真正的 Win32 程序（`Main.cpp` + `Win32Application.cpp`），有窗口、有
+swapchain，`RenderFrameWorker_000.cpp` 里会 `Present`。所以重建后运行，画面就在窗口里。
+
+实测流程（已跑通）：
+
+```powershell
+# 1. 首次配置。默认生成器可能是 Ninja 且无编译器，需显式指定 VS
+cmake -S <export> -B <export>\build -G "Visual Studio 18 2026" -A x64
+cmake --build <export>\build --config Release --parallel
+
+# 2. 运行。工作目录必须是导出根目录，因为 resources.bin 和 edited_*.dxil 都在那里
+Start-Process <export>\build\Release\<name>.exe -WorkingDirectory <export>
+```
+
+改 Slate 的 `ElementBatch` PS 加一行 `OutColor.rgb = float3(1,0,1)`，重建后窗口里整个
+面板由深灰变品红，采样统计 22.8% 像素为品红主导。同一份 UI 布局、同一批数据，只有颜色变了。
+
+### 一个必须知道的陷阱：改的 pass 要在上屏路径上
+
+第一次实测我改了 `Tonemap`，重建运行后**画面毫无变化**。不是工具坏了，是选错了 pass：
+
+```
+CopyResource(backBuffer, GetResource(23));    // 3864x2100，由 ElementBatch 写
+CopyResource(backBuffer, GetResource(2966));  // 1815x1115，由 ElementBatch 写
+Present(1, 0);
+```
+
+上屏拷的是这两个固定资源，而 `Tonemap` 写的是 rid 812，**本帧内没有被拷进 backbuffer**。
+这个截帧是在编辑器里截的，窗口显示的是 GPU Visualizer 面板，3D 视口的结果并不上屏。
+
+所以想看到变化，先确认目标 pass 的输出通向 backbuffer：
+
+```powershell
+pix-tool-set resource-usage --resource-id <被 CopyResource 拷贝的那个 rid>
+```
+
+也就是说，看不到变化有两种完全不同的原因——补丁没生效，或者补丁生效了但那个 pass
+不影响这一帧的最终画面。先用 `--patch` 的返回确认前者，再用上面的方法排除后者。
+
+### 构建环境的两个坑
+
+`CMakeLists.txt` 会从 nuget.org 下载 Agility SDK 与 WinPixEventRuntime。若 SSL 失败，
+它会留下 **0 字节的 .nupkg** 并继续，随后编译时报 `无法打开包括文件 d3d12.h`。手动补：
+
+```powershell
+Invoke-WebRequest 'https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12' -OutFile <export>\D3D12AgilitySdk.nupkg
+Invoke-WebRequest 'https://www.nuget.org/api/v2/package/WinPixEventRuntime' -OutFile <export>\WinPixEventRuntime.nupkg
+```
+
+删掉 `build` 目录重新配置，CMake 会自行解包。另外换生成器前必须清掉 `build`，
+否则报 `Does not match the generator used previously`。
+
 回归覆盖见 [tests/verify_shader_edit.py](tests/verify_shader_edit.py)（41 项），
 包含语法错误诊断、绑定拒绝、重复补丁检测与自动还原。
 

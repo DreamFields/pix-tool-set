@@ -118,14 +118,20 @@ diagnose-mobile-risks → diagnose-precision → diagnose-negative-values
 **「改一下这个 shader 看效果」**
 ```
 session-set-pdb-dirs --pdb-dirs <Project>\Saved\ShaderSymbols\PCD3D_SM6
-→ shader-edit-begin --queue-id <id> --output <dir>     取出真实 HLSL + 编译参数
+→ shader-edit-begin --draw-index <n> --stage PS --output <dir>   取出真实 HLSL + 编译参数
 → （编辑那个 .hlsl）
-→ shader-edit-apply --queue-id <id> --source <file>    先只编译校验
-→ shader-edit-apply ... --patch                        确认无误再打补丁
+→ shader-edit-apply --draw-index <n> --stage PS --source <file>  先只编译校验
+→ shader-edit-apply ... --patch                                 确认无误再打补丁
 ```
+`--draw-index` 是最精确的选择器，因为一个 pass 可能含多个使用不同 PSO 的 draw；
+也可用 `--queue-id` / `--global-id` / `--pass-name`（取该 pass 的首个 draw）。
 `apply` 不带 `--patch` 时只编译并校验绑定签名，不改动任何文件，适合先试错。
 返回 `partial` 且 `binding_check.identical=false` 表示替换不是 slot 兼容的，
 已被拒绝打补丁，需要先恢复原有资源声明。
+
+重建导出工程后能在窗口里看到新画面，但**前提是该 pass 的输出通向 backbuffer**。
+汇报「看不到变化」前必须先区分两种原因：补丁未生效，还是补丁生效但该 pass
+不影响这一帧的最终画面（编辑器截帧里 3D 视口常常并不上屏）。
 
 **「我刚才都做了什么」**
 ```
