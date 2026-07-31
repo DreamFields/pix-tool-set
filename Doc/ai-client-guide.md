@@ -93,6 +93,16 @@ list-shaders --stage CS --unique → shader-reflection --pso-id <id> --stage CS
 → disassemble-shader --pso-id <id> --stage CS -o cs.txt
 ```
 
+**「这块纹理/缓冲区里的值是多少」**
+```
+list-resources --kind texture3d          找到体积纹理
+read-resource-texture --resource-id <id> --z <n> --at-x <x> --at-y <y>
+read-buffer --resource-id <id> --length-bytes 64 --format R32_FLOAT
+```
+`Texture3D` 用 `--z` 选深度层（所有层共享一个 subresource）；
+`Tex2DArray` 用 `export-uav-slice --slice` 选数组层（每层一个 subresource）。
+越界会报错并给出实际上界，不会静默钳制。
+
 **「这块纹理是谁写的」**
 ```
 list-textures --render-target → resource-usage --resource-id <id>

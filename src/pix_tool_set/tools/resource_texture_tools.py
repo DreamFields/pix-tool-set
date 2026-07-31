@@ -29,7 +29,9 @@ _NOTE = (
     "export declares (format, dimensions and row pitch per plane). No GPU replay is "
     "involved, so it works on resources pixtool refuses, but it returns the contents the "
     "texture was initialised with rather than the output of any particular draw. A "
-    "depth-stencil surface appears as two planes: R32 depth then R8 stencil."
+    "depth-stencil surface appears as two planes: R32 depth then R8 stencil. A Texture3D "
+    "keeps every depth slice inside one subresource, so pick one with --z; a Tex2DArray "
+    "instead has one subresource per layer, which export-uav-slice addresses with --slice."
 )
 
 
@@ -98,11 +100,14 @@ def _resolve_resource(capture, args: dict[str, Any]):
     return rid, capture.resource(rid)
 
 
-def _plane_summary(blob: bytes, entry, *, sample_limit: int = 400000) -> dict[str, Any]:
+def _plane_summary(blob: bytes, entry, *, z: int = 0, sample_limit: int = 400000) -> dict[str, Any]:
     """Describe one plane's values without loading the whole thing into JSON."""
     stride = fp.format_stride(entry.format)
     out: dict[str, Any] = {**entry.to_dict(), "bytes_per_pixel": stride}
-    rows = fp.extract_rows(blob, entry)
+    if entry.is_volume:
+        out["z"] = z
+        out["z_availability"] = fp.slice_availability(blob, entry)
+    rows = fp.extract_rows(blob, entry, z)
     if rows is None or stride is None:
         out["decoded"] = False
         out["detail"] = f"{entry.format} is not a plain uncompressed format"
@@ -112,6 +117,12 @@ def _plane_summary(blob: bytes, entry, *, sample_limit: int = 400000) -> dict[st
     out["rows_recovered"] = len(rows)
     out["packed_bytes"] = len(packed)
     out["pixels"] = len(packed) // stride if stride else 0
+    if len(rows) < entry.height:
+        out["rows_missing"] = entry.height - len(rows)
+        out["row_note"] = (
+            "the capture holds fewer bytes than this slice declares, so the tail rows "
+            "are absent"
+        )
 
     count = min(out["pixels"], sample_limit)
     if count == 0:
@@ -285,6 +296,13 @@ def _encode_png(pixels: bytearray, width: int, height: int) -> bytes:
         },
         at_x={"type": "integer", "description": "Read a single pixel at this column."},
         at_y={"type": "integer", "description": "Read a single pixel at this row."},
+        z={
+            "type": "integer",
+            "description": (
+                "Depth slice of a Texture3D. Default 0. Validated against the volume's "
+                "actual depth rather than clamped."
+            ),
+        },
         output={
             "type": "string",
             "description": (
@@ -305,6 +323,7 @@ def _encode_png(pixels: bytearray, width: int, height: int) -> bytes:
     examples=[
         "pix-tool-set read-resource-texture --queue-id 17765 --target depth",
         "pix-tool-set read-resource-texture --queue-id 17765 --target depth --at-x 766 --at-y 382",
+        "pix-tool-set read-resource-texture --resource-id 1896 --z 225 --at-x 234 --at-y 234",
         "pix-tool-set read-resource-texture --resource-id 1985 --output G:\\out --png G:\\out",
     ],
     notes=_NOTE,
@@ -334,6 +353,17 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
         return result
 
     footprints = capture.resource_footprints(resource_id)
+    max_depth = max((entry.depth for entry in footprints), default=1)
+    z = int(args.get("z") or 0)
+    if z and z >= max_depth:
+        raise invalid_argument(
+            "z",
+            f"resource {resource_id} has {max_depth} depth slice(s), so valid indices are "
+            f"0..{max_depth - 1}; {z} is out of range.",
+        )
+    if z < 0:
+        raise invalid_argument("z", f"{z} is negative")
+
     data: dict[str, Any] = {
         "resource_id": resource_id,
         "resource": resource.to_dict(),
@@ -342,6 +372,14 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
         "footprint_count": len(footprints),
         "contents_are": "initial upload recorded at capture time, not a draw's output",
     }
+    if max_depth > 1:
+        data["volume"] = {
+            "z_selected": z,
+            "z_slices": max_depth,
+            "layout": (
+                "Texture3D: every z slice shares one subresource; --z picks which one"
+            ),
+        }
 
     if not footprints:
         data["planes"] = []
@@ -353,7 +391,7 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
         )
         return result
 
-    planes = [_plane_summary(blob, entry) for entry in footprints]
+    planes = [_plane_summary(blob, entry, z=z) for entry in footprints]
     data["planes"] = planes
     declared = sum(entry.size_bytes for entry in footprints)
     data["footprint_total_bytes"] = declared
@@ -365,7 +403,7 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
         if not plane.get("decoded"):
             continue
         stride = fp.format_stride(entry.format)
-        rows = fp.extract_rows(blob, entry)
+        rows = fp.extract_rows(blob, entry, z)
         if rows is None or not stride:
             continue
 
@@ -384,6 +422,8 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
             if 0 <= y < len(rows) and 0 <= x < entry.width:
                 chunk = rows[y][x * stride : (x + 1) * stride]
                 pixel: dict[str, Any] = {"x": x, "y": y, "hex": chunk.hex()}
+                if entry.is_volume:
+                    pixel["z"] = z
                 if stride == 4 and "R32" in entry.format.upper():
                     pixel["value"] = struct.unpack("<f", chunk)[0]
                 elif stride == 1:
@@ -402,11 +442,12 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
         directory.mkdir(parents=True, exist_ok=True)
         written = []
         for entry, plane in zip(footprints, planes):
-            rows = fp.extract_rows(blob, entry)
+            rows = fp.extract_rows(blob, entry, z)
             if rows is None:
                 continue
+            suffix = f"_z{z}" if entry.is_volume else ""
             name = (
-                f"resource{resource_id}_sub{entry.subresource_index}_"
+                f"resource{resource_id}_sub{entry.subresource_index}{suffix}_"
                 f"{entry.width}x{entry.height}_"
                 f"{entry.format.replace('DXGI_FORMAT_', '')}.bin"
             )
@@ -416,6 +457,7 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
             written.append(
                 {
                     "subresource_index": entry.subresource_index,
+                    **({"z": z} if entry.is_volume else {}),
                     "path": str(path),
                     "bytes": len(payload),
                     "layout": "tightly packed rows, pitch padding removed",
@@ -430,7 +472,7 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
         directory.mkdir(parents=True, exist_ok=True)
         images = []
         for entry, plane in zip(footprints, planes):
-            rows = fp.extract_rows(blob, entry)
+            rows = fp.extract_rows(blob, entry, z)
             stride = fp.format_stride(entry.format)
             if rows is None or not stride:
                 continue
@@ -438,15 +480,19 @@ def read_resource_texture(args: dict[str, Any], context: ToolContext) -> ToolRes
             if grey is None:
                 continue
             pixels, low, high = grey
+            suffix = f"_z{z}" if entry.is_volume else ""
             name = (
-                f"resource{resource_id}_sub{entry.subresource_index}_"
-                f"{entry.width}x{entry.height}.png"
+                f"resource{resource_id}_sub{entry.subresource_index}{suffix}_"
+                f"{entry.width}x{len(rows)}.png"
             )
             path = directory / name
-            path.write_bytes(_encode_png(pixels, entry.width, entry.height))
+            # Height comes from the rows actually recovered, not the declared height,
+            # so a short read produces a shorter image rather than a skewed one.
+            path.write_bytes(_encode_png(pixels, entry.width, len(rows)))
             images.append(
                 {
                     "subresource_index": entry.subresource_index,
+                    **({"z": z} if entry.is_volume else {}),
                     "path": str(path),
                     "stretched_from": low,
                     "stretched_to": high,

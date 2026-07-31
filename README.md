@@ -632,6 +632,50 @@ rid 1985 **被当作 render target 的事件数为 0**，`--rtv` 永远到不了
 | `pixtool` 拒绝的资源 | A（不依赖回放） |
 | 纹理的初始上传内容 | A |
 
+### Texture3D 选 z、Tex2DArray 选 slice
+
+两者布局不同，别混用：
+
+| 类型 | 存储方式 | 用什么选 |
+|---|---|---|
+| `Texture3D` | 所有 z 切片挤在**同一个** subresource 里，相邻切片相隔 `row_pitch × height` 字节 | `read-resource-texture --z <n>` |
+| `Tex2DArray` | **每层一个** subresource | `export-uav-slice --slice <n>` |
+
+```powershell
+# 468x468x450 的体积纹理，取第 225 层的某个体素
+pix-tool-set read-resource-texture --resource-id 1896 --z 225 --at-x 234 --at-y 234
+
+# 导出该层为 bin + 可视化 PNG（文件名带 z，不会互相覆盖）
+pix-tool-set read-resource-texture --resource-id 1896 --z 225 --output G:\out --png G:\out
+```
+
+返回里 `volume.z_slices` 给出总层数，`z_availability` 说明录到的字节实际覆盖多少层：
+
+```
+z_availability: declared=450  complete=449  partial=true
+                bytes_recorded=107,827,156  bytes_declared=107,827,200
+```
+
+少了 44 字节，所以**末片不完整**——这种情况会明说，而不是返回一张看起来完整的截断图。
+越界同样是拒绝而非钳制：
+
+```
+invalid_argument: resource 1896 has 450 depth slice(s), so valid indices are 0..449; 450 is out of range.
+```
+
+### 读 buffer 的值
+
+```powershell
+pix-tool-set read-buffer --resource-id 448 --length-bytes 64 --format R32_FLOAT
+pix-tool-set read-buffer --resource-id 448 --offset-bytes 4096 --length-bytes 256 --output G:\out\buf.bin
+```
+
+给 `--format` 就按类型解码成 `elements`，不给就只回 hex。`--stride` 可覆盖默认步长
+（结构化缓冲区里挑某个字段时有用）。
+
+同样的前提仍然成立：`resources.bin` 只存上传与 CPU 写入，**GPU 在帧内算出来的
+buffer 内容不在其中**，此时 `bytes_available` 为 `false` 并说明原因。
+
 ## 十三、导出纹理 UAV 的数组切片（如 RWLightGrid）
 
 ```powershell
@@ -914,6 +958,7 @@ python tests\verify_live.py                 # 静态分析类工具
 python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类工具
 python tests\verify_shader_edit.py           # shader 改源码并应用的全链路（41 项）
 python tests\verify_activity.py              # 调用活动记录与查看器（44 项）
+python tests\verify_value_reads.py           # buffer / 2D 纹理 / 3D 纹理 z 切片取值（52 项）
 ```
 
 在 `NoTiled.wpix`（2.33 GB，UE5 ManyLights 场景）上的实测结果：

@@ -44,11 +44,29 @@ class SubresourceFootprint:
     subresource_index: int
 
     @property
+    def slice_bytes(self) -> int:
+        """Bytes of one z slice, padding included.
+
+        A Texture3D packs every z slice into the *same* subresource, one after another,
+        each occupying ``row_pitch * height`` bytes. A Tex2DArray instead gets one
+        subresource per layer. This property is what lets a caller address a z slice
+        without conflating the two layouts.
+        """
+        return self.row_pitch * self.height
+
+    @property
     def size_bytes(self) -> int:
         return self.row_pitch * self.height * max(self.depth, 1)
 
+    @property
+    def is_volume(self) -> bool:
+        return self.depth > 1
+
+    def slice_offset(self, z: int) -> int:
+        return self.offset + z * self.slice_bytes
+
     def to_dict(self) -> dict:
-        return {
+        out = {
             "subresource_index": self.subresource_index,
             "offset": self.offset,
             "format": self.format,
@@ -58,6 +76,14 @@ class SubresourceFootprint:
             "row_pitch": self.row_pitch,
             "size_bytes": self.size_bytes,
         }
+        if self.is_volume:
+            out["slice_bytes"] = self.slice_bytes
+            out["z_slices"] = self.depth
+            out["layout"] = (
+                "volume: all z slices live in this one subresource, "
+                f"{self.slice_bytes} bytes apart"
+            )
+        return out
 
 
 def parse_footprints(root: Path) -> dict[int, list[SubresourceFootprint]]:
@@ -126,17 +152,52 @@ def format_stride(name: str) -> int | None:
 
 
 def extract_rows(
-    blob: bytes, footprint: SubresourceFootprint
+    blob: bytes, footprint: SubresourceFootprint, z: int = 0
 ) -> list[bytes] | None:
-    """Split one subresource into tightly packed rows, dropping pitch padding."""
+    """Split one z slice of a subresource into tightly packed rows.
+
+    ``z`` defaults to 0, which is the only slice a 2D texture has. For a Texture3D it
+    selects which depth slice to read, because all of them share one subresource.
+
+    Returns None when the format cannot be laid out. A short read (the capture holds
+    fewer bytes than the footprint declares) yields the rows that *are* present rather
+    than nothing, so the caller can see how far the data goes and report it.
+    """
     stride = format_stride(footprint.format)
     if stride is None:
         return None
+    if z < 0 or z >= max(footprint.depth, 1):
+        return None
     row_bytes = footprint.width * stride
+    base = footprint.slice_offset(z)
     rows: list[bytes] = []
     for y in range(footprint.height):
-        start = footprint.offset + y * footprint.row_pitch
+        start = base + y * footprint.row_pitch
         if start + row_bytes > len(blob):
             break
         rows.append(blob[start : start + row_bytes])
     return rows
+
+
+def slice_availability(
+    blob: bytes, footprint: SubresourceFootprint
+) -> dict[str, int | bool]:
+    """How many z slices the recorded bytes actually cover.
+
+    Captures can be a few bytes short of what the footprint declares, so the last
+    slice may be partial. Saying so is better than silently returning a truncated
+    image that looks complete.
+    """
+    slice_bytes = footprint.slice_bytes
+    declared = max(footprint.depth, 1)
+    if slice_bytes <= 0:
+        return {"declared": declared, "complete": 0, "partial": False}
+    available = max(len(blob) - footprint.offset, 0)
+    whole = available // slice_bytes
+    return {
+        "declared": declared,
+        "complete": min(whole, declared),
+        "partial": whole < declared and available % slice_bytes > 0,
+        "bytes_recorded": available,
+        "bytes_declared": slice_bytes * declared,
+    }
