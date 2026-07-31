@@ -62,7 +62,7 @@ def close(actual, expected) -> bool:
 def main() -> int:
     clear_capture_cache()
     payload = call_tool(
-        "pass-values", {"session": "tiled", "queue_id": 18385, "max_bytes": 256}
+        "pass-values", {"session": "Tiled", "queue_id": 18385, "max_bytes": 256}
     )
     if payload["status"] == "error":
         print(payload["error"])

@@ -19,7 +19,7 @@ def main() -> int:
     payload = call_tool(
         "read-resource-texture",
         {
-            "session": "tiled",
+            "session": "Tiled",
             "queue_id": QUEUE_ID,
             "target": "depth",
             "pixels": 6,

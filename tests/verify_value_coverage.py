@@ -12,7 +12,7 @@ from pix_tool_set.context import ToolContext, clear_capture_cache  # noqa: E402
 
 def main() -> int:
     clear_capture_cache()
-    capture = ToolContext.from_cwd().capture({"session": "tiled"})
+    capture = ToolContext.from_cwd().capture({"session": "Tiled"})
 
     cbv_ok = cbv_stale = cbv_none = 0
     draws_with_cbv = 0

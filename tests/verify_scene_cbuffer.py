@@ -35,7 +35,7 @@ def main() -> int:
     payload = call_tool(
         "pass-values",
         {
-            "session": "tiled",
+            "session": "Tiled",
             "queue_id": QUEUE_ID,
             "stage": STAGE,
             "cbuffer": CBUFFER,

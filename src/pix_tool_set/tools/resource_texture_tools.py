@@ -212,7 +212,12 @@ def _to_greyscale(
         low, high = min(finite), max(finite)
     elif stride == 1:
         values = [float(byte) for row in rows for byte in row[:width]]
-        low, high = 0.0, 255.0
+        # Stretch over the values actually present, not the format's full range.
+        # A 0/1 occupancy mask would otherwise render as solid black.
+        present = [value for value in values]
+        low, high = (min(present), max(present)) if present else (0.0, 255.0)
+        if high <= low:
+            low, high = 0.0, max(high, 1.0)
     else:
         return None
 

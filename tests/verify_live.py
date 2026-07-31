@@ -88,6 +88,7 @@ def build_args(name: str, capture) -> dict:
         "session-set-pdb-dirs": {"clear": True},
         "pass-values": {"pass_index": 0, "max_bytes": 64, "max_views": 4},
         "read-resource-texture": {"resource_id": 1985, "pixels": 4},
+        "export-uav-slice": {"resource_id": 824, "slice": 0, "pixels": 4},
         "pixel-history": (
             {"resource_id": texture.api_id, "x": 10, "y": 10} if texture else {"x": 10, "y": 10}
         ),

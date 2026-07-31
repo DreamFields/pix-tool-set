@@ -21,6 +21,7 @@ def load_builtin_tools() -> None:
     from . import replay_value_tools  # noqa: F401
     from . import resource_texture_tools  # noqa: F401
     from . import source_tools  # noqa: F401
+    from . import uav_slice_tools  # noqa: F401
     from . import value_tools  # noqa: F401
     from . import geometry_tools  # noqa: F401
     from . import pipeline_tools  # noqa: F401

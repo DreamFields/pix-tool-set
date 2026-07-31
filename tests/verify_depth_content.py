@@ -23,7 +23,7 @@ def main() -> int:
     payload = call_tool(
         "find-depth-content",
         {
-            "session": "tiled",
+            "session": "Tiled",
             "queue_id": 17765,
             "max_probes": 4,
             "output": str(OUT),
@@ -64,7 +64,7 @@ def main() -> int:
     read = call_tool(
         "read-replay-target",
         {
-            "session": "tiled",
+            "session": "Tiled",
             "draw_index": best["draw_index"],
             "depth": True,
             "at_x": 766,
@@ -92,7 +92,7 @@ def main() -> int:
     contrast = call_tool(
         "read-replay-target",
         {
-            "session": "tiled",
+            "session": "Tiled",
             "queue_id": 17765,
             "depth": True,
             "at_x": 766,

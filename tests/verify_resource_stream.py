@@ -14,7 +14,7 @@ from pix_tool_set.errors import PixToolError  # noqa: E402
 
 def main() -> int:
     clear_capture_cache()
-    capture = ToolContext.from_cwd().capture({"session": "tiled"})
+    capture = ToolContext.from_cwd().capture({"session": "Tiled"})
     reads = capture._resource_reads
     stream = capture._resource_stream
 

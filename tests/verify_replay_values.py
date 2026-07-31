@@ -50,7 +50,7 @@ def main() -> int:
         call_tool(
             "read-replay-target",
             {
-                "session": "tiled",
+                "session": "Tiled",
                 "queue_id": 17765,
                 "rtv": 1,
                 "at_x": 766,
@@ -66,7 +66,7 @@ def main() -> int:
         call_tool(
             "read-replay-target",
             {
-                "session": "tiled",
+                "session": "Tiled",
                 "draw_index": 2328,
                 "rtv": 0,
                 "at_x": 900,
@@ -82,7 +82,7 @@ def main() -> int:
         "Queue ID 17765 depth (expected to be refused)",
         call_tool(
             "read-replay-target",
-            {"session": "tiled", "queue_id": 17765, "rtv": 0, "keep": str(OUT / "d.dds")},
+            {"session": "Tiled", "queue_id": 17765, "rtv": 0, "keep": str(OUT / "d.dds")},
         ),
     )
     return 0

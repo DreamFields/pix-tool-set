@@ -20,7 +20,7 @@ from pix_tool_set.engine.model import RootParameterKind  # noqa: E402
 
 def main() -> int:
     clear_capture_cache()
-    capture = ToolContext.from_cwd().capture({"session": "tiled"})
+    capture = ToolContext.from_cwd().capture({"session": "Tiled"})
 
     multi = 0
     checked = 0
@@ -63,7 +63,7 @@ def main() -> int:
         payload = call_tool(
             "pass-values",
             {
-                "session": "tiled",
+                "session": "Tiled",
                 "draw_index": draw.index,
                 "max_bytes": 64,
                 "include_views": False,
@@ -93,7 +93,7 @@ def main() -> int:
     payload = call_tool(
         "pass-values",
         {
-            "session": "tiled",
+            "session": "Tiled",
             "queue_id": 17765,
             "stage": "PS",
             "cbuffer": "Scene",

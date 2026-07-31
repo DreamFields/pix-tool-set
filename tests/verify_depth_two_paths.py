@@ -33,7 +33,7 @@ def main() -> int:
     payload = call_tool(
         "read-resource-texture",
         {
-            "session": "tiled",
+            "session": "Tiled",
             "queue_id": QUEUE_ID,
             "target": "depth",
             "output": str(OUT),
@@ -68,7 +68,7 @@ def main() -> int:
     replay = call_tool(
         "save-render-target",
         {
-            "session": "tiled",
+            "session": "Tiled",
             "queue_id": QUEUE_ID,
             "depth": True,
             "output": str(OUT / "replay_depth.png"),
