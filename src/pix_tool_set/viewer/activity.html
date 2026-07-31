@@ -126,6 +126,60 @@
   .empty { color: var(--faint); text-align: center; padding: 40px 20px; font-size: 13px; }
   .empty code { background: #0b0e12; padding: 2px 6px; border-radius: 3px; color: #9ec4f0; }
 
+  /* --- rendered frame preview --- */
+  .shot { margin-bottom: 12px; }
+  .shot img {
+    display: block; width: 100%; height: auto; border-radius: 6px;
+    border: 1px solid var(--line); background: #000; cursor: zoom-in;
+  }
+  .shot .cap {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-top: 6px; font-size: 11.5px; color: var(--faint); font-family: var(--mono);
+  }
+  .badge {
+    display: inline-block; padding: 1px 7px; border-radius: 10px;
+    font-size: 10.5px; font-weight: 600; letter-spacing: .3px;
+    background: #1f6feb2b; color: #a9ccff; border: 1px solid #1f6feb55;
+    font-family: inherit;
+  }
+  .badge.changed { background: #4fb4772b; color: #8fe0ae; border-color: #4fb47755; }
+  .badge.same { background: #d9a13b2b; color: #e8c483; border-color: #d9a13b55; }
+  .swatch {
+    display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+    border: 1px solid #ffffff26; vertical-align: -1px; margin-right: 4px;
+  }
+  .thumbstrip {
+    display: flex; gap: 8px; overflow-x: auto; padding: 8px 14px;
+    background: #10151a; border-bottom: 1px solid var(--line); flex: none;
+  }
+  .thumbstrip.hidden { display: none; }
+  .thumb { flex: none; width: 118px; cursor: pointer; }
+  .thumb img {
+    display: block; width: 118px; height: 66px; object-fit: cover;
+    border-radius: 4px; border: 1px solid var(--line); background: #000;
+  }
+  .thumb.on img { border-color: var(--accent); box-shadow: 0 0 0 2px #1f6feb44; }
+  .thumb span {
+    display: block; margin-top: 3px; font-size: 10.5px; color: var(--faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono);
+  }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .compare figure { margin: 0; }
+  .compare figcaption {
+    font-size: 10.5px; color: var(--faint); font-family: var(--mono);
+    margin-top: 4px; text-align: center;
+  }
+  .lightbox {
+    position: fixed; inset: 0; background: #000000e8; z-index: 50;
+    display: none; align-items: center; justify-content: center; padding: 24px;
+  }
+  .lightbox.on { display: flex; }
+  .lightbox img { max-width: 100%; max-height: 100%; border-radius: 4px; }
+  .lightbox .hint {
+    position: absolute; bottom: 14px; left: 0; right: 0; text-align: center;
+    color: var(--faint); font-size: 12px;
+  }
+
   footer {
     flex: none; display: flex; align-items: center; gap: 12px;
     padding: 7px 16px; background: var(--panel); border-top: 1px solid var(--line);
@@ -178,6 +232,7 @@
 
 <main>
   <section class="list-pane">
+    <div class="thumbstrip hidden" id="strip"></div>
     <div class="rows" id="rows">
       <div class="empty" id="emptyList">
         暂无记录。在终端里执行任意命令，例如 <code>pix-tool-set frame-stats</code>，这里会实时出现。
@@ -190,6 +245,7 @@
       <h2 id="detailTitle">详情</h2>
       <div class="tabs">
         <span class="tab on" data-tab="overview">概览</span>
+        <span class="tab" data-tab="render">渲染结果</span>
         <span class="tab" data-tab="data">结果数据</span>
         <span class="tab" data-tab="raw">原始信封</span>
       </div>
@@ -199,6 +255,11 @@
     </div>
   </section>
 </main>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" alt="渲染结果">
+  <div class="hint">点击任意位置关闭</div>
+</div>
 
 <footer>
   <span id="replayState">就绪</span>
@@ -308,6 +369,7 @@
           ? "没有匹配当前过滤条件的调用。"
           : '暂无记录。在终端里执行任意命令，例如 <code>pix-tool-set frame-stats</code>，这里会实时出现。'
       }</div>`;
+      renderStrip();
       return;
     }
     const cursorId = state.replay.on && state.replay.at >= 0
@@ -325,6 +387,7 @@
         <span class="ms">${durationOf(entry.duration_ms)}</span>
       </div>`;
     }).join("");
+    renderStrip();
   }
 
   function updateCounts() {
@@ -336,6 +399,152 @@
     $("cOk").textContent = tally.success;
     $("cPart").textContent = tally.partial;
     $("cErr").textContent = tally.error;
+  }
+
+  // ------------------------------------------------------- rendered frames
+  // A capture is served from the log directory while following live, and inlined as a
+  // data URI in a standalone export. Resolving here keeps both paths out of the markup.
+  function renderUrl(name) {
+    if (!name) return null;
+    if (STANDALONE) {
+      const inlined = (boot.renders || {})[name];
+      return inlined ? `data:image/png;base64,${inlined}` : null;
+    }
+    return `api/render?name=${encodeURIComponent(name)}`;
+  }
+
+  function rendersOf(entries) {
+    return entries.filter((e) => e.render && e.render.name);
+  }
+
+  function swatch(rgb) {
+    if (!Array.isArray(rgb) || rgb.length < 3) return "";
+    const css = `rgb(${Math.round(rgb[0])},${Math.round(rgb[1])},${Math.round(rgb[2])})`;
+    return `<i class="swatch" style="background:${css}"></i>`;
+  }
+
+  function shotHtml(entry, url) {
+    const r = entry.render;
+    const label = r.label ? esc(r.label) : "未命名";
+    return `<div class="shot">
+      <img src="${url}" alt="渲染结果 ${label}" data-full="${url}">
+      <div class="cap">
+        <span class="badge">${label}</span>
+        <span>${r.width}x${r.height}</span>
+        <span>${clockOf(entry)}</span>
+      </div>
+    </div>`;
+  }
+
+  function comparisonHtml(cmp, entry, url) {
+    if (!cmp || !cmp.comparable) {
+      return cmp
+        ? `<div class="diag"><span class="lvl">未对比</span>${
+            esc(cmp.reason || "缺少可比对的基线")}</div>`
+        : "";
+    }
+    const changed = cmp.visibly_different;
+    const badge = changed
+      ? '<span class="badge changed">画面已改变</span>'
+      : '<span class="badge same">与基线无可测差异</span>';
+    const delta = (cmp.mean_rgb_delta || []).map((v) => (v > 0 ? `+${v}` : `${v}`)).join(", ");
+    const hue = Object.entries(cmp.hue_share_delta_percent || {})
+      .filter(([, v]) => Math.abs(v) >= 0.5)
+      .map(([k, v]) => `${k} ${v > 0 ? "+" : ""}${v}%`)
+      .join("  ");
+
+    // Baseline on the left, current on the right, so the eye reads it as a before/after.
+    const baseName = cmp.reference_render;
+    const baseUrl = renderUrl(baseName);
+    const side = baseUrl
+      ? `<div class="compare">
+           <figure><img src="${baseUrl}" data-full="${baseUrl}" alt="基线">
+             <figcaption>基线 ${esc(cmp.reference || "")}</figcaption></figure>
+           <figure><img src="${url}" data-full="${url}" alt="本次">
+             <figcaption>本次 ${esc((entry.render || {}).label || "")}</figcaption></figure>
+         </div>`
+      : "";
+
+    return `<h3 class="sec">与基线对比 ${badge}</h3>${side}
+      <dl class="kv">
+        <dt>均值 RGB 变化</dt><dd>${esc(delta || "-")}</dd>
+        <dt>最大通道差</dt><dd>${esc(cmp.largest_channel_delta)}</dd>
+        <dt>色相占比变化</dt><dd>${esc(hue || "无显著变化")}</dd>
+      </dl>`;
+  }
+
+  function renderViewHtml(entry) {
+    const own = entry.render && entry.render.name ? entry : null;
+    if (!own) {
+      const shots = rendersOf(state.entries);
+      if (!shots.length) {
+        return `<div class="empty">还没有渲染结果。补丁 shader 后运行
+          <code>pix-tool-set replay-render --label after-edit</code>，
+          重建并运行导出工程，画面会记录到这里。</div>`;
+      }
+      const latest = shots[shots.length - 1];
+      return `<div class="diag"><span class="lvl">提示</span>这条调用本身没有渲染结果，
+        下面显示的是最近一次 <code>replay-render</code> 的画面。</div>`
+        + shotHtml(latest, renderUrl(latest.render.name));
+    }
+
+    const url = renderUrl(entry.render.name);
+    if (!url) {
+      return '<div class="empty">这张渲染结果没有随快照一起导出。</div>';
+    }
+    const envelope = state.payloads.get(entry.id);
+    if (!envelope) {
+      fetchPayload(entry.id).then(() => {
+        if (state.selected === entry.id && state.tab === "render") renderDetail();
+      });
+      return shotHtml(entry, url) + '<div class="empty">正在读取颜色统计…</div>';
+    }
+
+    const data = envelope.data || {};
+    const shot = data.capture || {};
+    const colour = shot.colour || {};
+    let html = shotHtml(entry, url);
+    html += `<dl class="kv">
+      <dt>分辨率</dt><dd>${esc(shot.width)}x${esc(shot.height)}</dd>
+      <dt>抓取方式</dt><dd>${esc(shot.method || "-")}</dd>
+      <dt>均值 RGB</dt><dd>${swatch(colour.mean_rgb)}${
+        esc((colour.mean_rgb || []).join(", "))}</dd>
+      <dt>采样像素</dt><dd>${esc(colour.sampled || 0)}</dd>
+      <dt>文件</dt><dd>${esc(shot.path || "-")}</dd>
+    </dl>`;
+
+    const hue = colour.hue_share_percent || {};
+    const parts = Object.entries(hue)
+      .filter(([, v]) => v >= 0.5)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${k} ${v}%`);
+    if (parts.length) {
+      html += `<h3 class="sec">色相构成</h3><pre class="json">${esc(parts.join("\n"))}</pre>`;
+    }
+    html += comparisonHtml(data.comparison, entry, url);
+    return html;
+  }
+
+  function renderStrip() {
+    const strip = $("strip");
+    const shots = rendersOf(visibleEntries());
+    if (!shots.length) {
+      strip.classList.add("hidden");
+      strip.innerHTML = "";
+      return;
+    }
+    strip.classList.remove("hidden");
+    strip.innerHTML = shots.map((entry) => {
+      const url = renderUrl(entry.render.name);
+      const on = entry.id === state.selected ? " on" : "";
+      const label = entry.render.label || clockOf(entry);
+      return url
+        ? `<div class="thumb${on}" data-id="${esc(entry.id)}">
+             <img src="${url}" alt="${esc(label)}">
+             <span>${esc(label)}</span>
+           </div>`
+        : "";
+    }).join("");
   }
 
   // ---------------------------------------------------------------- detail
@@ -362,6 +571,10 @@
       detailEl.innerHTML = overviewHtml(entry);
       return;
     }
+    if (state.tab === "render") {
+      detailEl.innerHTML = renderViewHtml(entry);
+      return;
+    }
     const envelope = state.payloads.get(entry.id);
     if (!envelope) {
       detailEl.innerHTML = '<div class="empty">正在读取完整结果…</div>';
@@ -378,6 +591,14 @@
     const started = entry.started_at
       ? new Date(entry.started_at * 1000).toLocaleString() : "-";
     let html = `<div class="cmd">${esc(entry.command || entry.tool)}</div>`;
+
+    // Show the picture straight away when this call produced one; that is the whole
+    // point of recording it, and making the user find a tab first defeats it.
+    if (entry.render && entry.render.name) {
+      const url = renderUrl(entry.render.name);
+      if (url) html += shotHtml(entry, url);
+    }
+
     html += `<dl class="kv">
       <dt>状态</dt><dd class="st ${esc(entry.status)}">${esc(entry.status)}</dd>
       <dt>耗时</dt><dd>${durationOf(entry.duration_ms)}</dd>
@@ -556,6 +777,28 @@
     if (row) select(row.dataset.id);
   });
 
+  $("strip").addEventListener("click", (event) => {
+    const thumb = event.target.closest(".thumb");
+    if (!thumb) return;
+    state.tab = "render";
+    for (const tab of document.querySelectorAll(".tab")) {
+      tab.classList.toggle("on", tab.dataset.tab === "render");
+    }
+    select(thumb.dataset.id, { scroll: true });
+  });
+
+  // Click any capture to see it full size; the inline preview is width-constrained.
+  detailEl.addEventListener("click", (event) => {
+    const img = event.target.closest("img[data-full]");
+    if (!img) return;
+    $("lightboxImg").src = img.dataset.full;
+    $("lightbox").classList.add("on");
+  });
+  $("lightbox").addEventListener("click", () => {
+    $("lightbox").classList.remove("on");
+    $("lightboxImg").src = "";
+  });
+
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => {
       for (const other of document.querySelectorAll(".tab")) other.classList.remove("on");
@@ -578,6 +821,12 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && $("lightbox").classList.contains("on")) {
+      $("lightbox").classList.remove("on");
+      $("lightboxImg").src = "";
+      return;
+    }
+    if ($("lightbox").classList.contains("on")) return;
     if (event.target.tagName === "INPUT" || event.target.tagName === "SELECT") return;
     const rows = visibleEntries();
     const at = rows.findIndex((r) => r.id === state.selected);

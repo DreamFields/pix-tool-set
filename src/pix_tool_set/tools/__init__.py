@@ -32,5 +32,6 @@ def load_builtin_tools() -> None:
     from . import performance_tools  # noqa: F401
     from . import diagnostic_tools  # noqa: F401
     from . import activity_tools  # noqa: F401
+    from . import replay_render_tools  # noqa: F401
 
     _LOADED = True

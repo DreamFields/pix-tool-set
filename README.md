@@ -62,7 +62,7 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（70 个）
+## 五、工具总览（71 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
@@ -103,8 +103,8 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 **诊断（4）** `diagnose-negative-values` `diagnose-precision`
 `diagnose-reflection-mismatch` `diagnose-mobile-risks`
 
-**调用活动（2）** `activity-viewer` `activity-log` —— 本地网页实时显示每次调用与结果，
-并支持逐步回放调用历史。
+**调用活动（3）** `activity-viewer` `activity-log` `replay-render` —— 本地网页实时显示
+每次调用与结果、逐步回放调用历史，并把重建后的渲染画面抓成 PNG 显示在面板里。
 
 ## 六、输出信封
 
@@ -846,6 +846,54 @@ pix-tool-set resource-usage --resource-id <被 CopyResource 拷贝的那个 rid>
 也就是说，看不到变化有两种完全不同的原因——补丁没生效，或者补丁生效了但那个 pass
 不影响这一帧的最终画面。先用 `--patch` 的返回确认前者，再用上面的方法排除后者。
 
+### 把新的渲染结果显示在面板里
+
+不必自己盯窗口。`replay-render` 会构建、运行、等到画面真正出现，再把它抓成 PNG
+存进活动日志，`activity-viewer` 的面板里就能直接看：
+
+```powershell
+pix-tool-set replay-render --label baseline                        # 改之前先留一张
+# ... shader-edit-apply --patch ...
+pix-tool-set replay-render --label after-edit --compare-to baseline
+```
+
+面板的变化：调用流上方多一条缩略图带（只显示有截图的调用），详情多一个「渲染结果」
+页签，概览顶部直接内嵌画面，点图放大。带 `--compare-to` 时是基线与本次并排显示，
+外加一句判定：**画面已改变** 或 **与基线无可测差异**。
+
+判定不只靠眼睛，还给数字：
+
+```
+mean_rgb_delta        [-181.6, -240.4, -181.6]
+largest_channel_delta 240.4
+hue_share_delta_percent  grey -76.9%   magenta +23.0%
+visibly_different     true
+```
+
+阈值定得比抖动大一档（任一通道差 ≥ 8 级，或某色相占比变化 ≥ 3%），所以
+dither 和 UI 闪烁不会被当成 shader 改动。
+
+### 一个坑：窗口出现 ≠ 画面已渲染
+
+这个截帧要跑 4 分钟以上才 present。窗口会先出现好几分钟的**纯白**，此时抓图会得到
+一张空白页——而两张空白页互相对比是"完全一致"，读起来就像"补丁没生效"，比报错更糟。
+
+所以工具等的不是窗口，而是**画面内容**：轮询计算内部区域的内容占比，达到阈值且连续两次
+稳定才抓。判定只看内缩 12% 的内部区域，因为标题栏和边框本身就能让全图评分冲到 0.049，
+足以骗过一个朴素阈值（这是实测踩到的，修正后白屏评分 0.0000、已渲染 0.2828）。
+
+抓到空白时状态是 `partial` 并明确说明，不会伪装成结论：
+
+```
+warning: The window never showed a rendered frame within the settle window, so this
+         capture is a blank page and says nothing about the patch.
+```
+
+`--settle-seconds` 默认 150，大截帧建议给到 400 以上。已经构建过就加 `--skip-build`。
+
+回归覆盖见 [tests/verify_replay_render.py](tests/verify_replay_render.py)（40 项），
+包含 PNG 编码往返、白屏与已渲染的分离判定、色相对比阈值与图片路由的路径防护。
+
 ### 构建环境的两个坑
 
 `CMakeLists.txt` 会从 nuget.org 下载 Agility SDK 与 WinPixEventRuntime。若 SSL 失败，
@@ -875,6 +923,11 @@ pix-tool-set activity-viewer --port 9000 --no-browser
 页面左侧是调用流（时间、工具名、关键参数、状态、耗时），右侧是详情三视图：
 概览（命令原文、诊断、参数、结果摘要、产出文件）、结果数据、原始信封。
 顶部可按工具名/命令/参数过滤，也可只看 `error` 或 `partial`。
+
+`replay-render` 抓到的渲染画面也在这里：调用流上方出现缩略图带，详情多一个
+「渲染结果」页签，概览顶部直接内嵌画面，点图放大。截图存在
+`%LOCALAPPDATA%\pix-tool-set\activity\renders\`，页面通过 `api/render?name=` 取，
+文件名经过校验（只接受该目录下的裸 PNG 名，拒绝任何路径穿越）。详见第十四章。
 
 回放用于复盘"当时按什么顺序做了什么"：`▶ 回放` 自动逐条前进，`下一步` 手动单步，
 速度可选 1.6s / 0.8s / 0.3s，或**真实间隔**（按当时两次调用的实际时间差，
@@ -1011,7 +1064,8 @@ draw/dispatch 处快照——这份快照正是 PIX 选中某次 draw 时展示�
 python tests\verify_live.py                 # 静态分析类工具
 python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类工具
 python tests\verify_shader_edit.py           # shader 改源码并应用的全链路（41 项）
-python tests\verify_activity.py              # 调用活动记录与查看器（44 项）
+python tests\verify_activity.py              # 调用活动记录与查看器（45 项）
+python tests\verify_replay_render.py         # 渲染结果抓取与面板展示（42 项）
 python tests\verify_value_reads.py           # buffer / 2D 纹理 / 3D 纹理 z 切片取值（52 项）
 ```
 
@@ -1019,11 +1073,11 @@ python tests\verify_value_reads.py           # buffer / 2D 纹理 / 3D 纹理 z 
 
 | 项 | 结果 |
 |---|---|
-| 工具总数 | 70 |
+| 工具总数 | 71 |
 | 成功 | 51 |
 | partial | 6（均为已声明的数据边界）|
 | 异常 | **0** |
-| 跳过 | 13（GPU 回放类需 `--with-replay`；`session-open`/`session-close` 会改动会话状态；`shader-edit-apply` 依赖前置产物；`activity-viewer` 会常驻服务，后两者分别由 `verify_shader_edit.py` 与 `verify_activity.py` 覆盖）|
+| 跳过 | 14（GPU 回放类需 `--with-replay`；`session-open`/`session-close` 会改动会话状态；`shader-edit-apply` 依赖前置产物；`activity-viewer` 会常驻服务；`replay-render` 要构建并运行整个工程，后三者分别由 `verify_shader_edit.py`、`verify_activity.py` 与 `verify_replay_render.py` 覆盖）|
 
 解析规模：22,118 events、2,784 draw/dispatch、416 passes、3,293 resources、
 480,958 descriptors、359 shaders、56 root signatures。

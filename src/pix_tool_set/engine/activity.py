@@ -36,6 +36,7 @@ from ..session import sessions_root
 
 INDEX_NAME = "activity.jsonl"
 PAYLOAD_DIR = "payloads"
+RENDER_DIR = "renders"
 
 # Keep the newest N payloads. The index itself is cheap to keep whole.
 PAYLOAD_KEEP = 3000
@@ -62,6 +63,43 @@ def index_path() -> Path:
 
 def payload_dir() -> Path:
     return activity_root() / PAYLOAD_DIR
+
+
+def renders_dir() -> Path:
+    """Where replay-render writes its screenshots, so the viewer can serve them."""
+    directory = activity_root() / RENDER_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def read_render(name: str) -> bytes | None:
+    """Bytes of one stored render. The name is validated, never trusted.
+
+    Only a bare filename inside the renders directory is accepted: no separators, no
+    parent traversal, and the resolved path must still sit under that directory.
+    """
+    if not name or name != Path(name).name or not name.lower().endswith(".png"):
+        return None
+    if not all(ch.isalnum() or ch in "-_." for ch in name):
+        return None
+    directory = renders_dir().resolve()
+    target = (directory / name).resolve()
+    if target.parent != directory or not target.exists():
+        return None
+    try:
+        return target.read_bytes()
+    except OSError:
+        return None
+
+
+def list_renders() -> list[dict[str, Any]]:
+    """Every stored render, newest first."""
+    directory = renders_dir()
+    rows: list[dict[str, Any]] = []
+    for entry in sorted(directory.glob("*.png"), key=lambda p: -p.stat().st_mtime):
+        stat = entry.stat()
+        rows.append({"name": entry.name, "bytes": stat.st_size, "modified_at": stat.st_mtime})
+    return rows
 
 
 # ----------------------------------------------------------------------
@@ -185,6 +223,17 @@ def record(
                 "code": error.get("code"),
                 "message": error.get("message"),
                 "stage": error.get("stage"),
+            }
+
+        # A render capture is the one output worth surfacing in the feed itself, so the
+        # viewer can show the picture beside the call without fetching the payload.
+        capture_info = (data or {}).get("capture") if isinstance(data, dict) else None
+        if isinstance(capture_info, dict) and str(capture_info.get("path", "")).endswith(".png"):
+            line["render"] = {
+                "name": Path(str(capture_info["path"])).name,
+                "width": capture_info.get("width"),
+                "height": capture_info.get("height"),
+                "label": (args or {}).get("label"),
             }
 
         target = root / INDEX_NAME

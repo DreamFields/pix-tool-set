@@ -22,8 +22,8 @@ also be opened directly against an exported snapshot.
 
 from __future__ import annotations
 
+import base64
 import json
-import socket
 import threading
 import time
 import webbrowser
@@ -126,17 +126,32 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(activity.stats())
             return
 
+        if route == "/api/render":
+            name = (query.get("name") or [""])[0]
+            blob = activity.read_render(name)
+            if blob is None:
+                self._json({"error": f"no render named {name!r}"}, 404)
+                return
+            self._send(200, blob, "image/png")
+            return
+
+        if route == "/api/renders":
+            self._json({"renders": activity.list_renders()})
+            return
+
         self._json({"error": f"unknown route {route!r}"}, 404)
 
 
-def _port_is_free(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            probe.bind(("127.0.0.1", port))
-        except OSError:
-            return False
-    return True
+class _Server(ThreadingHTTPServer):
+    """A server that refuses to share its port.
+
+    ``HTTPServer`` sets ``allow_reuse_address``, which on Windows maps to SO_REUSEADDR and
+    lets a second process bind a port that is already listening. Both then appear to start
+    while only one receives connections - and a caller can end up reading a stale viewer's
+    log directory while believing it is their own. Refusing the bind is the honest answer.
+    """
+
+    allow_reuse_address = False
 
 
 # ======================================================================
@@ -185,15 +200,25 @@ def activity_viewer(args: dict[str, Any], context: ToolContext) -> ToolResult:
     port = int(args.get("port") or 8787)
     if port < 1 or port > 65535:
         raise invalid_argument("port", f"{port} is not a usable TCP port")
-    if not _port_is_free(port):
+
+    # Bind first and report the failure, rather than probing then binding. A probe leaves
+    # a race, and worse, a caller can end up talking to somebody else's server on that
+    # port and believing it is their own log - which is exactly how a stale viewer served
+    # the wrong directory and looked like an empty feed.
+    try:
+        server = _Server(("127.0.0.1", port), _Handler)
+    except OSError as exc:
         raise PixToolError(
             code="port_in_use",
-            message=f"Port {port} on 127.0.0.1 is already in use.",
+            message=f"Cannot serve on 127.0.0.1:{port}: {exc.strerror or exc}.",
             stage="viewer",
-            suggestion="Pass a different --port, or stop whatever is listening there.",
-        )
+            suggestion=(
+                "Pass a different --port, or stop whatever is listening there. A viewer "
+                "left running from an earlier session is the usual cause."
+            ),
+            details={"port": port, "errno": exc.errno},
+        ) from exc
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     url = f"http://127.0.0.1:{port}/"
     snapshot = activity.stats()
 
@@ -267,10 +292,30 @@ def _export_standalone(args: dict[str, Any], context: ToolContext) -> ToolResult
         payloads[record_id] = envelope
         used += len(blob)
 
+    # Renders must travel with the snapshot: a file:// page cannot fetch them from the
+    # log directory, so an un-inlined capture would show as a broken image.
+    renders: dict[str, str] = {}
+    render_budget = 12 * 1024 * 1024
+    render_used = 0
+    renders_skipped = 0
+    for row in reversed(entries):
+        name = ((row.get("render") or {}).get("name")) or ""
+        if not name or name in renders:
+            continue
+        blob = activity.read_render(name)
+        if blob is None:
+            continue
+        if render_used + len(blob) > render_budget:
+            renders_skipped += 1
+            continue
+        renders[name] = base64.b64encode(blob).decode("ascii")
+        render_used += len(blob)
+
     bundle = {
         "generated_at": time.time(),
         "entries": entries,
         "payloads": payloads,
+        "renders": renders,
         "stats": activity.stats(entries),
         "standalone": True,
     }
@@ -290,16 +335,31 @@ def _export_standalone(args: dict[str, Any], context: ToolContext) -> ToolResult
         "calls_embedded": len(entries),
         "payloads_embedded": len(payloads),
         "payloads_skipped": skipped,
+        "renders_embedded": len(renders),
+        "renders_skipped": renders_skipped,
         "mode": "standalone; opens over file:// but cannot follow new calls",
     }
     result = ToolResult.success(data, output_paths=[str(target)])
-    if skipped:
+    if skipped or renders_skipped:
         result.degrade(
-            f"{skipped} payload(s) were left out to keep the file openable.",
-            reason="the embedded payload budget is 8 MB",
-            alternative="Serve the log instead of exporting, which fetches payloads on demand.",
+            f"{skipped} payload(s) and {renders_skipped} render(s) were left out to keep "
+            "the file openable.",
+            reason="the embedded budgets are 8 MB for payloads and 12 MB for renders",
+            alternative="Serve the log instead of exporting, which fetches both on demand.",
         )
     return result
+
+
+class _Server(ThreadingHTTPServer):
+    """A server that refuses to share its port.
+
+    ``HTTPServer`` sets ``allow_reuse_address``, which on Windows maps to SO_REUSEADDR and
+    lets a second process bind a port that is already listening. Both then appear to start
+    while only one receives connections - and a caller can end up reading a stale viewer's
+    log directory while believing it is their own. Refusing the bind is the honest answer.
+    """
+
+    allow_reuse_address = False
 
 
 # ======================================================================

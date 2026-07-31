@@ -148,10 +148,11 @@ def stage_server(env: dict) -> None:
     from pix_tool_set.tools import activity_tools
     from http.server import ThreadingHTTPServer
 
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), activity_tools._Handler)
+    server = activity_tools._Server(("127.0.0.1", 0), activity_tools._Handler)
+    bound = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    base = f"http://127.0.0.1:{PORT}"
+    base = f"http://127.0.0.1:{bound}"
 
     def get(path: str):
         with urllib.request.urlopen(base + path, timeout=10) as response:
@@ -219,8 +220,10 @@ def stage_export(env: dict, log_dir: Path) -> None:
 
     page = target.read_text(encoding="utf-8")
     check("bootstrap slot replaced", "/*__PIX_ACTIVITY_BOOTSTRAP__*/" not in page)
-    check("no external resources",
-          not re.findall(r'(?:src|href)\s*=\s*["\'](?!#)[^"\']+["\']', page))
+    # Renders are inlined as data URIs, so the rule is "nothing fetched over the network
+    # or off the filesystem", not "no src attributes at all".
+    remote = re.findall(r'(?:src|href)\s*=\s*["\'](https?:|file:|//|[A-Za-z]:\\)', page)
+    check("no external resources", not remote, str(remote[:4]))
 
     match = re.search(r"window\.__PIX_ACTIVITY_BOOTSTRAP__ = (\{.*?\});\n", page, re.S)
     check("bundle parseable", match is not None)
@@ -231,6 +234,15 @@ def stage_export(env: dict, log_dir: Path) -> None:
         check("every entry has an embedded payload",
               ids == set(bundle["payloads"]),
               f"{len(ids - set(bundle['payloads']))} missing")
+        # Renders must travel with the snapshot, or an offline page shows broken images.
+        wanted = {
+            (e.get("render") or {}).get("name")
+            for e in bundle["entries"] if e.get("render")
+        }
+        wanted.discard(None)
+        embedded = set(bundle.get("renders") or {})
+        check("every recorded render is inlined", wanted <= embedded,
+              f"missing {sorted(wanted - embedded)}")
     check("offline branch guarded", "if (STANDALONE) {" in page)
 
 

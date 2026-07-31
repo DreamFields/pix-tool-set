@@ -52,6 +52,10 @@ NEEDS_PRIOR_STEP = {"shader-edit-apply"}
 # Covered end-to-end by tests/verify_activity.py instead.
 SERVES_FOREVER = {"activity-viewer"}
 
+# Builds and runs the exported project, which takes minutes and needs a GPU. Covered by
+# tests/verify_replay_render.py and the README recipe instead.
+BUILDS_AND_RUNS = {"replay-render"}
+
 
 def build_args(name: str, capture) -> dict:
     """Reasonable arguments for each tool so the call is meaningful."""
@@ -247,6 +251,9 @@ def main() -> int:
             continue
         if name in SERVES_FOREVER:
             rows.append((name, "skipped", 0.0, "see tests/verify_activity.py"))
+            continue
+        if name in BUILDS_AND_RUNS:
+            rows.append((name, "skipped", 0.0, "see tests/verify_replay_render.py"))
             continue
 
         args = build_args(name, capture)
