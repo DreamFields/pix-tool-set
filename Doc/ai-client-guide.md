@@ -42,6 +42,11 @@
 | `tool_not_found` | 工具名错误 | `error.details.closest` 给出近似名 |
 | `*_not_found`（`texture_not_found` 等） | 对象 id 不存在 | 先调对应的 `list-*` 工具取有效 id |
 | `disassembly_unavailable` | dxcompiler.dll 不可用 | 告知用户此类字段本机不可得 |
+| `compiler_unavailable` | 没有可用的 HLSL 编译器 | 提示安装 PIX（含 dxcompiler.dll）或 Windows SDK（含 dxc.exe） |
+| `shader_compile_failed` | 编辑后的 HLSL 编译不通过 | `error.details.compiler_output` 是 DXC 原文，含行列号，据此改源码 |
+| `compile_args_missing` | PDB 未记录编译参数 | 用 `--args` 显式传入，否则无法复现截帧内的构建 |
+| `source_unavailable` | 无法从 PDB 恢复 HLSL | 先用 `pass-shader-source` 确认该 PDB 是否可读 |
+| `already_patched` | 该 PSO 的这个 stage 已打过补丁 | 从导出目录的 `.orig` 备份恢复后再应用 |
 | `save_resource_failed` | PIX 无法保存该资源 | 换 `--global-id` 或改用 `--depth` / 其他 `--rtv` |
 | `pixtool_timeout` | 导出超时 | 提高 `--timeout`，或先单独 `session-open` |
 
@@ -100,6 +105,18 @@ diagnose-mobile-risks → diagnose-precision → diagnose-negative-values
 → diagnose-reflection-mismatch
 ```
 
+**「改一下这个 shader 看效果」**
+```
+session-set-pdb-dirs --pdb-dirs <Project>\Saved\ShaderSymbols\PCD3D_SM6
+→ shader-edit-begin --queue-id <id> --output <dir>     取出真实 HLSL + 编译参数
+→ （编辑那个 .hlsl）
+→ shader-edit-apply --queue-id <id> --source <file>    先只编译校验
+→ shader-edit-apply ... --patch                        确认无误再打补丁
+```
+`apply` 不带 `--patch` 时只编译并校验绑定签名，不改动任何文件，适合先试错。
+返回 `partial` 且 `binding_check.identical=false` 表示替换不是 slot 兼容的，
+已被拒绝打补丁，需要先恢复原有资源声明。
+
 **「两次 draw 为什么表现不同」**
 ```
 diff-draw-calls --left-draw <a> --right-draw <b>
@@ -114,6 +131,8 @@ diff-draw-calls --left-draw <a> --right-draw <b>
   由 `has_embedded_source` 判定，不要含糊表述。
 - `pixel-history` 给的是**静态覆盖候选集**（视口/裁剪覆盖该像素且绑定了该目标的 draw），
   不是逐片元替换历史。
+- `shader-edit-apply --patch` 改的是**导出的 C++ 回放工程**，不是 `.wpix`。
+  向用户汇报时不要说成「修改了截帧」；要看到效果需重建并运行那个工程。
 - 凡 `status=partial`，都应把 `diagnostics` 中的原因转达用户，
   不要静默当作完整结果。
 

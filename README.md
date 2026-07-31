@@ -62,7 +62,7 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（66 个）
+## 五、工具总览（68 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
@@ -76,9 +76,16 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 **纹理分析（8）** `list-textures` `texture-stats` `texture-info` `export-texture`
 `export-draw-textures` `read-texture-pixels` `texture-pixel-stats` `pick-pixel`
 
-**Shader 分析（9）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
+**Shader 分析（12）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
 `shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
-`pass-shader-source` `session-set-pdb-dirs` `pass-values` `read-resource-texture` `read-replay-target` `find-depth-content` `export-uav-slice`
+`pass-shader-source` `pass-values` `shader-edit-begin` `shader-edit-apply`
+
+**Shader 源码与编辑（3）** `session-set-pdb-dirs` `shader-edit-begin` `shader-edit-apply`
+—— 从引擎 shader PDB 恢复真实 HLSL，改完重编译并校验绑定签名后打补丁到导出工程，
+是 PIX Debug 面板 Apply 按钮的可脚本化等价物。
+
+**纹理数值读取（4）** `read-resource-texture` `read-replay-target` `find-depth-content`
+`export-uav-slice`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -673,7 +680,88 @@ PNG 直接可见：左上直角是场景边界裁切，右下圆弧是球面，�
 `resources.bin` 只存上传和 CPU 写入，GPU 在 dispatch 中写入的值不在其中。这份数据与
 dispatch 输出高度一致，但**无法仅凭截帧证明二者相等**。
 
-## 十四、`partial` 的含义（重要）
+## 十四、改 shader 源码并应用（PIX Debug 面板 Apply 的等价物）
+
+PIX GUI 的 Debug 面板可以直接改 shader 源码再点 Apply。这是 GUI 独有能力：
+`pixtool` 的完整命令列表里**没有任何 shader 替换命令**。等价能力由两步拼出：
+
+```powershell
+# 1. 取出可编辑的真实 HLSL，连同 PDB 里记录的原始编译参数
+pix-tool-set shader-edit-begin --queue-id 18461 --output G:\edit `
+  --pdb-dirs "F:\JL_TMR\UnrealEngine\Games\JyGame\Saved\ShaderSymbols\PCD3D_SM6"
+
+# 2. 编辑 G:\edit\q18461_CS_RayTracingBuildLightGridCS.hlsl 之后
+pix-tool-set shader-edit-apply --queue-id 18461 `
+  --source G:\edit\q18461_CS_RayTracingBuildLightGridCS.hlsl --patch
+```
+
+`begin` 会写出三个文件：可编辑源码、一份 pristine 副本（用于回退对比）、
+以及 `.args.txt`。`apply` 默认自动读取那个 sidecar，所以第二步不必重复参数。
+
+### 为什么这条路走得通
+
+PDB 同时提供了重编译所需的两半，缺一不可：
+
+| 需要什么 | 从哪来 |
+|---|---|
+| 自包含的预处理 HLSL（无需 include 路径） | PDB 的 `SRCI`，UE 写的是单个编译单元 |
+| 精确编译参数 | PDB 记录 `-HV 2021 -Zpr -O1 -WX -auto-binding-space 0 -Zsb -Zi -Qstrip_debug -E <entry> -T cs_6_6` |
+
+编译走 `IDxcCompiler3`（ctypes 裸 COM，零第三方依赖），`dxc.exe` 作为回退。
+`dxil.dll` 会先加载，因此产物容器**已签名** —— 未签名的容器 D3D12 会直接拒绝。
+
+### 核心安全检查：绑定签名
+
+录制的命令列表**按 slot 绑定资源**，所以只有"资源、register、入口点、线程组尺寸
+全部不变"的替换才是安全的。不满足就拒绝打补丁，而不是放行：
+
+```
+status: partial
+binding_check.identical: false
+warning: Compiled successfully but the replacement is not slot-compatible,
+         so it was not patched in.  reason: bindings differ
+```
+
+实测：原样重编译时 5 个绑定（`cb0` / `t0` / `t1` / `u0` / `u1`）逐项一致；
+一旦多声明一个 UAV 把 `RWLightGrid` 从 `u0` 挤到 `u1`，就会被上面这条拦住。
+确实想改绑定时用 `--allow-binding-change` 显式放行。
+
+编译失败则原样透出 DXC 自己的诊断，带行列号：
+
+```
+__UE_FILENAME_SENTINEL:259:32: error: expected expression
+        uint3 VoxelId = 0, VoxelRes = ;
+                                      ^
+```
+
+### 补丁做了什么，边界在哪
+
+`--patch` 修改的是**导出的 C++ 回放工程**，不是 `.wpix`。截帧记录的是 API 调用序列，
+本工具不会改写它。补丁采用"保留原赋值 + 下一行覆盖"而非整行替换：
+
+```cpp
+    g_resourceReader->Read(data, 12491);
+    pssDesc.CS = { reinterpret_cast<BYTE*>(&data[offset]), 16436 };
+    // pix-tool-set: CS replaced by shader-edit-apply
+    static std::vector<BYTE> editedBytes_CS = Helpers::ReadFileBytes(LR"(edited_CreatePipelineState_3241_CS.dxil)");
+    if (!editedBytes_CS.empty())
+        pssDesc.CS = { editedBytes_CS.data(), editedBytes_CS.size() };
+```
+
+两个原因必须这样做：本工具集自身要解析 `CreatePSOs.cpp` 得到各 stage 字节码尺寸，
+整行替换会让它再也找不到该 shader；而 `resources.bin` 是**无索引的顺序流**，
+跳过一次 `Read` 会让后面所有 blob 错位。
+
+补丁前自动留 `.orig` 备份，重复应用会被 `already_patched` 拦住。改完重建即可运行：
+
+```powershell
+cmake -S <export> -B <export>\build && cmake --build <export>\build --config Release
+```
+
+回归覆盖见 [tests/verify_shader_edit.py](tests/verify_shader_edit.py)（41 项），
+包含语法错误诊断、绑定拒绝、重复补丁检测与自动还原。
+
+## 十五、`partial` 的含义（重要）
 
 `partial` 表示**答案可用，但某处被降级**，原因一定写在 `diagnostics` 里。
 这比假装成功或直接报错更有用，因为它区分了「工具坏了」和「数据本就不存在」。
@@ -691,7 +779,7 @@ dispatch 输出高度一致，但**无法仅凭截帧证明二者相等**。
 资源绑定表、入口函数名、numthreads 与全部 IR）。`has_embedded_source` 字段明确
 告知属于哪种情况。
 
-## 十五、Python API
+## 十六、Python API
 
 ```python
 from pix_tool_set import call_tool, list_tools, open_capture
@@ -716,7 +804,7 @@ draw.render_targets, draw.srvs, draw.uavs
 draw.shader("PS").disassembly
 ```
 
-## 十六、架构
+## 十七、架构
 
 ```
 src/pix_tool_set/
@@ -750,27 +838,28 @@ draw/dispatch 处快照——这份快照正是 PIX 选中某次 draw 时展示�
 `dxcompiler.dll`（裸 COM vtable），因此零第三方依赖。
 纹理像素读取内置纯 stdlib 的 PNG 解码器。
 
-## 十七、验证
+## 十八、验证
 
 ```powershell
 python tests\verify_live.py                 # 静态分析类工具
 python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类工具
+python tests\verify_shader_edit.py           # shader 改源码并应用的全链路（41 项）
 ```
 
 在 `NoTiled.wpix`（2.33 GB，UE5 ManyLights 场景）上的实测结果：
 
 | 项 | 结果 |
 |---|---|
-| 工具总数 | 55 |
-| 成功 | 49 |
-| partial | 4（均为已声明的数据边界）|
+| 工具总数 | 68 |
+| 成功 | 50 |
+| partial | 6（均为已声明的数据边界）|
 | 异常 | **0** |
-| 跳过 | 2（`session-open` / `session-close`，会改动会话状态）|
+| 跳过 | 12（GPU 回放类需 `--with-replay`；`session-open`/`session-close` 会改动会话状态；`shader-edit-apply` 依赖前置产物，由 `tests/verify_shader_edit.py` 端到端覆盖）|
 
 解析规模：22,118 events、2,784 draw/dispatch、416 passes、3,293 resources、
 480,958 descriptors、359 shaders、56 root signatures。
 
-## 十八、已知边界
+## 十九、已知边界
 
 - 依赖本机 PIX 安装；纹理与像素类工具需要该截帧能在本机 GPU 上回放。
 - 首次 `session-open` 对 2.3 GB 截帧约需 30–60 秒，缓存约 2.5 GB。
@@ -778,5 +867,7 @@ python tests\verify_live.py --with-replay    # 含 GPU 回放的纹理/像素类
   一次导出多张，再本地读取。
 - 逐像素替换历史、实时寄存器级 shader 调试需要 PIX 实时回放会话，
   本工具提供静态等价物（覆盖分析 + 完整 shader 代码与输入）并明确标注。
+- 改 shader 源码后的替换（`shader-edit-apply`）生效范围是**导出的 C++ 回放工程**，
+  不改写 `.wpix`；且需要引擎的 shader PDB 才能取到真实 HLSL 与原始编译参数。
 - 部分资源在特定事件不是可保存的 RTV/DSV，PIX 会返回 `0x80070032`；
   错误信封会原样透传 PIX 的诊断文本。
