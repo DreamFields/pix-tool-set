@@ -44,6 +44,10 @@ REPLAY_TOOLS = {
 
 SKIP = {"session-open", "session-close"}
 
+# Needs an artifact that another tool produces first, so a flat smoke pass cannot
+# supply it. Covered end-to-end by tests/verify_shader_edit.py instead.
+NEEDS_PRIOR_STEP = {"shader-edit-apply"}
+
 
 def build_args(name: str, capture) -> dict:
     """Reasonable arguments for each tool so the call is meaningful."""
@@ -85,6 +89,18 @@ def build_args(name: str, capture) -> dict:
         "find-pass": {"name": chosen_pass_name or "Pass"},
         "pass-bindings": {"pass_index": 0, "max_draws": 2},
         "pass-shader-source": {"pass_index": 0, "max_lines": 20},
+        "shader-edit-begin": (
+            {
+                "global_id": dispatch.global_id,
+                "stage": "CS",
+                "output": "verify-out/shader-edit",
+                "pdb_dirs": [
+                    r"F:\JL_TMR\UnrealEngine\Games\JyGame\Saved\ShaderSymbols\PCD3D_SM6"
+                ],
+            }
+            if dispatch and dispatch.global_id
+            else {}
+        ),
         "session-set-pdb-dirs": {"clear": True},
         "pass-values": {"pass_index": 0, "max_bytes": 64, "max_views": 4},
         "read-resource-texture": {"resource_id": 1985, "pixels": 4},
@@ -220,6 +236,9 @@ def main() -> int:
             continue
         if name in REPLAY_TOOLS and not include_replay:
             rows.append((name, "skipped", 0.0, "needs GPU replay (--with-replay)"))
+            continue
+        if name in NEEDS_PRIOR_STEP:
+            rows.append((name, "skipped", 0.0, "see tests/verify_shader_edit.py"))
             continue
 
         args = build_args(name, capture)
