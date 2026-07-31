@@ -117,6 +117,16 @@ session-set-pdb-dirs --pdb-dirs <Project>\Saved\ShaderSymbols\PCD3D_SM6
 返回 `partial` 且 `binding_check.identical=false` 表示替换不是 slot 兼容的，
 已被拒绝打补丁，需要先恢复原有资源声明。
 
+**「我刚才都做了什么」**
+```
+activity-log --limit 20            最近的调用、状态与耗时
+activity-log --status error        只看失败的
+activity-log --record-id <id>      取回某次调用的完整信封
+activity-viewer                    本地网页实时跟随 + 历史逐步回放
+```
+每次 CLI 调用与 `call_tool()` 都会自动记录，无需客户端自行埋点。
+设 `PIX_TOOL_SET_NO_LOG=1` 可关闭；记录失败不会影响调用本身。
+
 **「两次 draw 为什么表现不同」**
 ```
 diff-draw-calls --left-draw <a> --right-draw <b>
@@ -133,6 +143,9 @@ diff-draw-calls --left-draw <a> --right-draw <b>
   不是逐片元替换历史。
 - `shader-edit-apply --patch` 改的是**导出的 C++ 回放工程**，不是 `.wpix`。
   向用户汇报时不要说成「修改了截帧」；要看到效果需重建并运行那个工程。
+- `activity-log` 列表里的 `summary` / `args` 是**折叠后的摘要**，
+  `<list: n>` 与 `<dict: n keys>` 是占位标记而非真实值；
+  需要真实数据时用 `--record-id` 取完整信封。
 - 凡 `status=partial`，都应把 `diagnostics` 中的原因转达用户，
   不要静默当作完整结果。
 

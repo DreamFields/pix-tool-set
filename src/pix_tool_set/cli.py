@@ -20,6 +20,7 @@ import sys
 from typing import Any
 
 from .context import ToolContext
+from .engine import activity
 from .errors import PixToolError
 from .registry import CATEGORY_TITLES, ToolDefinition, get_registry
 from .results import ToolResult
@@ -216,6 +217,13 @@ def _execute(tool_name: str, tool_args: dict[str, Any], namespace: argparse.Name
 def _cmd_run(args: argparse.Namespace) -> int:
     try:
         payload = json.loads(args.json_args)
+    except Exception as exc:  # noqa: BLE001
+        result = _failure(exc, args.tool_name)
+        _emit(result.to_dict(), args.compact)
+        return 1
+
+    timer = activity.Timer(args.tool_name, payload if isinstance(payload, dict) else {}, "cli:run")
+    try:
         if not isinstance(payload, dict):
             raise ValueError("--json-args must decode to a JSON object")
         result = _execute(args.tool_name, payload, args)
@@ -225,23 +233,37 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
             traceback.print_exc()
         result = _failure(exc, args.tool_name)
-    _emit(result.to_dict(), args.compact)
+    envelope = result.to_dict()
+    timer.finish(envelope, session=_session_hint(payload if isinstance(payload, dict) else {}))
+    _emit(envelope, args.compact)
     return 0 if result.status != "error" else 1
+
+
+def _session_hint(tool_args: dict[str, Any]) -> str | None:
+    """The session a call targeted, when it named one explicitly."""
+    value = tool_args.get("session")
+    return str(value) if value else None
 
 
 def _cmd_direct(args: argparse.Namespace) -> int:
     registry = get_registry()
     tool_name = getattr(args, "_tool")
+    tool_args: dict[str, Any] = {}
+    timer = activity.Timer(tool_name, tool_args, "cli:direct")
     try:
         definition = registry.get(tool_name)
-        result = _execute(definition.name, _namespace_to_args(definition, args), args)
+        tool_args = _namespace_to_args(definition, args)
+        timer.args = tool_args
+        result = _execute(definition.name, tool_args, args)
     except Exception as exc:  # noqa: BLE001
         if getattr(args, "traceback", False):
             import traceback
 
             traceback.print_exc()
         result = _failure(exc, tool_name)
-    _emit(result.to_dict(), args.compact)
+    envelope = result.to_dict()
+    timer.finish(envelope, session=_session_hint(tool_args))
+    _emit(envelope, args.compact)
     return 0 if result.status != "error" else 1
 
 

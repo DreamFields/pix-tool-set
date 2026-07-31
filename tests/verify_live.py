@@ -48,6 +48,10 @@ SKIP = {"session-open", "session-close"}
 # supply it. Covered end-to-end by tests/verify_shader_edit.py instead.
 NEEDS_PRIOR_STEP = {"shader-edit-apply"}
 
+# Binds a socket and serves until interrupted, so it cannot run inside a smoke loop.
+# Covered end-to-end by tests/verify_activity.py instead.
+SERVES_FOREVER = {"activity-viewer"}
+
 
 def build_args(name: str, capture) -> dict:
     """Reasonable arguments for each tool so the call is meaningful."""
@@ -102,6 +106,7 @@ def build_args(name: str, capture) -> dict:
             else {}
         ),
         "session-set-pdb-dirs": {"clear": True},
+        "activity-log": {"stats_only": True},
         "pass-values": {"pass_index": 0, "max_bytes": 64, "max_views": 4},
         "read-resource-texture": {"resource_id": 1985, "pixels": 4},
         "export-uav-slice": {"resource_id": 824, "slice": 0, "pixels": 4},
@@ -239,6 +244,9 @@ def main() -> int:
             continue
         if name in NEEDS_PRIOR_STEP:
             rows.append((name, "skipped", 0.0, "see tests/verify_shader_edit.py"))
+            continue
+        if name in SERVES_FOREVER:
+            rows.append((name, "skipped", 0.0, "see tests/verify_activity.py"))
             continue
 
         args = build_args(name, capture)

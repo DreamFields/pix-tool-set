@@ -49,7 +49,15 @@ def call_tool(name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
     """Invoke a registered tool and return its result envelope as a dict."""
     load_builtin_tools()
     registry = get_registry()
-    definition = registry.get(name)
+    from .engine import activity
+
+    timer = activity.Timer(name, args or {}, "python:call_tool", argv=[])
+    try:
+        definition = registry.get(name)
+    except PixToolError as exc:
+        envelope = ToolResult.failure(exc).to_dict()
+        timer.finish(envelope)
+        return envelope
     context = ToolContext.from_cwd()
     try:
         cleaned = definition.validate_args(args or {})
@@ -57,7 +65,9 @@ def call_tool(name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
     except PixToolError as exc:
         result = ToolResult.failure(exc)
     result.tool = definition.name
-    return result.to_dict()
+    envelope = result.to_dict()
+    timer.finish(envelope, session=str((args or {}).get("session") or "") or None)
+    return envelope
 
 
 def list_tools(category: str | None = None, *, verbose: bool = False) -> list[dict[str, Any]]:

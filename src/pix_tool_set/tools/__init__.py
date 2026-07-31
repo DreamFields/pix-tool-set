@@ -31,5 +31,6 @@ def load_builtin_tools() -> None:
     from . import advanced_tools  # noqa: F401
     from . import performance_tools  # noqa: F401
     from . import diagnostic_tools  # noqa: F401
+    from . import activity_tools  # noqa: F401
 
     _LOADED = True
