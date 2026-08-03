@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from ..context import ToolContext
-from ..engine import activity, screencap
+from ..engine import activity, screencap, winpixruntime
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
 from ._common import tool, with_session
@@ -36,7 +36,10 @@ _NOTE = (
     "Builds the exported C++ replay project with CMake, runs it, and captures the window "
     "it presents to. This is how an edited shader's effect becomes visible: patch with "
     "shader-edit-apply, then run this. The capture is stored with the activity log so "
-    "activity-viewer can show it. Requires CMake and a Visual Studio toolchain. Note that "
+    "activity-viewer can show it. Requires CMake and a Visual Studio toolchain. "
+    "WinPixEventRuntime ships vendored in pix-tool-set, so the build needs no network "
+    "for it; pass --no-vendored-winpixruntime to download it from nuget instead. "
+    "Note that "
     "a patched pass only changes the picture if its output actually reaches the "
     "backbuffer - see the README section on the present path."
 )
@@ -45,6 +48,11 @@ _NUPKGS = {
     "D3D12AgilitySdk.nupkg": "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12",
     "WinPixEventRuntime.nupkg": "https://www.nuget.org/api/v2/package/WinPixEventRuntime",
 }
+
+# WinPixEventRuntime ships vendored in this repository, so this entry is only
+# reached as a fallback. See engine/winpixruntime.py for why the download is
+# worth avoiding.
+_LOCALLY_SUPPLIED = "WinPixEventRuntime.nupkg"
 
 
 def _export_root(context: ToolContext, args: dict[str, Any]) -> Path:
@@ -59,15 +67,40 @@ def _export_root(context: ToolContext, args: dict[str, Any]) -> Path:
     return root
 
 
-def _repair_nupkgs(root: Path) -> list[dict[str, Any]]:
+def _supply_winpixruntime(root: Path, args: dict[str, Any]) -> dict[str, Any] | None:
+    """Install WinPixEventRuntime from the files vendored in this repository.
+
+    Returns None when the caller opted out, which leaves the nuget path in
+    `_repair_nupkgs` to handle it exactly as before.
+    """
+    if args.get("no_vendored_winpixruntime"):
+        return None
+
+    report = winpixruntime.install_into_export(
+        root, force=bool(args.get("force_reconfigure"))
+    )
+    report["action"] = (
+        "reused what is already in the export"
+        if report.get("reused_existing")
+        else "copied from the runtime vendored in pix-tool-set"
+    )
+    return report
+
+
+def _repair_nupkgs(root: Path, *, skip: set[str] | None = None) -> list[dict[str, Any]]:
     """Replace the 0-byte packages CMake leaves behind when its download fails.
 
     CMake treats "file exists" as success, so an SSL failure during configure is only
     discovered much later as a missing d3d12.h. Fixing it here turns a confusing compile
     error into a handled step.
+
+    ``skip`` names packages already supplied from the vendored copies, so we neither
+    re-download them nor mistake a deliberate stamp file for a truncated transfer.
     """
     repaired: list[dict[str, Any]] = []
     for name, url in _NUPKGS.items():
+        if skip and name in skip:
+            continue
         target = root / name
         if target.exists() and target.stat().st_size > 1024:
             continue
@@ -101,16 +134,35 @@ def _run(command: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
 
 
 def _configure_and_build(
-    root: Path, generator: str, timeout: int, force: bool
+    root: Path,
+    generator: str,
+    timeout: int,
+    force: bool,
+    args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     build_dir = root / "build"
     steps: dict[str, Any] = {"build_dir": str(build_dir)}
+    args = args or {}
 
-    repaired = _repair_nupkgs(root)
+    # Vendored files first: this is the step that used to depend on nuget being
+    # reachable, and it is the one that failed most confusingly when it was not.
+    supplied = _supply_winpixruntime(root, args)
+    locally_supplied: set[str] = set()
+    if supplied is not None:
+        steps["winpixeventruntime"] = supplied
+        if supplied.get("ok"):
+            locally_supplied.add(_LOCALLY_SUPPLIED)
+
+    repaired = _repair_nupkgs(root, skip=locally_supplied)
     if repaired:
         steps["dependencies_repaired"] = repaired
         # The extracted SDK is derived from the package, so it must be redone.
-        for folder in ("AgilitySDK", "WinPixEventRuntime"):
+        # A vendored runtime is not derived from any package, so wiping it would
+        # throw away the work just done above.
+        stale_dirs = ["AgilitySDK"]
+        if _LOCALLY_SUPPLIED not in locally_supplied:
+            stale_dirs.append("WinPixEventRuntime")
+        for folder in stale_dirs:
             shutil.rmtree(root / folder, ignore_errors=True)
         force = True
 
@@ -283,6 +335,13 @@ def _await_content(
             "type": "boolean",
             "description": "Run the existing executable without rebuilding.",
         },
+        no_vendored_winpixruntime={
+            "type": "boolean",
+            "description": (
+                "Ignore the WinPixEventRuntime vendored in pix-tool-set and download "
+                "it from nuget instead."
+            ),
+        },
         keep_running={
             "type": "boolean",
             "description": "Leave the replayer running after the capture.",
@@ -330,7 +389,7 @@ def replay_render(args: dict[str, Any], context: ToolContext) -> ToolResult:
         exe = executables[0]
     else:
         steps = _configure_and_build(
-            root, generator, timeout, bool(args.get("force_reconfigure"))
+            root, generator, timeout, bool(args.get("force_reconfigure")), args
         )
         data["build"] = steps
         exe = Path(steps["executable"])

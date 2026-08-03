@@ -22,4 +22,11 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-pix_tool_set = ["py.typed", "viewer/*.html"]
+pix_tool_set = [
+    "py.typed",
+    "viewer/*.html",
+    "vendor/winpixeventruntime/LICENSE.txt",
+    "vendor/winpixeventruntime/include/*.h",
+    "vendor/winpixeventruntime/bin/*/*.dll",
+    "vendor/winpixeventruntime/bin/*/*.lib",
+]
