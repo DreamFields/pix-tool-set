@@ -46,23 +46,21 @@ def _resolve_resource(capture, args: dict[str, Any]):
     # Locate the depth or a render target of a pass instead.
     selector = {
         key: args.get(key)
-        for key in ("draw_index", "global_id", "queue_id", "pass_index", "pass_name")
+        for key in ("draw_index", "queue_id", "pass_index", "pass_name")
         if args.get(key) is not None
     }
     if not selector:
         raise invalid_argument(
             "resource_id",
-            "Pass --resource-id, or identify a pass with --queue-id/--global-id/"
+            "Pass --resource-id, or identify a pass with --queue-id/"
             "--pass-name/--draw-index plus --target depth|rt0|rt1...",
         )
     if args.get("draw_index") is not None:
         draw = capture.draw_call(int(args["draw_index"]))
     else:
         entry = None
-        if args.get("queue_id") is not None or args.get("global_id") is not None:
-            entry = capture.find_pass_by_event(
-                global_id=args.get("global_id"), queue_id=args.get("queue_id")
-            )
+        if args.get("queue_id") is not None:
+            entry = capture.find_pass_by_event(queue_id=args.get("queue_id"))
         elif args.get("pass_index") is not None:
             entry = capture.find_pass(int(args["pass_index"]))
         elif args.get("pass_name"):
@@ -281,8 +279,14 @@ def _encode_png(pixels: bytearray, width: int, height: int) -> bytes:
     category="textures",
     parameters=with_session(
         resource_id={"type": "integer", "description": "Texture resource id."},
-        queue_id={"type": "integer", "description": "PIX GUI Queue ID to take the target from."},
-        global_id={"type": "integer", "description": "PIX GUI Global ID to take the target from."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' to take the target from. Present on every row of the "
+                "PIX event list, and the only event id accepted as input; Global ID is "
+                "reported in the results only."
+            ),
+        },
         pass_name={"type": "string", "description": "Pass name to take the target from."},
         pass_index={"type": "integer", "description": "Pass index to take the target from."},
         draw_index={"type": "integer", "description": "Draw index to take the target from."},

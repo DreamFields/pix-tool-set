@@ -11,7 +11,7 @@ from ..context import ToolContext
 from ..engine.model import ShaderStage
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
-from ._common import DRAW_SELECTOR, tool, with_session
+from ._common import DRAW_SELECTOR, resolve_draw, tool, with_session
 
 _FORMAT_DECODERS: dict[str, tuple[str, int, int]] = {
     # name -> (struct code per component, component count, bytes)
@@ -181,13 +181,7 @@ def read_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def export_mesh(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
-        queue_id=args.get("queue_id"),
-    )
-    if draw is None:
-        raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
+    draw = resolve_draw(capture, args)
 
     pso = draw.pipeline_state
     layout = pso.input_layout if pso else []
@@ -278,7 +272,7 @@ def export_mesh(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Written file path and which resource it corresponds to.",
     examples=[
         "pix-tool-set save-render-target --draw-index 2461 -o rt0.png",
-        "pix-tool-set save-render-target --global-id 3644 --depth -o depth.png",
+        "pix-tool-set save-render-target --queue-id 18704 --depth -o depth.png",
     ],
 )
 def save_render_target(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -295,12 +289,11 @@ def save_render_target(args: dict[str, Any], context: ToolContext) -> ToolResult
     marker = args.get("marker")
     draw = capture.resolve_draw(
         draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
         queue_id=args.get("queue_id"),
     )
     if draw is None and marker is None:
         raise invalid_argument(
-            "draw_index/global_id/marker", "provide one way to select the event"
+            "draw_index/queue_id/marker", "provide one way to select the event"
         )
 
     rtv = int(args.get("rtv") or 0)

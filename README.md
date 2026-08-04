@@ -178,13 +178,13 @@ PIX GUI 事件列表里每行有两个 id，本工具集都能直接接受，不
 | `Global ID` | 仅 action（draw/dispatch/copy 等），本截帧 5,334 / 22,155 行 | 在 GUI 里选中一次 draw 就能看到 |
 | `Queue ID` | **每一行都有**，22,155 / 22,155 | 唯一全量主键，marker（pass 行）只有这个 |
 
-所以查 pass 时优先用 `Queue ID`：pass 的标记行本身没有 Global ID。
+所以查 pass 时只能用 `Queue ID`：pass 的标记行本身没有 Global ID。工具**只接受
+`--queue-id` 作为事件选择器**，`global_id` 仅在返回数据中报告，供与 GUI 交叉核对。
 
 ```powershell
-pix-tool-set find-pass --global-id 3893        # -> pass TileClassificationMark
-pix-tool-set find-pass --queue-id 18704        # 同一个 pass
-pix-tool-set pass-bindings --global-id 3893    # 直接出 shader 绑定
-pix-tool-set event-timing --global-id 3893     # 直接出实测耗时
+pix-tool-set find-pass --queue-id 18704        # -> pass TileClassificationMark
+pix-tool-set pass-bindings --queue-id 18704    # 直接出 shader 绑定
+pix-tool-set event-timing --queue-id 18704     # 直接出实测耗时
 ```
 
 `find-pass` 返回里同时给出 `global_id`、`queue_id`、`marker_queue_id`（pass 标记自身的

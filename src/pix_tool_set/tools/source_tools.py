@@ -20,7 +20,7 @@ from ..engine import shaderpdb
 from ..engine.model import ShaderStage
 from ..errors import not_found
 from ..results import ToolResult
-from ._common import tool, with_session
+from ._common import PASS_SELECTOR, resolve_pass, tool, with_session
 
 _STAGES = [stage.value for stage in ShaderStage]
 
@@ -95,10 +95,7 @@ def _resolve_source(shader, search_dirs: list[Path]) -> dict[str, Any]:
     ),
     category="shaders",
     parameters=with_session(
-        pass_name={"type": "string", "description": "Pass name (substring match)."},
-        pass_index={"type": "integer", "description": "Pass index from list-passes."},
-        global_id={"type": "integer", "description": "PIX GUI 'Global ID' inside the pass."},
-        queue_id={"type": "integer", "description": "PIX GUI 'Queue ID' inside the pass."},
+        PASS_SELECTOR,
         stage={"type": "string", "enum": _STAGES, "description": "Restrict to one stage."},
         max_lines={
             "type": "integer",
@@ -142,22 +139,7 @@ def _resolve_source(shader, search_dirs: list[Path]) -> dict[str, Any]:
 def pass_shader_source(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
 
-    global_id = args.get("global_id")
-    queue_id = args.get("queue_id")
-    if global_id is not None or queue_id is not None:
-        entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
-        label = f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
-    elif args.get("pass_index") is not None:
-        entry = capture.find_pass(int(args["pass_index"]))
-        label = f"pass_index={args['pass_index']}"
-    elif args.get("pass_name"):
-        entry = capture.find_pass(str(args["pass_name"]))
-        label = f"pass_name={args['pass_name']!r}"
-    else:
-        raise not_found("pass", "<no selector>", "Pass --pass-name/--pass-index/--queue-id.")
-
-    if entry is None:
-        raise not_found("pass", label, "Run list-passes or find-pass to get a valid id.")
+    entry = resolve_pass(capture, args)
 
     draw = capture.draw_call(entry["first_draw_index"])
     if draw is None:

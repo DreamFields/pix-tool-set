@@ -147,8 +147,14 @@ def _read_depth_levels(
     category="textures",
     parameters=with_session(
         draw_index={"type": "integer", "description": "Draw index to replay."},
-        global_id={"type": "integer", "description": "PIX GUI Global ID."},
-        queue_id={"type": "integer", "description": "PIX GUI Queue ID."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of the event. Present on every row of the PIX event "
+                "list, and the only event id accepted as input; Global ID is reported in "
+                "the results only."
+            ),
+        },
         pass_name={"type": "string", "description": "Pass name (substring match)."},
         rtv={"type": "integer", "description": "Render target slot. Default 0."},
         depth={
@@ -190,7 +196,6 @@ def read_replay_target(args: dict[str, Any], context: ToolContext) -> ToolResult
 
     draw = capture.resolve_draw(
         draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
         queue_id=args.get("queue_id"),
     )
     if draw is None and args.get("pass_name"):
@@ -199,7 +204,7 @@ def read_replay_target(args: dict[str, Any], context: ToolContext) -> ToolResult
             draw = capture.draw_call(entry["first_draw_index"])
     if draw is None:
         raise invalid_argument(
-            "draw_index/global_id/queue_id/pass_name", "provide one way to select the event"
+            "draw_index/queue_id/pass_name", "provide one way to select the event"
         )
 
     slot = int(args.get("rtv") or 0)

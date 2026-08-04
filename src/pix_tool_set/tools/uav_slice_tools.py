@@ -164,8 +164,14 @@ def _read_uint_field(capture, draw, cbuffer: dict, field: dict) -> int | None:
                 "selector so the shader's declaration can be read."
             ),
         },
-        queue_id={"type": "integer", "description": "PIX GUI Queue ID of the pass."},
-        global_id={"type": "integer", "description": "PIX GUI Global ID of the pass."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of the pass. Present on every row of the PIX event "
+                "list, and the only event id accepted as input; Global ID is reported in "
+                "the results only."
+            ),
+        },
         draw_index={"type": "integer", "description": "Draw index of the pass."},
         slice={
             "type": "integer",
@@ -198,12 +204,11 @@ def export_uav_slice(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if resource_id is None and args.get("name"):
         draw = capture.resolve_draw(
             draw_index=args.get("draw_index"),
-            global_id=args.get("global_id"),
             queue_id=args.get("queue_id"),
         )
         if draw is None:
             raise invalid_argument(
-                "queue_id/global_id/draw_index",
+                "queue_id/draw_index",
                 "resolving a UAV by name needs a pass selector too",
             )
         found, detail = _find_by_name(capture, draw, str(args["name"]))

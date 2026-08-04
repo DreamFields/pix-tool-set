@@ -196,10 +196,6 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "PIX GUI 'Queue ID' of any row inside a pass. Reports just that pass."
             ),
         },
-        global_id={
-            "type": "integer",
-            "description": "PIX GUI 'Global ID' of an action inside a pass.",
-        },
         sort_by={
             "type": "string",
             "enum": ["measured", "cost", "triangles", "threads", "pixels", "order"],
@@ -294,7 +290,7 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     # An id names exactly one pass, so it selects rather than filters. Names are a
     # substring match and can legitimately hit several passes with the same label.
-    if args.get("queue_id") is not None or args.get("global_id") is not None:
+    if args.get("queue_id") is not None:
         wanted = resolve_pass(capture, args)
         rows = [row for row in rows if row["pass_index"] == wanted["pass_index"]]
 

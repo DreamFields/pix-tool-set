@@ -36,9 +36,9 @@ def main() -> int:
     print(f"  counter_columns={len(timing.get('counter_columns') or [])}")
 
     print("\n" + "=" * 78)
-    print(f"event-timing --global-id {GLOBAL_ID}  (the GUI id under test)")
+    print(f"event-timing --queue-id {QUEUE_ID}  (the GUI id under test)")
     print("=" * 78)
-    payload = run("event-timing", global_id=GLOBAL_ID)
+    payload = run("event-timing", queue_id=QUEUE_ID)
     if payload["status"] == "error":
         print(f"  ERROR {payload['error']['message']}")
     else:

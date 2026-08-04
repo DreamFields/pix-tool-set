@@ -221,10 +221,6 @@ def draw_call_stats(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "draws, which a name cannot do when several passes share a label."
             ),
         },
-        global_id={
-            "type": "integer",
-            "description": "PIX GUI 'Global ID' of an action inside a pass.",
-        },
         detail={"type": "boolean", "description": "Include the full bound state per draw."},
         sort_by={
             "type": "string",
@@ -243,7 +239,7 @@ def list_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     offset, limit = page_args(args)
 
-    if args.get("queue_id") is not None or args.get("global_id") is not None:
+    if args.get("queue_id") is not None:
         # Match on the pass's exact marker path, not its name: names repeat, and a
         # caller who supplied an id is pointing at one specific pass.
         wanted = tuple(resolve_pass(capture, args)["marker_path"])
@@ -286,29 +282,35 @@ def list_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         left_draw={"type": "integer", "description": "First draw index."},
         right_draw={"type": "integer", "description": "Second draw index."},
-        left_global_id={"type": "integer", "description": "First draw by Global ID."},
-        right_global_id={"type": "integer", "description": "Second draw by Global ID."},
+        left_queue_id={
+            "type": "integer",
+            "description": "First draw by PIX GUI 'Queue ID'.",
+        },
+        right_queue_id={
+            "type": "integer",
+            "description": "Second draw by PIX GUI 'Queue ID'.",
+        },
         include_same={"type": "boolean", "description": "Also list fields that match."},
     ),
     returns="Field-level differences with a same/different verdict per group.",
     examples=[
         "pix-tool-set diff-draw-calls --left-draw 2461 --right-draw 2462",
-        "pix-tool-set diff-draw-calls --left-global-id 3644 --right-global-id 3650",
+        "pix-tool-set diff-draw-calls --left-queue-id 18704 --right-queue-id 18708",
     ],
     aliases=["compare-draw-calls"],
 )
 def diff_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     left = capture.resolve_draw(
-        draw_index=args.get("left_draw"), global_id=args.get("left_global_id")
+        draw_index=args.get("left_draw"), queue_id=args.get("left_queue_id")
     )
     right = capture.resolve_draw(
-        draw_index=args.get("right_draw"), global_id=args.get("right_global_id")
+        draw_index=args.get("right_draw"), queue_id=args.get("right_queue_id")
     )
     if left is None:
-        raise not_found("draw call", args.get("left_draw") or args.get("left_global_id"))
+        raise not_found("draw call", args.get("left_draw") or args.get("left_queue_id"))
     if right is None:
-        raise not_found("draw call", args.get("right_draw") or args.get("right_global_id"))
+        raise not_found("draw call", args.get("right_draw") or args.get("right_queue_id"))
 
     include_same = bool(args.get("include_same"))
 

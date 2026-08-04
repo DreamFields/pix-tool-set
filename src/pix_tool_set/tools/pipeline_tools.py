@@ -14,6 +14,7 @@ from ._common import (
     PAGE_PARAMS,
     page_args,
     page_envelope,
+    resolve_draw,
     tool,
     with_session,
 )
@@ -103,7 +104,13 @@ def list_pipeline_states(args: dict[str, Any], context: ToolContext) -> ToolResu
     parameters=with_session(
         pso_id={"type": "integer", "description": "Pipeline state id."},
         draw_index={"type": "integer", "description": "Take the PSO bound at this draw."},
-        global_id={"type": "integer", "description": "Take the PSO bound at this event."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of the event to take the PSO from. This id is present "
+                "on every row of the PIX event list."
+            ),
+        },
     ),
     returns="PSO detail plus root signature layout.",
     examples=[
@@ -115,11 +122,14 @@ def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     pso_id = args.get("pso_id")
     if pso_id is None:
-        draw = capture.resolve_draw(
-            draw_index=args.get("draw_index"), global_id=args.get("global_id")
-        )
-        if draw is None or draw.pso_id is None:
-            raise not_found("pipeline state", args.get("draw_index") or args.get("global_id"))
+        draw = resolve_draw(capture, args, what="pipeline state")
+        if draw.pso_id is None:
+            raise not_found(
+                "pipeline state",
+                f"queue_id={args['queue_id']}"
+                if args.get("queue_id") is not None
+                else f"draw_index={args.get('draw_index')}",
+            )
         pso_id = draw.pso_id
 
     pso = capture.pipeline_state(int(pso_id))
@@ -171,13 +181,7 @@ def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
-        queue_id=args.get("queue_id"),
-    )
-    if draw is None:
-        raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
+    draw = resolve_draw(capture, args)
 
     max_views = int(args.get("max_views") or 128)
     pso = draw.pipeline_state
@@ -217,13 +221,7 @@ def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def vertex_input(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
-        queue_id=args.get("queue_id"),
-    )
-    if draw is None:
-        raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
+    draw = resolve_draw(capture, args)
 
     pso = draw.pipeline_state
     layout = pso.input_layout if pso else []
@@ -316,13 +314,7 @@ def vertex_input(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def post_vs_data(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
-        queue_id=args.get("queue_id"),
-    )
-    if draw is None:
-        raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
+    draw = resolve_draw(capture, args)
 
     shader = draw.shader(ShaderStage.VS)
     outputs = [element.to_dict() for element in shader.output_signature] if shader else []

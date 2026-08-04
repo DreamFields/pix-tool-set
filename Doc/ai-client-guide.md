@@ -47,7 +47,7 @@
 | `compile_args_missing` | PDB 未记录编译参数 | 用 `--args` 显式传入，否则无法复现截帧内的构建 |
 | `source_unavailable` | 无法从 PDB 恢复 HLSL | 先用 `pass-shader-source` 确认该 PDB 是否可读 |
 | `already_patched` | 该 PSO 的这个 stage 已打过补丁 | 从导出目录的 `.orig` 备份恢复后再应用 |
-| `save_resource_failed` | PIX 无法保存该资源 | 换 `--global-id` 或改用 `--depth` / 其他 `--rtv` |
+| `save_resource_failed` | PIX 无法保存该资源 | 换 `--queue-id` 或改用 `--depth` / 其他 `--rtv` |
 | `pixtool_timeout` | 导出超时 | 提高 `--timeout`，或先单独 `session-open` |
 
 ## 四、分页
@@ -124,7 +124,8 @@ session-set-pdb-dirs --pdb-dirs <Project>\Saved\ShaderSymbols\PCD3D_SM6
 → shader-edit-apply ... --patch                                 确认无误再打补丁
 ```
 `--draw-index` 是最精确的选择器，因为一个 pass 可能含多个使用不同 PSO 的 draw；
-也可用 `--queue-id` / `--global-id` / `--pass-name`（取该 pass 的首个 draw）。
+也可用 `--queue-id` / `--pass-name`（取该 pass 的首个 draw）。事件选择器只接受
+Queue ID，`global_id` 仅在返回数据中报告。
 `apply` 不带 `--patch` 时只编译并校验绑定签名，不改动任何文件，适合先试错。
 返回 `partial` 且 `binding_check.identical=false` 表示替换不是 slot 兼容的，
 已被拒绝打补丁，需要先恢复原有资源声明。

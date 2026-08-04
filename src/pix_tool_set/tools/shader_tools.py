@@ -15,6 +15,7 @@ from ._common import (
     PAGE_PARAMS,
     page_args,
     page_envelope,
+    resolve_draw,
     tool,
     with_session,
 )
@@ -43,7 +44,6 @@ def _resolve_shader(capture, args: dict[str, Any]):
         stage=args.get("stage"),
         shader_hash=args.get("shader_hash"),
         draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
         queue_id=args.get("queue_id"),
     )
     if shader is None:
@@ -363,13 +363,7 @@ def shader_reflection(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
-        queue_id=args.get("queue_id"),
-    )
-    if draw is None:
-        raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
+    draw = resolve_draw(capture, args)
 
     stage = args.get("stage")
     shaders = [draw.shader(stage)] if stage else draw.shaders
@@ -449,13 +443,7 @@ def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
-        queue_id=args.get("queue_id"),
-    )
-    if draw is None:
-        raise not_found("draw call", args.get("draw_index") or args.get("global_id"))
+    draw = resolve_draw(capture, args)
 
     stage = args.get("stage")
     shaders = [draw.shader(stage)] if stage else draw.shaders

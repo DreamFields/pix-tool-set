@@ -44,11 +44,11 @@ _KIND_VALUES = [kind.value for kind in EventKind]
             "type": "string",
             "description": "Substring match against the marker path of the event.",
         },
-        min_global_id={"type": "integer", "description": "Lowest Global ID to include."},
-        max_global_id={"type": "integer", "description": "Highest Global ID to include."},
+        min_queue_id={"type": "integer", "description": "Lowest PIX Queue ID to include."},
+        max_queue_id={"type": "integer", "description": "Highest PIX Queue ID to include."},
         detail={"type": "boolean", "description": "Include marker path and counters."},
     ),
-    returns="Paged list of events with kind, name, Global ID and depth.",
+    returns="Paged list of events with kind, name, Queue ID, Global ID and depth.",
     examples=[
         "pix-tool-set list-actions --limit 20",
         "pix-tool-set list-actions --drawable-only --limit 50",
@@ -71,8 +71,8 @@ def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     kind = args.get("kind")
     marker = (args.get("marker") or "").lower()
-    lo = args.get("min_global_id")
-    hi = args.get("max_global_id")
+    lo = args.get("min_queue_id")
+    hi = args.get("max_queue_id")
     drawable_only = bool(args.get("drawable_only"))
 
     filtered = []
@@ -81,9 +81,11 @@ def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
             continue
         if drawable_only and event.kind not in DRAW_KINDS:
             continue
-        if lo is not None and (event.global_id is None or event.global_id < lo):
+        # Range filtering on Queue ID rather than Global ID: every row has a Queue ID,
+        # so a window expressed this way cannot silently drop markers.
+        if lo is not None and event.queue_id < lo:
             continue
-        if hi is not None and (event.global_id is None or event.global_id > hi):
+        if hi is not None and event.queue_id > hi:
             continue
         if marker and marker not in " / ".join(event.marker_path).lower():
             continue
@@ -106,31 +108,34 @@ def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
     ),
     category="events",
     parameters=with_session(
-        global_id={"type": "integer", "description": "PIX Global ID of the event."},
-        queue_id={"type": "integer", "description": "Queue ID (row index) of the event."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of the event. Every row of the PIX event list has "
+                "one, so this addresses markers as well as actions."
+            ),
+        },
         include_children={
             "type": "boolean",
             "description": "Include the immediate child events.",
         },
     ),
     returns="Event detail, ancestor chain, and linked draw call summary.",
-    examples=["pix-tool-set action-info --global-id 3644"],
+    examples=["pix-tool-set action-info --queue-id 18704"],
 )
 def action_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    global_id = args.get("global_id")
     queue_id = args.get("queue_id")
-    if global_id is None and queue_id is None:
-        raise invalid_argument("global_id/queue_id", "provide one of them")
+    if queue_id is None:
+        raise invalid_argument("queue_id", "provide the event's PIX Queue ID")
 
-    event = None
-    if global_id is not None:
-        event = capture.event_by_global_id(int(global_id))
-    if event is None and queue_id is not None:
-        event = next((e for e in capture.events if e.queue_id == int(queue_id)), None)
+    event = capture.event_by_queue_id(int(queue_id))
     if event is None:
-        raise not_found("action", global_id if global_id is not None else queue_id,
-                        "Use list-actions or search-actions to find a valid id.")
+        raise not_found(
+            "action",
+            f"queue_id={queue_id}",
+            "Use list-actions or search-actions to find a valid Queue ID.",
+        )
 
     ancestors = []
     node = event.parent
@@ -212,10 +217,6 @@ def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "that one pass, which a name cannot do when passes share a label."
             ),
         },
-        global_id={
-            "type": "integer",
-            "description": "PIX GUI 'Global ID' of an action inside a pass.",
-        },
         marker={"type": "string", "description": "Substring match on the full marker path."},
         kind={
             "type": "string",
@@ -242,7 +243,7 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     offset, limit = page_args(args)
 
-    if args.get("queue_id") is not None or args.get("global_id") is not None:
+    if args.get("queue_id") is not None:
         # Resolve the id to one pass, then apply the remaining filters within it.
         # Filtering by the pass's name would widen the result again, because names
         # are not unique across the frame.
@@ -296,7 +297,6 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     ),
     returns="Position within the frame plus surrounding context.",
     examples=[
-        "pix-tool-set locate-event --global-id 3644",
         "pix-tool-set locate-event --queue-id 18461",
         "pix-tool-set locate-event --draw-index 2461 --neighbours 5",
     ],
@@ -305,20 +305,15 @@ def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     draw = capture.resolve_draw(
         draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
         queue_id=args.get("queue_id"),
     )
     if draw is None:
         # The id may name a marker rather than an action. Markers carry no Global
-        # ID in the PIX GUI, so this is the normal case for a Queue ID taken off
-        # a pass row; answer with the marker and the pass it opens.
-        event = capture.resolve_event(
-            global_id=args.get("global_id"), queue_id=args.get("queue_id")
-        )
+        # ID in the PIX GUI, which is exactly why Queue ID is the only selector the
+        # toolkit accepts; answer with the marker and the pass it opens.
+        event = capture.resolve_event(queue_id=args.get("queue_id"))
         if event is not None:
-            pass_entry = capture.find_pass_by_event(
-                global_id=event.global_id, queue_id=event.queue_id
-            )
+            pass_entry = capture.find_pass_by_event(queue_id=event.queue_id)
             result = ToolResult.success(
                 {
                     "is_action": False,
@@ -344,8 +339,8 @@ def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
             return result
         raise not_found(
             "event",
-            args.get("global_id") or args.get("queue_id") or args.get("draw_index"),
-            "Use list-draw-calls or list-actions to find a valid identifier.",
+            args.get("queue_id") or args.get("draw_index"),
+            "Use list-draw-calls or list-actions to find a valid Queue ID.",
         )
 
     span = int(args.get("neighbours") or 3)

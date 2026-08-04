@@ -35,7 +35,7 @@ from ..engine.hlslcompile import require_compiler
 from ..engine.model import ShaderStage
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
-from ._common import tool, with_session
+from ._common import PASS_SELECTOR, resolve_pass, tool, with_session
 
 _STAGES = [stage.value for stage in ShaderStage]
 
@@ -70,8 +70,6 @@ def _pdb_dirs(context: ToolContext, args: dict[str, Any]) -> list[Path]:
 
 def _resolve_shader(capture, args: dict[str, Any]):
     """Locate the pass and the one shader stage being edited."""
-    global_id = args.get("global_id")
-    queue_id = args.get("queue_id")
     draw_index = args.get("draw_index")
     draw = None
     if draw_index is not None:
@@ -83,8 +81,7 @@ def _resolve_shader(capture, args: dict[str, Any]):
             raise not_found(
                 "draw", draw_index, "Run list-draw-calls or find-draw-calls for valid indices."
             )
-        entry = capture.find_pass_by_event(global_id=draw.global_id)
-        label = f"draw_index={draw_index}"
+        entry = capture.find_pass_by_event(queue_id=draw.queue_id)
         if entry is None:
             # The draw exists but no marker encloses it; carry on with a minimal entry so
             # the edit still works rather than refusing over a cosmetic detail.
@@ -94,23 +91,8 @@ def _resolve_shader(capture, args: dict[str, Any]):
                 "first_draw_index": draw.index,
                 "first_queue_id": None,
             }
-    elif global_id is not None or queue_id is not None:
-        entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
-        label = f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
-    elif args.get("pass_index") is not None:
-        entry = capture.find_pass(int(args["pass_index"]))
-        label = f"pass_index={args['pass_index']}"
-    elif args.get("pass_name"):
-        entry = capture.find_pass(str(args["pass_name"]))
-        label = f"pass_name={args['pass_name']!r}"
     else:
-        raise not_found(
-            "pass",
-            "<no selector>",
-            "Pass --draw-index, or --queue-id/--global-id/--pass-name.",
-        )
-    if entry is None:
-        raise not_found("pass", label, "Run find-pass to get a valid selector.")
+        entry = resolve_pass(capture, args)
 
     if draw is None:
         draw = capture.draw_call(entry["first_draw_index"])
@@ -165,10 +147,7 @@ def _describe(signature: list[tuple]) -> list[dict[str, Any]]:
     ),
     category="shaders",
     parameters=with_session(
-        pass_name={"type": "string", "description": "Pass name (substring match)."},
-        pass_index={"type": "integer", "description": "Pass index from list-passes."},
-        queue_id={"type": "integer", "description": "PIX GUI Queue ID inside the pass."},
-        global_id={"type": "integer", "description": "PIX GUI Global ID inside the pass."},
+        PASS_SELECTOR,
         draw_index={
             "type": "integer",
             "description": (
@@ -312,11 +291,8 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
     ),
     category="shaders",
     parameters=with_session(
+        PASS_SELECTOR,
         source={"type": "string", "description": "Edited .hlsl file to compile."},
-        pass_name={"type": "string", "description": "Pass name (substring match)."},
-        pass_index={"type": "integer", "description": "Pass index from list-passes."},
-        queue_id={"type": "integer", "description": "PIX GUI Queue ID inside the pass."},
-        global_id={"type": "integer", "description": "PIX GUI Global ID inside the pass."},
         draw_index={
             "type": "integer",
             "description": (

@@ -39,34 +39,33 @@ def main() -> int:
     print("=" * 78)
 
     print("\n1. locate-event")
-    payload = run("locate-event", global_id=GLOBAL_ID)
+    payload = run("locate-event", queue_id=QUEUE_ID)
     data = payload.get("data") or {}
     leaf = (data.get("event") or {}).get("marker_path", [""])[-1]
-    check("global_id -> pass leaf", leaf == EXPECT, f"leaf={leaf}")
+    check("queue_id -> pass leaf", leaf == EXPECT, f"leaf={leaf}")
 
-    print("\n2. find-pass --global-id")
-    payload = run("find-pass", global_id=GLOBAL_ID)
-    if payload["status"] == "error":
-        check("find-pass by global_id", False, payload["error"]["message"])
-    else:
-        m = payload["data"]["matches"][0]
-        check("name", m["name"] == EXPECT, f"name={m['name']}")
-        check("queue_id echoed", m["queue_id"] == QUEUE_ID, f"queue_id={m['queue_id']}")
-        check("draw_index resolved", m["draw_index"] is not None, f"draw_index={m['draw_index']}")
-
-    print("\n3. find-pass --queue-id")
+    print("\n2. find-pass --queue-id (global_id must still be reported)")
     payload = run("find-pass", queue_id=QUEUE_ID)
     if payload["status"] == "error":
         check("find-pass by queue_id", False, payload["error"]["message"])
     else:
         m = payload["data"]["matches"][0]
         check("name", m["name"] == EXPECT, f"name={m['name']}")
-        check("global_id echoed", m["global_id"] == GLOBAL_ID, f"global_id={m['global_id']}")
+        check("queue_id echoed", m["queue_id"] == QUEUE_ID, f"queue_id={m['queue_id']}")
+        check("global_id still in output", m["global_id"] == GLOBAL_ID,
+              f"global_id={m['global_id']}")
+        check("draw_index resolved", m["draw_index"] is not None, f"draw_index={m['draw_index']}")
 
-    print("\n4. pass-bindings --global-id")
-    payload = run("pass-bindings", global_id=GLOBAL_ID, stage="CS")
+    print("\n3. a global id is no longer accepted as input")
+    payload = run("find-pass", global_id=GLOBAL_ID)
+    check("find-pass rejects global_id",
+          payload["status"] == "error",
+          f"status={payload['status']}")
+
+    print("\n4. pass-bindings --queue-id")
+    payload = run("pass-bindings", queue_id=QUEUE_ID, stage="CS")
     if payload["status"] == "error":
-        check("pass-bindings by global_id", False, payload["error"]["message"])
+        check("pass-bindings by queue_id", False, payload["error"]["message"])
     else:
         p = payload["data"]["passes"][0]
         check("name", p["name"] == EXPECT, f"name={p['name']}")

@@ -21,7 +21,7 @@ from ..engine import values as values_mod
 from ..engine.model import RootParameterKind
 from ..errors import PixToolError, not_found
 from ..results import ToolResult
-from ._common import tool, with_session
+from ._common import PASS_SELECTOR, resolve_pass, tool, with_session
 
 _NOTE = (
     "Values come from resources.bin, which stores what PIX observed being uploaded plus "
@@ -106,10 +106,7 @@ def _read_values(
     ),
     category="shaders",
     parameters=with_session(
-        pass_name={"type": "string", "description": "Pass name (substring match)."},
-        pass_index={"type": "integer", "description": "Pass index from list-passes."},
-        global_id={"type": "integer", "description": "PIX GUI 'Global ID' inside the pass."},
-        queue_id={"type": "integer", "description": "PIX GUI 'Queue ID' inside the pass."},
+        PASS_SELECTOR,
         draw_index={"type": "integer", "description": "Address the draw directly."},
         max_bytes={
             "type": "integer",
@@ -159,23 +156,7 @@ def pass_values(args: dict[str, Any], context: ToolContext) -> ToolResult:
         if draw is None:
             raise not_found("draw", args["draw_index"])
     else:
-        global_id = args.get("global_id")
-        queue_id = args.get("queue_id")
-        if global_id is not None or queue_id is not None:
-            entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
-            label = f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
-        elif args.get("pass_index") is not None:
-            entry = capture.find_pass(int(args["pass_index"]))
-            label = f"pass_index={args['pass_index']}"
-        elif args.get("pass_name"):
-            entry = capture.find_pass(str(args["pass_name"]))
-            label = f"pass_name={args['pass_name']!r}"
-        else:
-            raise not_found(
-                "pass", "<no selector>", "Pass --queue-id/--global-id/--pass-name/--draw-index."
-            )
-        if entry is None:
-            raise not_found("pass", label, "Run find-pass or list-passes for a valid id.")
+        entry = resolve_pass(capture, args)
         draw = capture.draw_call(entry["first_draw_index"])
         if draw is None:
             raise not_found("draw", entry["first_draw_index"])

@@ -47,8 +47,14 @@ def _depth_events(capture, resource_id: int) -> list:
     category="textures",
     parameters=with_session(
         resource_id={"type": "integer", "description": "Depth-stencil resource id."},
-        queue_id={"type": "integer", "description": "Take the depth target from this PIX Queue ID."},
-        global_id={"type": "integer", "description": "Take the depth target from this Global ID."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of the event to take the depth target from. Every row "
+                "of the PIX event list has one, so this is the only event id accepted as "
+                "input; Global ID is reported in the results only."
+            ),
+        },
         draw_index={"type": "integer", "description": "Take the depth target from this draw."},
         max_probes={
             "type": "integer",
@@ -85,7 +91,6 @@ def find_depth_content(args: dict[str, Any], context: ToolContext) -> ToolResult
     if resource_id is None:
         draw = capture.resolve_draw(
             draw_index=args.get("draw_index"),
-            global_id=args.get("global_id"),
             queue_id=args.get("queue_id"),
         )
         if draw is None:

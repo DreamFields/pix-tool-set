@@ -37,15 +37,13 @@ DRAW_SELECTOR: dict[str, Any] = {
         "type": "integer",
         "description": "Zero-based index into the draw call list (see list-draw-calls).",
     },
-    "global_id": {
-        "type": "integer",
-        "description": "PIX GUI 'Global ID' of the event. Preferred when you have it.",
-    },
     "queue_id": {
         "type": "integer",
         "description": (
-            "PIX GUI 'Queue ID' of the event. Present on every row of the PIX event "
-            "list, unlike Global ID, so it also addresses pass markers."
+            "PIX GUI 'Queue ID' of the event. This is the single event identifier the "
+            "toolkit accepts: it is present on every row of the PIX event list, so it "
+            "also addresses pass markers. Global ID is reported in results but is not "
+            "accepted as input."
         ),
     },
 }
@@ -53,10 +51,6 @@ DRAW_SELECTOR: dict[str, Any] = {
 PASS_SELECTOR: dict[str, Any] = {
     "pass_name": {"type": "string", "description": "Pass name (substring match)."},
     "pass_index": {"type": "integer", "description": "Pass index from list-passes."},
-    "global_id": {
-        "type": "integer",
-        "description": "PIX GUI 'Global ID' of any action inside the pass.",
-    },
     "queue_id": {
         "type": "integer",
         "description": (
@@ -65,6 +59,7 @@ PASS_SELECTOR: dict[str, Any] = {
         ),
     },
 }
+
 
 
 
@@ -124,31 +119,26 @@ def percent(part: float, whole: float) -> float:
 # PIX identifiers
 # --------------------------------------------------------------------------
 def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a pass from a name, a pass index, or any PIX GUI event id.
+    """Resolve a pass from a name, a pass index, or a PIX GUI Queue ID.
 
-    Shared so that every tool naming a pass accepts the same selectors. The PIX GUI
-    shows a Global ID (actions only) and a Queue ID (every row), and Queue ID is the
-    one always on screen, so a value copied straight off the GUI has to work here
-    without the caller first translating it into an index of ours.
+    Queue ID is the toolkit's single event identifier. The PIX GUI also shows a Global
+    ID, but only for actions, so it cannot name a pass marker and cannot address every
+    row the user can see. Accepting both meant two ways to say the same thing, with one
+    of them silently unable to express half the cases; results still report Global ID
+    for cross-referencing.
 
     An id wins over a name, because it is unambiguous while a name is a substring
     match that can hit several passes.
     """
     from ..errors import invalid_argument, not_found
 
-    global_id = args.get("global_id")
     queue_id = args.get("queue_id")
-    if global_id is not None or queue_id is not None:
-        entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
+    if queue_id is not None:
+        entry = capture.find_pass_by_event(queue_id=queue_id)
         if entry is None:
-            label = (
-                f"global_id={global_id}"
-                if global_id is not None
-                else f"queue_id={queue_id}"
-            )
             raise not_found(
                 "pass",
-                label,
+                f"queue_id={queue_id}",
                 "Use locate-event to check the id, or list-passes to browse passes.",
             )
         return entry
@@ -158,12 +148,39 @@ def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
         key = args.get("pass_name")
     if key is None:
         raise invalid_argument(
-            "pass_name/pass_index/global_id/queue_id", "provide one of them"
+            "pass_name/pass_index/queue_id", "provide one of them"
         )
     entry = capture.find_pass(key)
     if entry is None:
         raise not_found("pass", key, "Run list-passes to see valid names and indices.")
     return entry
+
+
+def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
+    """Resolve a draw call from a Queue ID or a draw index, or raise.
+
+    Centralised so the "which event?" question has exactly one answer across the
+    toolkit, and so the not-found error names the selector the caller actually used.
+    """
+    from ..errors import not_found
+
+    draw = capture.resolve_draw(
+        draw_index=args.get("draw_index"),
+        queue_id=args.get("queue_id"),
+    )
+    if draw is None:
+        selector = (
+            f"queue_id={args['queue_id']}"
+            if args.get("queue_id") is not None
+            else f"draw_index={args.get('draw_index')}"
+        )
+        raise not_found(
+            what,
+            selector,
+            "Use list-draw-calls to find a valid Queue ID or draw index.",
+        )
+    return draw
+
 
 
 def pass_identity(entry: dict[str, Any]) -> dict[str, Any]:

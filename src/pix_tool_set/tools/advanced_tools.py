@@ -296,7 +296,13 @@ def analyze_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
         width={"type": "integer", "description": "Region width. Default 32."},
         height={"type": "integer", "description": "Region height. Default 32."},
         resource_id={"type": "integer", "description": "Render target resource id."},
-        global_id={"type": "integer", "description": "Event whose contents to sample."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of the event whose contents to sample. This id is "
+                "present on every row of the PIX event list."
+            ),
+        },
         depth={"type": "boolean", "description": "Sample the depth buffer."},
         rtv={"type": "integer", "description": "Render target slot. Default 0."},
         bins={"type": "integer", "description": "Histogram bin count. Default 8."},
@@ -313,19 +319,19 @@ def sample_pixel_region(args: dict[str, Any], context: ToolContext) -> ToolResul
 
     capture = context.capture(args)
     resource_id = args.get("resource_id")
-    global_id = args.get("global_id")
-    if resource_id is None and global_id is None:
-        raise invalid_argument("resource_id/global_id", "provide at least one")
+    queue_id = args.get("queue_id")
+    if resource_id is None and queue_id is None:
+        raise invalid_argument("resource_id/queue_id", "provide at least one")
 
     path, diagnostics = _texture_export(
         context,
         args,
         capture,
         resource_id=int(resource_id) if resource_id is not None else None,
-        global_id=int(global_id) if global_id is not None else None,
+        queue_id=int(queue_id) if queue_id is not None else None,
         rtv=int(args.get("rtv") or 0),
         depth=bool(args.get("depth")),
-        stem=f"region_{resource_id if resource_id is not None else global_id}",
+        stem=f"region_{resource_id if resource_id is not None else queue_id}",
     )
     try:
         image = read_png(path)
@@ -397,7 +403,13 @@ def sample_pixel_region(args: dict[str, Any], context: ToolContext) -> ToolResul
         y={"type": "integer", "description": "Pixel Y coordinate."},
         resource_id={"type": "integer", "description": "Render target resource id."},
         draw_index={"type": "integer", "description": "Skip coverage search and use this draw."},
-        global_id={"type": "integer", "description": "Skip coverage search and use this event."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of the event to use instead of the coverage search. "
+                "This id is present on every row of the PIX event list."
+            ),
+        },
         max_lines={"type": "integer", "description": "Disassembly lines to inline. Default 200."},
         required=[],
     ),
@@ -416,7 +428,6 @@ def debug_pixel_shader(args: dict[str, Any], context: ToolContext) -> ToolResult
     capture = context.capture(args)
     draw = capture.resolve_draw(
         draw_index=args.get("draw_index"),
-        global_id=args.get("global_id"),
         queue_id=args.get("queue_id"),
     )
 

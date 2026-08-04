@@ -109,7 +109,6 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "enum": ["event", "pass"],
             "description": "Report individual events or aggregate per pass. Default pass.",
         },
-        global_id={"type": "integer", "description": "PIX GUI 'Global ID' to look up."},
         queue_id={"type": "integer", "description": "PIX GUI 'Queue ID' to look up."},
         pass_name={"type": "string", "description": "Restrict to passes matching this substring."},
         no_measure={
@@ -135,7 +134,7 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Measured durations in nanoseconds and milliseconds.",
     examples=[
         "pix-tool-set event-timing --limit 15",
-        "pix-tool-set event-timing --global-id 3893",
+        "pix-tool-set event-timing --queue-id 18704",
         "pix-tool-set event-timing --group-by event --limit 20",
     ],
     notes=_NOTE,
@@ -158,21 +157,17 @@ def event_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
         )
         return result
 
-    global_id = args.get("global_id")
     queue_id = args.get("queue_id")
-    if global_id is not None or queue_id is not None:
-        entry = table.lookup(global_id=global_id, queue_id=queue_id)
+    if queue_id is not None:
+        entry = table.lookup(queue_id=queue_id)
         if entry is None:
-            label = (
-                f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
-            )
             raise not_found(
-                "timing", label, "That event carries no counter sample in this capture."
+                "timing",
+                f"queue_id={queue_id}",
+                "That event carries no counter sample in this capture.",
             )
-        event = capture.resolve_event(global_id=entry.global_id, queue_id=entry.queue_id)
-        pass_entry = capture.find_pass_by_event(
-            global_id=entry.global_id, queue_id=entry.queue_id
-        )
+        event = capture.resolve_event(queue_id=entry.queue_id)
+        pass_entry = capture.find_pass_by_event(queue_id=entry.queue_id)
         return ToolResult.success(
             {
                 "available": True,

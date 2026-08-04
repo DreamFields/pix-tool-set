@@ -16,6 +16,7 @@ from ..errors import invalid_argument, not_found
 from ..results import ToolResult
 from ._common import (
     PAGE_PARAMS,
+    PASS_SELECTOR,
     page_args,
     page_envelope,
     resolve_pass,
@@ -161,19 +162,7 @@ def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[st
     ),
     category="shaders",
     parameters=with_session(
-        pass_name={"type": "string", "description": "Pass name (substring match)."},
-        pass_index={"type": "integer", "description": "Pass index from list-passes."},
-        global_id={
-            "type": "integer",
-            "description": "PIX GUI 'Global ID' of a draw/dispatch inside the pass.",
-        },
-        queue_id={
-            "type": "integer",
-            "description": (
-                "PIX GUI 'Queue ID' of any event in the pass, including the pass marker "
-                "itself. Present on every event, unlike Global ID."
-            ),
-        },
+        PASS_SELECTOR,
         stage={
             "type": "string",
             "enum": _STAGES,
@@ -200,7 +189,6 @@ def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[st
     examples=[
         'pix-tool-set pass-bindings --pass-name TileClassificationBuildLists --stage CS',
         "pix-tool-set pass-bindings --pass-index 270",
-        "pix-tool-set pass-bindings --global-id 3893",
         "pix-tool-set pass-bindings --queue-id 18704",
         'pix-tool-set pass-bindings --pass-name TileClassification --all-matches',
     ],
@@ -305,19 +293,17 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         PAGE_PARAMS,
         name={"type": "string", "description": "Pass name or substring to look up."},
-        global_id={
-            "type": "integer",
-            "description": "PIX GUI 'Global ID'; returns the pass containing that action.",
-        },
         queue_id={
             "type": "integer",
-            "description": "PIX GUI 'Queue ID'; works for markers as well as actions.",
+            "description": (
+                "PIX GUI 'Queue ID'; works for markers as well as actions. This is the "
+                "only event id accepted as input, though Global ID is still reported."
+            ),
         },
     ),
     returns="Every matching pass with the ids needed by draw-state / shader-bindings.",
     examples=[
         'pix-tool-set find-pass --name TileClassificationBuildLists',
-        "pix-tool-set find-pass --global-id 3893",
         "pix-tool-set find-pass --queue-id 18704",
     ],
 )
@@ -342,11 +328,10 @@ def find_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "pso_ids": entry["pso_ids"],
         }
 
-    global_id = args.get("global_id")
     queue_id = args.get("queue_id")
-    if global_id is not None or queue_id is not None:
-        entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
-        label = f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
+    if queue_id is not None:
+        entry = capture.find_pass_by_event(queue_id=queue_id)
+        label = f"queue_id={queue_id}"
         if entry is None:
             raise not_found(
                 "pass",
@@ -359,7 +344,7 @@ def find_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "matches": [row(entry)],
                 "next_step": (
                     "Feed draw_index into `pass-bindings`, `draw-state` or `shader-bindings`, "
-                    "or pass the same --global-id/--queue-id straight to `pass-bindings`."
+                    "or pass the same --queue-id straight to `pass-bindings`."
                 ),
                 **page_envelope(1, 0, limit, 1),
             }
