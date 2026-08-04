@@ -267,6 +267,230 @@ def content_score(bgra: bytearray, width: int, height: int) -> float:
     return 1.0 - (dominant / sampled)
 
 
+# ----------------------------------------------------------------------
+# Region analysis.
+#
+# "Blank" here means unreadable, and that takes two conditions, not one. A cell
+# must be near enough to a single colour *and* that colour must carry no
+# information - near black or near white, the two states a window is left in when
+# nothing has been drawn into it. Flatness alone is not enough: the world-normal
+# exports this was tested against are large flat fields of saturated green and
+# blue, entirely flat per cell and entirely real content. Requiring both keeps
+# them out, because calling a rendered frame blank is the expensive mistake: it
+# would invent a reason to distrust a capture that is fine.
+_FLAT_CELL_SHARE = 0.985
+_GREY_SPREAD = 24
+_DARK_LEVEL = 24
+_BRIGHT_LEVEL = 232
+
+
+def _cell_profile(
+    bgra: bytearray, width: int, x0: int, y0: int, x1: int, y1: int
+) -> tuple[bool, tuple[int, int, int]]:
+    """Is this cell near enough to one colour, and which colour is it?"""
+    step_x = max((x1 - x0) // 16, 1)
+    step_y = max((y1 - y0) // 16, 1)
+    tally: dict[tuple[int, int, int], int] = {}
+    sampled = 0
+    for y in range(y0, y1, step_y):
+        row = y * width
+        for x in range(x0, x1, step_x):
+            offset = (row + x) * 4
+            if offset + 3 > len(bgra):
+                continue
+            key = (bgra[offset], bgra[offset + 1], bgra[offset + 2])
+            tally[key] = tally.get(key, 0) + 1
+            sampled += 1
+    if sampled == 0:
+        return True, (0, 0, 0)
+    colour, count = max(tally.items(), key=lambda item: item[1])
+    return (count / sampled) >= _FLAT_CELL_SHARE, colour
+
+
+def _carries_nothing(colour: tuple[int, int, int]) -> bool:
+    """Is this the colour of a surface nothing was drawn onto?
+
+    Near black or near white, and unsaturated. A cleared viewport and an unpainted
+    Win32 client area are both one of those two; a rendered surface, even a flat one,
+    generally is not.
+    """
+    high, low = max(colour), min(colour)
+    if high - low >= _GREY_SPREAD:
+        return False
+    return high <= _DARK_LEVEL or low >= _BRIGHT_LEVEL
+
+
+def _largest_rect(
+    mask: list[bool], columns: int, rows: int, wanted: bool
+) -> tuple[int, int, int, int, int]:
+    """Largest axis-aligned run of cells all equal to ``wanted``.
+
+    The maximal-rectangle histogram scan, over a grid small enough that its cost is
+    irrelevant. A rectangle rather than a connected blob because the question being
+    answered is "is there a big empty area", and an L-shaped blob around a corner panel
+    would answer it with a number that overstates how empty any one place is.
+    """
+    best = (0, 0, 0, 0, 0)  # area, x, y, width, height, in cells
+    heights = [0] * columns
+    for y in range(rows):
+        for x in range(columns):
+            heights[x] = heights[x] + 1 if mask[y * columns + x] == wanted else 0
+        stack: list[tuple[int, int]] = []
+        for x in range(columns + 1):
+            h = heights[x] if x < columns else 0
+            start = x
+            while stack and stack[-1][1] >= h:
+                left, height = stack.pop()
+                area = height * (x - left)
+                if area > best[0]:
+                    best = (area, left, y - height + 1, x - left, height)
+                start = left
+            stack.append((start, h))
+    return best
+
+
+def viewport_blankness(bgra: bytearray, width: int, height: int, *, grid: int = 12) -> dict:
+    """Where the content is, as a grid of blank / not-blank cells.
+
+    ``content_score`` answers "is anything on screen at all", over the whole inset frame.
+    That becomes the wrong question as soon as a window can show a UI panel over an
+    unrendered viewport. Measured on a real replay of the Tiled capture: a 600x400 Slate
+    panel in the corner of a 1280x720 window scored 0.2803 while the 3D viewport was
+    solid black. That passed the 0.02 gate, so the capture was treated as a rendered
+    frame, and the whole-window diff that followed - which could only ever have described
+    the panel - read as a verdict about a shader patch.
+
+    This reports *where* the content is instead of how much of it there is, so the three
+    cases can be told apart: nothing rendered, something rendered but only in one part of
+    the window, and a frame with content across it.
+
+    Independent of ``content_score`` on purpose. That function's 12% inset and threshold
+    are calibrated against a measured blank window, and nothing here changes them.
+    """
+    total_pixels = width * height
+    if total_pixels == 0 or width < 40 or height < 40:
+        return {
+            "verdict": "too_small",
+            "main_area_blank": False,
+            "note": "the frame is too small to divide into regions, so its layout is unknown",
+        }
+
+    columns = max(1, min(grid, width // 8))
+    rows = max(1, min(grid, height // 8))
+    edges_x = [(index * width) // columns for index in range(columns + 1)]
+    edges_y = [(index * height) // rows for index in range(rows + 1)]
+
+    blank: list[bool] = []
+    colours: list[tuple[int, int, int]] = []
+    flat_cells = 0
+    near_black = 0
+    for row in range(rows):
+        for column in range(columns):
+            is_flat, colour = _cell_profile(
+                bgra, width,
+                edges_x[column], edges_y[row], edges_x[column + 1], edges_y[row + 1],
+            )
+            colours.append(colour)
+            if is_flat:
+                flat_cells += 1
+            empty = is_flat and _carries_nothing(colour)
+            blank.append(empty)
+            if empty and max(colour) <= _DARK_LEVEL:
+                near_black += 1
+
+    cells = columns * rows
+    blank_cells = sum(1 for flag in blank if flag)
+    blank_share = blank_cells / cells
+
+    # One flat colour over the whole window, whatever that colour is. This is the
+    # un-presented window, and it is worth catching separately because a mid grey
+    # would not read as "carries nothing" on its own.
+    first = colours[0]
+    uniform = flat_cells == cells and all(
+        max(abs(c[i] - first[i]) for i in range(3)) <= 8 for c in colours
+    )
+
+    # The middle of the window, grid-aligned. This is where a 3D viewport lives when a
+    # tool panel is docked over a corner, and testing it is what stops a flat sky - blank
+    # cells, but at the top - from being mistaken for an empty viewport.
+    cx0, cx1 = columns // 4, columns - columns // 4
+    cy0, cy1 = rows // 4, rows - rows // 4
+    centre = [
+        blank[row * columns + column]
+        for row in range(cy0, max(cy1, cy0 + 1))
+        for column in range(cx0, max(cx1, cx0 + 1))
+    ]
+    centre_blank_share = (sum(1 for flag in centre if flag) / len(centre)) if centre else 0.0
+
+    def as_rect(found: tuple[int, int, int, int, int]) -> dict | None:
+        area, x, y, cell_w, cell_h = found
+        if area == 0:
+            return None
+        x0, y0 = edges_x[x], edges_y[y]
+        x1, y1 = edges_x[x + cell_w], edges_y[y + cell_h]
+        return {
+            "x": x0,
+            "y": y0,
+            "width": x1 - x0,
+            "height": y1 - y0,
+            "share_of_frame": round((x1 - x0) * (y1 - y0) / total_pixels, 4),
+        }
+
+    blank_rect = as_rect(_largest_rect(blank, columns, rows, True))
+    content_rect = as_rect(_largest_rect(blank, columns, rows, False))
+    blank_rect_share = blank_rect["share_of_frame"] if blank_rect else 0.0
+
+    # A frame is only called part-empty when a large contiguous area carries nothing
+    # *and* the middle is one of those areas. Requiring both is what keeps normally
+    # rendered frames out of this bucket - measured at blank_cell_share 0.0 on two
+    # full-frame world-normal exports, against 0.67 for the Slate panel capture.
+    if uniform or blank_share >= 0.98:
+        verdict = "frame_blank"
+    elif blank_share >= 0.45 and blank_rect_share >= 0.25 and centre_blank_share >= 0.5:
+        verdict = "content_confined_to_part_of_frame"
+    else:
+        verdict = "content_across_frame"
+
+    if verdict == "frame_blank":
+        note = (
+            "every cell is one flat colour, so nothing was rendered and no measurement "
+            "taken from this frame describes a scene"
+        )
+    elif verdict == "content_confined_to_part_of_frame":
+        shape = (
+            f"{content_rect['width']}x{content_rect['height']} at "
+            f"({content_rect['x']},{content_rect['y']})"
+            if content_rect
+            else "a small area"
+        )
+        note = (
+            f"content is confined to {shape}; {round(blank_rect_share * 100)}% of the "
+            f"frame is one blank rectangle and {round(centre_blank_share * 100)}% of the "
+            "middle carries nothing, so a whole-frame measurement describes that content "
+            "and not the scene"
+        )
+    else:
+        note = (
+            "content is spread across the frame, so a whole-frame measurement describes "
+            "what was rendered"
+        )
+
+    return {
+        "grid": f"{columns}x{rows}",
+        "cells": cells,
+        "flat_cell_share": round(flat_cells / cells, 4),
+        "blank_cells": blank_cells,
+        "blank_cell_share": round(blank_share, 4),
+        "near_black_cell_share": round(near_black / cells, 4),
+        "centre_blank_share": round(centre_blank_share, 4),
+        "largest_blank_rect": blank_rect,
+        "largest_content_rect": content_rect,
+        "main_area_blank": verdict in ("frame_blank", "content_confined_to_part_of_frame"),
+        "verdict": verdict,
+        "note": note,
+    }
+
+
 def capture_window(hwnd: int) -> tuple[bytearray, int, int, str] | None:
     """Grab a window's client area as BGRA rows, reporting which method worked."""
     for use_print_window, label in ((True, "PrintWindow(PW_RENDERFULLCONTENT)"),

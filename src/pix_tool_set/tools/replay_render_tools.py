@@ -456,6 +456,7 @@ def replay_render(args: dict[str, Any], context: ToolContext) -> ToolResult:
         written = screencap.write_png(target, pixels, width, height)
 
         summary = screencap.colour_summary(pixels, width, height)
+        regions = screencap.viewport_blankness(pixels, width, height)
         data["capture"] = {
             "path": str(target),
             "bytes": written,
@@ -463,8 +464,10 @@ def replay_render(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "height": height,
             "method": method,
             "colour": summary,
+            "regions": regions,
             "shows_rendered_frame": not blank,
         }
+        main_area_blank = bool(regions.get("main_area_blank")) and not blank
 
         if blank:
             diagnostics.append((
@@ -472,6 +475,27 @@ def replay_render(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "The window never showed a rendered frame within the settle window, so "
                 "this capture is a blank page and says nothing about the patch. Raise "
                 "--settle-seconds and try again.",
+            ))
+        elif main_area_blank:
+            content_rect = regions.get("largest_content_rect") or {}
+            where = (
+                f"{content_rect.get('width')}x{content_rect.get('height')} at "
+                f"({content_rect.get('x')},{content_rect.get('y')})"
+                if content_rect
+                else "one part of the window"
+            )
+            diagnostics.append((
+                "warning",
+                "The window passed the content gate but only because content is confined "
+                f"to {where}, which is "
+                f"{round(float(content_rect.get('share_of_frame') or 0.0) * 100)}% of the "
+                f"frame; {round(float(regions.get('centre_blank_share') or 0.0) * 100)}% of "
+                "the middle carries nothing. content_score measures the whole window, so a "
+                "docked tool panel over an unrendered viewport raises it on its own. This "
+                "capture is therefore not suitable for judging whether a patch took "
+                "effect: any whole-window comparison would describe that panel. Use "
+                "read-uav to read what the dispatch actually wrote on the GPU, which is "
+                "independent of what reaches the backbuffer.",
             ))
         elif not wait_info.get("settled"):
             diagnostics.append((
@@ -487,16 +511,29 @@ def replay_render(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     "reason": "the current capture is blank, so a comparison would be meaningless",
                 }
             else:
-                data["comparison"] = _compare_with(str(args["compare_to"]), summary)
-                if data["comparison"].get("comparable") and not data["comparison"].get(
-                    "visibly_different"
-                ):
-                    diagnostics.append((
-                        "warning",
-                        "This render is not measurably different from the one compared "
-                        "against. Either the patch did not take effect, or the patched "
-                        "pass does not reach the backbuffer in this frame.",
-                    ))
+                outcome = _compare_with(str(args["compare_to"]), summary)
+                _state_what_the_diff_proves(outcome, regions)
+                data["comparison"] = outcome
+                if outcome.get("comparable") and not outcome.get("visibly_different"):
+                    if outcome.get("supports_conclusion"):
+                        diagnostics.append((
+                            "warning",
+                            "This render is not measurably different from the one compared "
+                            "against. Both captures show content across the frame, so the "
+                            "two frames really are alike: either the patch did not take "
+                            "effect, or the patched pass does not reach the backbuffer in "
+                            "this frame. read-uav distinguishes those two, because it reads "
+                            "the dispatch's own output rather than the presented frame.",
+                        ))
+                    else:
+                        diagnostics.append((
+                            "warning",
+                            "The two captures measure alike, but "
+                            f"{outcome.get('inconclusive_because', 'a main area is blank')}, "
+                            "so this comparison is not evidence either way about the patch. "
+                            "Do not read it as the patch having failed. Use read-uav to read "
+                            "what the dispatch wrote on the GPU.",
+                        ))
     finally:
         if not args.get("keep_running"):
             process.terminate()
@@ -531,6 +568,7 @@ def _compare_with(reference: str, current: dict[str, Any]) -> dict[str, Any]:
     previous: dict[str, Any] | None = None
     source = ""
     reference_render = ""
+    reference_regions: dict[str, Any] | None = None
 
     candidate = Path(reference)
     if candidate.suffix.lower() == ".png" and candidate.exists():
@@ -559,6 +597,9 @@ def _compare_with(reference: str, current: dict[str, Any]) -> dict[str, Any]:
                 previous = found
                 source = f"activity record {entry['id']}"
                 reference_render = (entry.get("render") or {}).get("name") or ""
+                # Captures recorded before region analysis existed have no such facts,
+                # which is a different state from "recorded, and the area was fine".
+                reference_regions = shot.get("regions")
                 break
 
     if previous is None:
@@ -573,4 +614,51 @@ def _compare_with(reference: str, current: dict[str, Any]) -> dict[str, Any]:
     outcome["reference_colour"] = previous
     if reference_render:
         outcome["reference_render"] = reference_render
+    if reference_regions is not None:
+        outcome["reference_regions"] = reference_regions
     return outcome
+
+
+def _state_what_the_diff_proves(
+    outcome: dict[str, Any], regions: dict[str, Any]
+) -> None:
+    """Separate "the two frames measure alike" from "therefore the patch did nothing".
+
+    ``visibly_different`` is a measurement and is always true or false. What may be
+    concluded from it is a separate question that depends on whether either frame was
+    worth measuring, and conflating the two is what made a capture of a tool panel over
+    an unrendered viewport read as a failed patch. Both are reported, so a caller need
+    not infer the second from the first.
+    """
+    if not outcome.get("comparable"):
+        return
+
+    blocked: list[str] = []
+    if regions.get("main_area_blank"):
+        blocked.append("this capture's main area carries nothing")
+    reference_regions = outcome.get("reference_regions")
+    if isinstance(reference_regions, dict) and reference_regions.get("main_area_blank"):
+        blocked.append("the reference capture's main area carries nothing")
+
+    outcome["supports_conclusion"] = not blocked
+    if blocked:
+        outcome["inconclusive_because"] = " and ".join(blocked)
+        outcome["conclusion"] = (
+            "no_evidence_either_way: the frames were measured, but "
+            f"{outcome['inconclusive_because']}, so the comparison describes whatever else "
+            "was on screen rather than the scene. This is not evidence that the patch "
+            "failed. read-uav reads the dispatch's output on the GPU and does not depend "
+            "on the frame reaching the backbuffer."
+        )
+    elif outcome.get("visibly_different"):
+        outcome["conclusion"] = (
+            "changed: both captures show content across the frame and they differ, so "
+            "something the patch affects does reach the backbuffer."
+        )
+    else:
+        outcome["conclusion"] = (
+            "unchanged_on_valid_frames: both captures show content across the frame and "
+            "measure alike, so the patched pass most likely does not affect the "
+            "backbuffer in this frame. That is still distinct from the patch not "
+            "applying, which read-uav can settle."
+        )
