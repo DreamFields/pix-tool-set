@@ -14,7 +14,14 @@ from ..context import ToolContext
 from ..engine.model import RootParameterKind, ShaderStage
 from ..errors import invalid_argument, not_found
 from ..results import ToolResult
-from ._common import PAGE_PARAMS, page_args, page_envelope, tool, with_session
+from ._common import (
+    PAGE_PARAMS,
+    page_args,
+    page_envelope,
+    resolve_pass,
+    tool,
+    with_session,
+)
 
 _TRUST_NOTE = (
     "Declared registers come from the shader bytecode reflection and are authoritative. "
@@ -24,39 +31,6 @@ _TRUST_NOTE = (
 )
 
 _STAGES = [stage.value for stage in ShaderStage]
-
-
-def _resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a pass from a name, a pass index, or any PIX GUI event id.
-
-    The PIX GUI shows a Global ID (actions only) and a Queue ID (every row), so
-    accepting both means a value copied straight off the GUI works here without
-    the caller first translating it into a draw index.
-    """
-    global_id = args.get("global_id")
-    queue_id = args.get("queue_id")
-    if global_id is not None or queue_id is not None:
-        entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
-        if entry is None:
-            label = f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}"
-            raise not_found(
-                "pass",
-                label,
-                "Use locate-event to check the id, or list-passes to browse passes.",
-            )
-        return entry
-
-    key = args.get("pass_index")
-    if key is None:
-        key = args.get("pass_name")
-    if key is None:
-        raise invalid_argument(
-            "pass_name/pass_index/global_id/queue_id", "provide one of them"
-        )
-    entry = capture.find_pass(key)
-    if entry is None:
-        raise not_found("pass", key, "Run list-passes to see valid names and indices.")
-    return entry
 
 
 def _classify_table(binding, declared_counts: dict[str, int]) -> dict[str, Any]:
@@ -246,7 +220,7 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
         if not entries:
             raise not_found("pass", args["pass_name"], "Run list-passes to see valid names.")
     else:
-        entries = [_resolve_pass(capture, args)]
+        entries = [resolve_pass(capture, args)]
 
     pass_payloads: list[dict[str, Any]] = []
     trust_tally: dict[str, int] = {}

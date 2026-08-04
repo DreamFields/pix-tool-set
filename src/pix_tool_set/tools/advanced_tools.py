@@ -9,7 +9,7 @@ from ..context import ToolContext
 from ..engine.model import EventKind, ShaderStage, ViewKind
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
-from ._common import DRAW_SELECTOR, tool, with_session
+from ._common import DRAW_SELECTOR, PASS_SELECTOR, resolve_pass, tool, with_session
 from .texture_tools import read_png
 
 _REPLAY_NOTE = (
@@ -168,23 +168,16 @@ def pixel_history(args: dict[str, Any], context: ToolContext) -> ToolResult:
         "state changes, and observations about likely inefficiencies."
     ),
     category="advanced",
-    parameters=with_session(
-        pass_name={"type": "string", "description": "Pass name (substring match)."},
-        pass_index={"type": "integer", "description": "Pass index from list-passes."},
-    ),
+    parameters=with_session(PASS_SELECTOR),
     returns="Pass workload, inputs/outputs, shader mix and observations.",
-    examples=['pix-tool-set analyze-pass --pass-name "ShadowDepths"'],
+    examples=[
+        'pix-tool-set analyze-pass --pass-name "ShadowDepths"',
+        "pix-tool-set analyze-pass --queue-id 18704",
+    ],
 )
 def analyze_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    key = args.get("pass_index")
-    if key is None:
-        key = args.get("pass_name")
-    if key is None:
-        raise invalid_argument("pass_index/pass_name", "provide one of them")
-    entry = capture.find_pass(key)
-    if entry is None:
-        raise not_found("pass", key, "Run list-passes to see valid names and indices.")
+    entry = resolve_pass(capture, args)
 
     marker_path = tuple(entry["marker_path"])
     draws = [d for d in capture.draw_calls if d.marker_path == marker_path]

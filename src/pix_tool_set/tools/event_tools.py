@@ -14,6 +14,7 @@ from ._common import (
     page_args,
     page_envelope,
     pass_identity,
+    resolve_pass,
     tool,
     with_session,
 )
@@ -204,6 +205,17 @@ def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         PAGE_PARAMS,
         pass_name={"type": "string", "description": "Substring match on the innermost marker."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of any row inside a pass. Restricts the search to "
+                "that one pass, which a name cannot do when passes share a label."
+            ),
+        },
+        global_id={
+            "type": "integer",
+            "description": "PIX GUI 'Global ID' of an action inside a pass.",
+        },
         marker={"type": "string", "description": "Substring match on the full marker path."},
         kind={
             "type": "string",
@@ -220,6 +232,7 @@ def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Paged list of draw calls with counts of bound resources.",
     examples=[
         "pix-tool-set find-draw-calls --pass-name Lumen --limit 10",
+        "pix-tool-set find-draw-calls --queue-id 18704",
         "pix-tool-set find-draw-calls --kind dispatch --min-triangles 0",
         "pix-tool-set find-draw-calls --uses-resource 641 --detail",
     ],
@@ -228,18 +241,36 @@ def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
 def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     offset, limit = page_args(args)
-    window, total = capture.find_draw_calls(
-        pass_name=args.get("pass_name"),
-        marker=args.get("marker"),
-        kind=args.get("kind"),
-        pso_id=args.get("pso_id"),
-        uses_resource=args.get("uses_resource"),
-        shader_hash=args.get("shader_hash"),
-        min_instances=args.get("min_instances"),
-        min_triangles=args.get("min_triangles"),
-        offset=offset,
-        limit=limit,
-    )
+
+    if args.get("queue_id") is not None or args.get("global_id") is not None:
+        # Resolve the id to one pass, then apply the remaining filters within it.
+        # Filtering by the pass's name would widen the result again, because names
+        # are not unique across the frame.
+        wanted = tuple(resolve_pass(capture, args)["marker_path"])
+        candidates, _ = capture.find_draw_calls(
+            kind=args.get("kind"),
+            pso_id=args.get("pso_id"),
+            uses_resource=args.get("uses_resource"),
+            shader_hash=args.get("shader_hash"),
+            min_instances=args.get("min_instances"),
+            min_triangles=args.get("min_triangles"),
+        )
+        matched = [d for d in candidates if d.marker_path == wanted]
+        total = len(matched)
+        window = matched[offset : offset + limit] if limit else matched[offset:]
+    else:
+        window, total = capture.find_draw_calls(
+            pass_name=args.get("pass_name"),
+            marker=args.get("marker"),
+            kind=args.get("kind"),
+            pso_id=args.get("pso_id"),
+            uses_resource=args.get("uses_resource"),
+            shader_hash=args.get("shader_hash"),
+            min_instances=args.get("min_instances"),
+            min_triangles=args.get("min_triangles"),
+            offset=offset,
+            limit=limit,
+        )
     detail = bool(args.get("detail"))
     return ToolResult.success(
         {

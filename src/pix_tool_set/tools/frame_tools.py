@@ -11,10 +11,12 @@ from ..errors import not_found
 from ..results import ToolResult
 from ._common import (
     PAGE_PARAMS,
+    PASS_SELECTOR,
     page_args,
     page_envelope,
     pass_identity,
     percent,
+    resolve_pass,
     tool,
     with_session,
 )
@@ -113,8 +115,7 @@ def list_passes(args: dict[str, Any], context: ToolContext) -> ToolResult:
     ),
     category="frame",
     parameters=with_session(
-        pass_name={"type": "string", "description": "Pass name (substring match)."},
-        pass_index={"type": "integer", "description": "Pass index from list-passes."},
+        PASS_SELECTOR,
         include_draws={
             "type": "boolean",
             "description": "Include the pass's draw call list. Default true.",
@@ -125,18 +126,12 @@ def list_passes(args: dict[str, Any], context: ToolContext) -> ToolResult:
     examples=[
         "pix-tool-set pass-info --pass-index 12",
         'pix-tool-set pass-info --pass-name "ShadowDepths"',
+        "pix-tool-set pass-info --queue-id 18704",
     ],
 )
 def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    key = args.get("pass_index")
-    if key is None:
-        key = args.get("pass_name")
-    if key is None:
-        raise not_found("pass", None, "Pass --pass-index or --pass-name.")
-    entry = capture.find_pass(key)
-    if entry is None:
-        raise not_found("pass", key, "Run list-passes to see valid names and indices.")
+    entry = resolve_pass(capture, args)
 
     marker_path = tuple(entry["marker_path"])
     draws = [d for d in capture.draw_calls if d.marker_path == marker_path]
@@ -195,6 +190,16 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         PAGE_PARAMS,
         pass_name={"type": "string", "description": "Restrict to passes matching this name."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of any row inside a pass. Reports just that pass."
+            ),
+        },
+        global_id={
+            "type": "integer",
+            "description": "PIX GUI 'Global ID' of an action inside a pass.",
+        },
         sort_by={
             "type": "string",
             "enum": ["measured", "cost", "triangles", "threads", "pixels", "order"],
@@ -226,6 +231,7 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Per-pass measured GPU duration and share of the frame, plus the cost model.",
     examples=[
         "pix-tool-set pass-cost --limit 15",
+        "pix-tool-set pass-cost --queue-id 18704",
         "pix-tool-set pass-cost --no-measure --limit 15",
         "pix-tool-set pass-cost --force-measure",
     ],
@@ -285,6 +291,12 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
     needle = (args.get("pass_name") or "").lower()
     if needle:
         rows = [row for row in rows if needle in row["name"].lower()]
+
+    # An id names exactly one pass, so it selects rather than filters. Names are a
+    # substring match and can legitimately hit several passes with the same label.
+    if args.get("queue_id") is not None or args.get("global_id") is not None:
+        wanted = resolve_pass(capture, args)
+        rows = [row for row in rows if row["pass_index"] == wanted["pass_index"]]
 
     # Measured GPU time is the whole point of a cost ranking, so make sure it exists
     # rather than quietly answering with the model. By default the capture is replayed

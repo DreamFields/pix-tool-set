@@ -50,6 +50,23 @@ DRAW_SELECTOR: dict[str, Any] = {
     },
 }
 
+PASS_SELECTOR: dict[str, Any] = {
+    "pass_name": {"type": "string", "description": "Pass name (substring match)."},
+    "pass_index": {"type": "integer", "description": "Pass index from list-passes."},
+    "global_id": {
+        "type": "integer",
+        "description": "PIX GUI 'Global ID' of any action inside the pass.",
+    },
+    "queue_id": {
+        "type": "integer",
+        "description": (
+            "PIX GUI 'Queue ID' of any row inside the pass, or of the pass marker "
+            "itself. This is the id visible on every PIX event list row."
+        ),
+    },
+}
+
+
 
 def object_schema(
     *fragments: dict[str, Any],
@@ -106,6 +123,49 @@ def percent(part: float, whole: float) -> float:
 # --------------------------------------------------------------------------
 # PIX identifiers
 # --------------------------------------------------------------------------
+def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a pass from a name, a pass index, or any PIX GUI event id.
+
+    Shared so that every tool naming a pass accepts the same selectors. The PIX GUI
+    shows a Global ID (actions only) and a Queue ID (every row), and Queue ID is the
+    one always on screen, so a value copied straight off the GUI has to work here
+    without the caller first translating it into an index of ours.
+
+    An id wins over a name, because it is unambiguous while a name is a substring
+    match that can hit several passes.
+    """
+    from ..errors import invalid_argument, not_found
+
+    global_id = args.get("global_id")
+    queue_id = args.get("queue_id")
+    if global_id is not None or queue_id is not None:
+        entry = capture.find_pass_by_event(global_id=global_id, queue_id=queue_id)
+        if entry is None:
+            label = (
+                f"global_id={global_id}"
+                if global_id is not None
+                else f"queue_id={queue_id}"
+            )
+            raise not_found(
+                "pass",
+                label,
+                "Use locate-event to check the id, or list-passes to browse passes.",
+            )
+        return entry
+
+    key = args.get("pass_index")
+    if key is None:
+        key = args.get("pass_name")
+    if key is None:
+        raise invalid_argument(
+            "pass_name/pass_index/global_id/queue_id", "provide one of them"
+        )
+    entry = capture.find_pass(key)
+    if entry is None:
+        raise not_found("pass", key, "Run list-passes to see valid names and indices.")
+    return entry
+
+
 def pass_identity(entry: dict[str, Any]) -> dict[str, Any]:
     """The PIX identifiers that address a pass, for splicing into any payload.
 

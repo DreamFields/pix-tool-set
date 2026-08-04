@@ -16,6 +16,7 @@ from ._common import (
     page_envelope,
     pass_identity,
     percent,
+    resolve_pass,
     tool,
     with_session,
 )
@@ -213,6 +214,17 @@ def draw_call_stats(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "description": "Restrict to one draw kind.",
         },
         pass_name={"type": "string", "description": "Substring match on the innermost marker."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "PIX GUI 'Queue ID' of any row inside a pass. Lists only that pass's "
+                "draws, which a name cannot do when several passes share a label."
+            ),
+        },
+        global_id={
+            "type": "integer",
+            "description": "PIX GUI 'Global ID' of an action inside a pass.",
+        },
         detail={"type": "boolean", "description": "Include the full bound state per draw."},
         sort_by={
             "type": "string",
@@ -223,6 +235,7 @@ def draw_call_stats(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Paged draw call list.",
     examples=[
         "pix-tool-set list-draw-calls --limit 25",
+        "pix-tool-set list-draw-calls --queue-id 18704",
         "pix-tool-set list-draw-calls --sort-by triangles --limit 10",
     ],
 )
@@ -230,10 +243,18 @@ def list_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     offset, limit = page_args(args)
 
-    matched, _total = capture.find_draw_calls(
-        kind=args.get("kind"),
-        pass_name=args.get("pass_name"),
-    )
+    if args.get("queue_id") is not None or args.get("global_id") is not None:
+        # Match on the pass's exact marker path, not its name: names repeat, and a
+        # caller who supplied an id is pointing at one specific pass.
+        wanted = tuple(resolve_pass(capture, args)["marker_path"])
+        matched = [d for d in capture.draw_calls if d.marker_path == wanted]
+        if args.get("kind"):
+            matched = [d for d in matched if d.kind.value == args["kind"]]
+    else:
+        matched, _total = capture.find_draw_calls(
+            kind=args.get("kind"),
+            pass_name=args.get("pass_name"),
+        )
     sort_by = args.get("sort_by") or "order"
     sorters = {
         "order": lambda d: d.index,
