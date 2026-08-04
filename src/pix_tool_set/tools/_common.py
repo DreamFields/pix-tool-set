@@ -101,3 +101,29 @@ def top_n(items: list[dict[str, Any]], key: str, count: int = 10) -> list[dict[s
 
 def percent(part: float, whole: float) -> float:
     return round(100.0 * part / whole, 2) if whole else 0.0
+
+
+# --------------------------------------------------------------------------
+# PIX identifiers
+# --------------------------------------------------------------------------
+def pass_identity(entry: dict[str, Any]) -> dict[str, Any]:
+    """The PIX identifiers that address a pass, for splicing into any payload.
+
+    Every payload naming a pass should carry these, because `pass_index` is ours
+    alone: it is derived from marker grouping and means nothing in the PIX UI. Queue ID
+    is what the user can see and type, so omitting it forces them to run another tool
+    just to translate our answer back into something they can act on.
+
+    Two Queue IDs are reported because they answer different questions:
+      * ``queue_id`` is the pass's first action, which is what other tools accept as a
+        selector for reading bindings, values or shaders.
+      * ``marker_queue_id`` is the marker row that opens the pass. Markers carry no
+        Global ID, so this is the only id addressing the pass row itself.
+    """
+    return {
+        "queue_id": entry.get("first_queue_id"),
+        "marker_queue_id": entry.get("marker_queue_id"),
+        "first_queue_id": entry.get("first_queue_id"),
+        "last_queue_id": entry.get("last_queue_id"),
+        "first_global_id": entry.get("first_global_id"),
+    }

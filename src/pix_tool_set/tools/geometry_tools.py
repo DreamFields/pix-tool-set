@@ -14,6 +14,7 @@ from ._common import (
     PAGE_PARAMS,
     page_args,
     page_envelope,
+    pass_identity,
     percent,
     tool,
     with_session,
@@ -184,6 +185,7 @@ def draw_call_stats(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 {
                     "pass_index": entry["pass_index"],
                     "name": entry["name"],
+                    **pass_identity(entry),
                     "draw_count": entry["draw_count"],
                     "dispatch_count": entry["dispatch_count"],
                     "triangle_count": entry["triangle_count"],

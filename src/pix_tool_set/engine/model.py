@@ -666,6 +666,18 @@ class DrawCall:
         return self._capture.event_by_global_id(self.global_id)
 
     @property
+    def queue_id(self) -> Optional[int]:
+        """The Queue ID the PIX GUI shows for this action.
+
+        Queue ID is the identifier a user can actually see and type into PIX, and it
+        addresses every row in the event list, whereas Global ID only exists for
+        actions. Exposing it here means any payload built from a DrawCall can quote
+        the same id the user is looking at, instead of forcing them to translate.
+        """
+        event = self.event
+        return getattr(event, "queue_id", None) if event is not None else None
+
+    @property
     def pass_name(self) -> str:
         return self.marker_path[-1] if self.marker_path else ""
 
@@ -802,6 +814,7 @@ class DrawCall:
             "draw_index": self.index,
             "kind": self.kind.value,
             "api": self.api,
+            "queue_id": self.queue_id,
             "global_id": self.global_id,
             "command_list_id": self.command_list_id,
             "pass_name": self.pass_name,

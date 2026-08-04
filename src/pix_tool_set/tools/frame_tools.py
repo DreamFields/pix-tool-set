@@ -9,7 +9,15 @@ from ..engine import timing as timing_mod
 from ..engine.model import EventKind
 from ..errors import not_found
 from ..results import ToolResult
-from ._common import PAGE_PARAMS, page_args, page_envelope, percent, tool, with_session
+from ._common import (
+    PAGE_PARAMS,
+    page_args,
+    page_envelope,
+    pass_identity,
+    percent,
+    tool,
+    with_session,
+)
 
 _TIMING_NOTE = (
     "Real per-pass GPU time comes from a counter-enriched replay driven by pixtool, not "
@@ -262,6 +270,7 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
         row = {
             "pass_index": entry["pass_index"],
             "name": entry["name"],
+            **pass_identity(entry),
             "event_count": entry["event_count"],
             "triangle_count": triangles,
             "thread_count": threads,

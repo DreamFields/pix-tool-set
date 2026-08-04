@@ -9,7 +9,14 @@ from ..engine import timing as timing_mod
 from ..errors import not_found
 from ..pixtool import find_pixtool
 from ..results import ToolResult
-from ._common import PAGE_PARAMS, page_args, page_envelope, tool, with_session
+from ._common import (
+    PAGE_PARAMS,
+    page_args,
+    page_envelope,
+    pass_identity,
+    tool,
+    with_session,
+)
 
 _NOTE = (
     "Timing comes from a real GPU replay driven by `pixtool save-event-list --counters`, "
@@ -178,7 +185,11 @@ def event_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     "duration_ms": round(entry.duration_ms, 4),
                 },
                 "pass": (
-                    {"pass_index": pass_entry["pass_index"], "name": pass_entry["name"]}
+                    {
+                        "pass_index": pass_entry["pass_index"],
+                        "name": pass_entry["name"],
+                        **pass_identity(pass_entry),
+                    }
                     if pass_entry
                     else None
                 ),
@@ -224,6 +235,7 @@ def event_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 {
                     "pass_index": pass_entry["pass_index"],
                     "name": pass_entry["name"],
+                    **pass_identity(pass_entry),
                     "marker_path": pass_entry["marker_path"],
                     "measured_events": 0,
                     "duration_ns": 0,

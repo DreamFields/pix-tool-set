@@ -112,6 +112,9 @@ def analyze_overdraw(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     entry["depth_tested_draws"] += 1
             if draw.pass_name and draw.pass_name not in entry["passes"]:
                 entry["passes"].append(draw.pass_name)
+                # Pair each contributing pass with an addressable id, so a caller can
+                # jump straight to it in PIX instead of searching by name.
+                entry.setdefault("pass_queue_ids", []).append(draw.queue_id)
 
     min_draws = int(args.get("min_draws") or 2)
     rows = []
@@ -286,6 +289,11 @@ def analyze_bandwidth(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 key,
                 {
                     "pass_name": key,
+                    # Grouping is by name, so several distinct passes can share a row.
+                    # Quote the first contributing action's Queue ID so the row is still
+                    # addressable in the PIX UI rather than being a bare label.
+                    "queue_id": draw.queue_id,
+                    "first_draw_index": draw.index,
                     "write_bytes": 0,
                     "read_bytes": 0,
                     "draw_count": 0,
@@ -375,6 +383,10 @@ def analyze_state_changes(args: dict[str, Any], context: ToolContext) -> ToolRes
                 previous = draw.pso_id
         per_pass[name] = {
             "pass_name": name,
+            # See analyze-bandwidth: rows are keyed by name, so the first member's
+            # Queue ID is what makes the row addressable in PIX.
+            "queue_id": members[0].queue_id if members else None,
+            "first_draw_index": members[0].index if members else None,
             "event_count": len(members),
             "pipeline_state_switches": switches,
             "distinct_pipeline_states": len(

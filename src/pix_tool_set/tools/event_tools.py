@@ -13,6 +13,7 @@ from ._common import (
     PAGE_PARAMS,
     page_args,
     page_envelope,
+    pass_identity,
     tool,
     with_session,
 )
@@ -295,9 +296,9 @@ def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
                         {
                             "pass_index": pass_entry["pass_index"],
                             "name": pass_entry["name"],
+                            **pass_identity(pass_entry),
                             "marker_path": pass_entry["marker_path"],
                             "first_draw_index": pass_entry["first_draw_index"],
-                            "first_global_id": pass_entry["first_global_id"],
                         }
                         if pass_entry
                         else None
