@@ -54,44 +54,36 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if capture.event_csv is None:
         raise not_found("event list", "events.csv", "Re-open the session to export it.")
 
-    destination = timing_mod.timing_csv_path(
-        capture.event_csv.parent, capture.capture_path.stem
-    )
-    if destination.exists() and not args.get("force"):
-        table = timing_mod.TimingTable(destination)
-        return ToolResult.success(
-            {
-                "reused_cache": True,
-                "timing": table.to_dict(),
-                "hint": "Pass --force to re-export.",
-            }
-        )
-
-    report = timing_mod.export_timing_csv(
-        find_pixtool(),
-        capture.capture_path,
-        destination,
+    table, report = timing_mod.ensure_timing(
+        capture,
+        pixtool_exe=find_pixtool(),
         counters=str(args.get("counters") or timing_mod.TIMING_GLOB),
         timeout=int(args.get("timeout") or 1800),
+        force=bool(args.get("force")),
     )
-    if not report.get("ok"):
-        result = ToolResult.partial({"reused_cache": False, "export": report})
+    if table is None:
+        result = ToolResult.partial({"reused_cache": False, "measurement": report})
         result.degrade(
-            "pixtool could not export the counter-enriched event list; timing stays estimated.",
-            error=report.get("error"),
+            "pixtool could not export the counter-enriched event list; timing stays "
+            f"estimated: {report.get('reason')}",
             counters=report.get("counters"),
         )
         return result
 
-    capture.__dict__.pop("timing", None)
-    table = timing_mod.TimingTable(destination)
+    reused = report.get("source") == "cache"
     result = ToolResult.success(
-        {"reused_cache": False, "export": report, "timing": table.to_dict()}
+        {
+            "reused_cache": reused,
+            "export": report.get("export"),
+            "timing": table.to_dict(),
+            **({"hint": "Pass --force to re-export."} if reused else {}),
+        }
     )
     result.add_diagnostic(
         "info",
-        f"{table.measured_count:,} events now carry a measured duration from "
-        f"column '{table.timing_column}'.",
+        f"{table.measured_count:,} events carry a measured duration from "
+        f"column '{table.timing_column}'."
+        + ("" if reused else " pass-cost and event-timing now report real GPU time."),
     )
     return result
 
@@ -99,8 +91,8 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
 @tool(
     name="event-timing",
     summary=(
-        "Measured GPU duration per event or per pass, sorted by cost. Requires "
-        "export-timing to have been run once."
+        "Measured GPU duration per event or per pass, sorted by cost. Replays the capture "
+        "once to measure it if no cached measurement exists."
     ),
     category="performance",
     parameters=with_session(
@@ -113,6 +105,25 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
         global_id={"type": "integer", "description": "PIX GUI 'Global ID' to look up."},
         queue_id={"type": "integer", "description": "PIX GUI 'Queue ID' to look up."},
         pass_name={"type": "string", "description": "Restrict to passes matching this substring."},
+        no_measure={
+            "type": "boolean",
+            "description": (
+                "Never replay the capture; report only a cached measurement if one "
+                "exists. By default the capture is measured once when nothing is cached."
+            ),
+        },
+        force_measure={
+            "type": "boolean",
+            "description": "Re-run the timing replay even if a cached measurement exists.",
+        },
+        counters={
+            "type": "string",
+            "description": "Counter glob for the timing replay. Default '*Duration*'.",
+        },
+        timeout={
+            "type": "integer",
+            "description": "Seconds to allow for the timing replay. Default 1800.",
+        },
     ),
     returns="Measured durations in nanoseconds and milliseconds.",
     examples=[
@@ -124,12 +135,19 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def event_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    table = capture.timing
+    table, timing_report = timing_mod.ensure_timing(
+        capture,
+        counters=str(args.get("counters") or timing_mod.TIMING_GLOB),
+        timeout=int(args.get("timeout") or 1800),
+        force=bool(args.get("force_measure")),
+        allow_export=not args.get("no_measure"),
+    )
     if table is None:
-        result = ToolResult.partial({"available": False})
+        result = ToolResult.partial({"available": False, "measurement": timing_report})
         result.degrade(
-            "No measured timing available. Run `export-timing` once to produce it.",
-            remedy="pix-tool-set export-timing",
+            "No measured GPU timing is available: "
+            f"{timing_report.get('reason') or 'the capture carries no duration counters'}.",
+            remedy="pix-tool-set pass-cost --force-measure",
         )
         return result
 

@@ -5,16 +5,20 @@ from __future__ import annotations
 from typing import Any
 
 from ..context import ToolContext
+from ..engine import timing as timing_mod
 from ..engine.model import EventKind
 from ..errors import not_found
 from ..results import ToolResult
 from ._common import PAGE_PARAMS, page_args, page_envelope, percent, tool, with_session
 
 _TIMING_NOTE = (
-    "PIX GPU capture files do not carry per-pass wall-clock timings unless the capture "
-    "was taken with GPU counters. This tool therefore reports a workload-based cost "
-    "model (triangles, threads, pixel coverage, state changes) plus any counters that "
-    "were exported. Treat the ranking as relative cost, not milliseconds."
+    "Real per-pass GPU time comes from a counter-enriched replay driven by pixtool, not "
+    "from the capture file itself. `pass-cost` performs that replay on demand (roughly "
+    "100s on a 2.5 GB capture) and caches it next to the event list, so the first call "
+    "is slow and every later one is instant. Pass --no-measure to skip it and get the "
+    "workload cost model instead (triangles, threads, pixel coverage, state changes), "
+    "which is a relative ranking rather than milliseconds. Durations are per-event GPU "
+    "samples and passes nest, so shares do not sum to 100% of frame time."
 )
 
 
@@ -176,9 +180,8 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
 @tool(
     name="pass-cost",
     summary=(
-        "Relative cost estimate per render pass. Reports the workload model (triangles, "
-        "compute threads, pixel coverage, state churn) and any GPU counters present in "
-        "the event list."
+        "Measured GPU time per render pass, replaying the capture once if needed. Falls "
+        "back to a workload cost model when the capture cannot be measured."
     ),
     category="frame",
     parameters=with_session(
@@ -187,11 +190,37 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
         sort_by={
             "type": "string",
             "enum": ["measured", "cost", "triangles", "threads", "pixels", "order"],
-            "description": "Ordering. Default 'cost'.",
+            "description": (
+                "Ordering. Defaults to 'measured' when GPU time is available, else 'cost'."
+            ),
+        },
+        no_measure={
+            "type": "boolean",
+            "description": (
+                "Never replay the capture. A cached measurement is still used if one "
+                "exists; otherwise the workload cost model is reported. Use for an "
+                "answer that is always instant."
+            ),
+        },
+        force_measure={
+            "type": "boolean",
+            "description": "Re-run the timing replay even if a cached measurement exists.",
+        },
+        counters={
+            "type": "string",
+            "description": "Counter glob for the timing replay. Default '*Duration*'.",
+        },
+        timeout={
+            "type": "integer",
+            "description": "Seconds to allow for the timing replay. Default 1800.",
         },
     ),
-    returns="Per-pass cost breakdown with shares of the frame total.",
-    examples=["pix-tool-set pass-cost --limit 15"],
+    returns="Per-pass measured GPU duration and share of the frame, plus the cost model.",
+    examples=[
+        "pix-tool-set pass-cost --limit 15",
+        "pix-tool-set pass-cost --no-measure --limit 15",
+        "pix-tool-set pass-cost --force-measure",
+    ],
     notes=_TIMING_NOTE,
 )
 def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -248,8 +277,16 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if needle:
         rows = [row for row in rows if needle in row["name"].lower()]
 
-    # Prefer measured GPU time when the timing event list has been exported.
-    timing = capture.timing
+    # Measured GPU time is the whole point of a cost ranking, so make sure it exists
+    # rather than quietly answering with the model. By default the capture is replayed
+    # once (~100s) and cached, so later calls are instant; --no-measure opts out.
+    timing, timing_report = timing_mod.ensure_timing(
+        capture,
+        counters=str(args.get("counters") or timing_mod.TIMING_GLOB),
+        timeout=int(args.get("timeout") or 1800),
+        force=bool(args.get("force_measure")),
+        allow_export=not args.get("no_measure"),
+    )
     measured_total_ns = 0
     measured_passes = 0
     if timing is not None:
@@ -303,6 +340,7 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "measured_total_ms": (
                 round(measured_total_ns / 1_000_000.0, 3) if measured_total_ns else None
             ),
+            "measurement": timing_report,
             "timing_column": timing.timing_column if timing is not None else None,
             "total_cost_score": round(total_cost, 2),
             "passes": window,
@@ -311,14 +349,28 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
         }
     )
     if measured_passes:
+        if timing_report.get("source") == "replay":
+            result.add_diagnostic(
+                "info",
+                f"Replayed the capture in {timing_report.get('elapsed_seconds')}s to measure "
+                f"GPU time; the result is cached, so later calls are instant.",
+            )
         result.add_diagnostic(
             "info",
             f"{measured_passes} passes carry measured GPU time from "
             f"'{timing.timing_column}'; cost_score is kept for passes without a sample.",
         )
-    elif not counter_names:
+    else:
+        # Say why the answer is modelled, because the caller asked for cost and a
+        # silent switch of units is the failure mode worth avoiding here.
         result.degrade(
-            "No GPU counters in this capture, so timings are modelled rather than measured.",
-            hint="Run `export-timing` once to replay the capture and record real durations.",
+            "Reporting the workload estimate, not measured GPU time: "
+            f"{timing_report.get('reason') or 'no measurement is available'}.",
+            hint=(
+                "pix-tool-set pass-cost --force-measure"
+                if timing_report.get("source") == "none"
+                else None
+            ),
+            counters_in_capture=sorted(counter_names),
         )
     return result

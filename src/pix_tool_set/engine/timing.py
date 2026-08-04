@@ -119,6 +119,140 @@ def timing_csv_path(cache_dir: Path, capture_stem: str) -> Path:
     return Path(cache_dir) / f"{capture_stem}.events.timing.csv"
 
 
+def ensure_timing(
+    capture: Any,
+    *,
+    pixtool_exe: Path | None = None,
+    counters: str = TIMING_GLOB,
+    timeout: int = 1800,
+    force: bool = False,
+    allow_export: bool = True,
+) -> tuple[Optional["TimingTable"], dict[str, Any]]:
+    """Return the capture's measured timing, exporting it first if necessary.
+
+    This exists so that *every* tool wanting real GPU time is self-sufficient.
+    Previously each one only read the cache (``capture.timing``) and degraded to an
+    estimate when it was absent, which meant `pass-cost` silently reported modelled
+    numbers until the user happened to know that `export-timing` had to be run first.
+    A tool that quietly answers with a different kind of number than the caller asked
+    for is worse than a slow one, so the export is now performed on demand.
+
+    Returns ``(table, report)`` and never raises: callers decide whether a missing
+    measurement is fatal or merely a degradation. ``report["ok"]`` distinguishes the
+    two outcomes, and ``report["reason"]`` explains a refusal in caller-facing terms.
+    """
+    report: dict[str, Any] = {"counters": counters}
+
+    if not force:
+        cached = capture.timing
+        if cached is not None:
+            report.update(
+                {
+                    "ok": True,
+                    "source": "cache",
+                    "path": str(cached.path),
+                    "measured_events": cached.measured_count,
+                }
+            )
+            return cached, report
+
+    if not allow_export:
+        report.update(
+            {
+                "ok": False,
+                "source": "none",
+                "reason": "measurement was not requested, so the estimate is used",
+            }
+        )
+        return None, report
+
+    # Both of these are hard requirements for a replay, and both fail in ways that
+    # are worth naming rather than reporting as a generic export failure.
+    if capture.event_csv is None:
+        report.update(
+            {
+                "ok": False,
+                "source": "none",
+                "reason": "this session has no event list, so there is nothing to enrich",
+            }
+        )
+        return None, report
+    if capture.capture_path is None or not Path(capture.capture_path).exists():
+        report.update(
+            {
+                "ok": False,
+                "source": "none",
+                "reason": (
+                    "the .wpix capture is not available to this session, so it cannot "
+                    "be replayed to measure GPU time"
+                ),
+            }
+        )
+        return None, report
+
+    if pixtool_exe is None:
+        located = getattr(capture, "pixtool", None)
+        if located is None:
+            report.update(
+                {
+                    "ok": False,
+                    "source": "none",
+                    "reason": (
+                        "pixtool.exe was not found, so the capture cannot be replayed; "
+                        "install Microsoft PIX or set PIXTOOL_PATH"
+                    ),
+                }
+            )
+            return None, report
+        pixtool_exe = located.exe
+
+    destination = timing_csv_path(capture.event_csv.parent, capture.capture_path.stem)
+    export = export_timing_csv(
+        pixtool_exe,
+        capture.capture_path,
+        destination,
+        counters=counters,
+        timeout=timeout,
+    )
+    report["export"] = export
+    if not export.get("ok"):
+        report.update(
+            {
+                "ok": False,
+                "source": "none",
+                "reason": export.get("error") or "pixtool could not export the counters",
+            }
+        )
+        return None, report
+
+    # The capture caches `timing`, so drop it or the fresh CSV stays invisible.
+    capture.__dict__.pop("timing", None)
+    table = capture.timing
+    if table is None:
+        report.update(
+            {
+                "ok": False,
+                "source": "none",
+                "reason": (
+                    "the replay completed but produced no usable duration column, so "
+                    "there is nothing to measure with"
+                ),
+            }
+        )
+        return None, report
+
+    report.update(
+        {
+            "ok": True,
+            "source": "replay",
+            "path": str(table.path),
+            "measured_events": table.measured_count,
+            "elapsed_seconds": export.get("elapsed_seconds"),
+        }
+    )
+    return table, report
+
+
 def export_timing_csv(
     pixtool_exe: Path,
     capture: Path,
