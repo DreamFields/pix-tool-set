@@ -29,6 +29,7 @@ from .model import (
     PipelineState,
     Resource,
     ResourceKind,
+    RootParameterKind,
     Shader,
     ShaderStage,
     View,
@@ -532,6 +533,44 @@ class Capture:
             ):
                 entry[key] = sorted(set(entry[key]))
         return usage
+
+    @cached_property
+    def descriptor_coverage(self) -> dict[str, Any]:
+        """How much of the frame's descriptor data actually came back.
+
+        ``resource_usage`` is built entirely from the views a draw resolves, so a capture
+        whose descriptor writes were not recovered yields empty read/write lists that look
+        exactly like "nothing in the frame touches this resource". That ambiguity cost real
+        debugging time once: a UAV was reported as consumed by nobody when in truth the
+        export's ``ModifyDescriptors_*.cpp`` had simply never been parsed. Publishing the
+        coverage lets a caller say "no data" instead of asserting a negative.
+        """
+        tables = 0
+        tables_with_views = 0
+        for draw in self.draw_calls:
+            for binding in draw.bindings:
+                if binding.kind is not RootParameterKind.DESCRIPTOR_TABLE:
+                    continue
+                tables += 1
+                if binding.resolved_views:
+                    tables_with_views += 1
+        resolved = sum(1 for view in self.views.values() if view.resource_id is not None)
+        return {
+            "descriptors_parsed": len(self.views),
+            "descriptors_with_resource": resolved,
+            "descriptor_tables_bound": tables,
+            "descriptor_tables_with_views": tables_with_views,
+            "tables_empty": tables - tables_with_views,
+            "coverage_percent": (
+                round(100.0 * tables_with_views / tables, 2) if tables else 0.0
+            ),
+            "usage_is_complete": tables > 0 and tables_with_views == tables,
+            "caveat": (
+                "resource_usage is derived from resolved descriptors. Where a table "
+                "resolved to no views, an empty read/write list means the data is missing, "
+                "not that the frame leaves the resource untouched."
+            ),
+        }
 
     # ==================================================================
     # lookups

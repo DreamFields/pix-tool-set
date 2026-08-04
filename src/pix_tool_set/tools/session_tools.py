@@ -302,7 +302,12 @@ def capture_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
             if resources_bin.exists()
             else 0,
             "command_list_files": len(list(export_dir.glob("CommandLists*.cpp"))),
+            # Counted separately because `Descriptors*.cpp` does not match
+            # `ModifyDescriptors_*.cpp`, and those hold the descriptor writes that are
+            # actually live at a draw. Reporting only the first number made an export
+            # look fully accounted for while half the descriptor data went unmentioned.
             "descriptor_files": len(list(export_dir.glob("Descriptors*.cpp"))),
+            "modify_descriptor_files": len(list(export_dir.glob("ModifyDescriptors*.cpp"))),
         },
         "counts": {
             "events": len(capture.events),
@@ -314,6 +319,9 @@ def capture_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "root_signatures": len(capture.root_signatures),
             "shaders": len(capture.shaders),
         },
+        # Says whether resource_usage can be read as fact. An empty read/write list means
+        # "not recorded" rather than "untouched" when coverage is short of 100%.
+        "descriptor_coverage": capture.descriptor_coverage,
         "capabilities": {
             "event_list": bool(capture.events),
             "shader_disassembly": capture.disassembly_available,
@@ -324,4 +332,11 @@ def capture_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     result = ToolResult.success(data)
     if not capture.events:
         result.degrade("No event list in this session; run `session-open --force` to add one.")
+    coverage = data["descriptor_coverage"]
+    if coverage["descriptor_tables_bound"] and not coverage["usage_is_complete"]:
+        result.degrade(
+            f"{coverage['tables_empty']} of {coverage['descriptor_tables_bound']} descriptor "
+            "tables resolved to no views, so resource_usage is incomplete for the resources "
+            "they address: an empty read/write list there means unrecorded, not untouched."
+        )
     return result
