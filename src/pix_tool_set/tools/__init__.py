@@ -22,6 +22,7 @@ def load_builtin_tools() -> None:
     from . import resource_texture_tools  # noqa: F401
     from . import source_tools  # noqa: F401
     from . import shader_edit_tools  # noqa: F401
+    from . import shader_diff_tools  # noqa: F401
     from . import uav_slice_tools  # noqa: F401
     from . import uav_readback_tools  # noqa: F401
     from . import value_tools  # noqa: F401
