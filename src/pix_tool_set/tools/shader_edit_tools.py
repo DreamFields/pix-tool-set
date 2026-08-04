@@ -60,8 +60,18 @@ def _pdb_dirs(context: ToolContext, args: dict[str, Any]) -> list[Path]:
     if supplied:
         return supplied
     try:
-        record = context.store.get(args.get("session"))
+        # `resolve`, not `get`: without an explicit --session the name is None, which no
+        # registered session is ever called, so `get` would discard what
+        # session-set-pdb-dirs stored. `resolve` falls back to the active session, which
+        # is the one every other command in this toolkit operates on.
+        record = context.store.resolve(
+            session=args.get("session"),
+            capture_path=args.get("capture"),
+            export_dir=args.get("export_dir"),
+        )
     except Exception:
+        # No session at all is not an error here: the caller may still pass --pdb-dirs,
+        # and the tool reports the missing directories itself with a better message.
         return []
     if record is None:
         return []

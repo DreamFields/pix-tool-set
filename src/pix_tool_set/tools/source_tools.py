@@ -37,8 +37,16 @@ _NOTE = (
 def _default_pdb_dirs(context: ToolContext, args: dict[str, Any]) -> list[Path]:
     """Symbol directories saved on the session by session-set-pdb-dirs."""
     try:
-        record = context.store.get(args.get("session"))
+        # `resolve`, not `get`: with no explicit --session the name is None, and `get`
+        # matches by name only, so the stored directories would never be found. `resolve`
+        # falls back to the active session the way every other command does.
+        record = context.store.resolve(
+            session=args.get("session"),
+            capture_path=args.get("capture"),
+            export_dir=args.get("export_dir"),
+        )
     except Exception:
+        # Having no session is not fatal: this tool degrades to DXIL disassembly.
         return []
     if record is None:
         return []
@@ -303,11 +311,14 @@ def pass_shader_source(args: dict[str, Any], context: ToolContext) -> ToolResult
     notes=_NOTE,
 )
 def session_set_pdb_dirs(args: dict[str, Any], context: ToolContext) -> ToolResult:
-    record = context.store.get(args.get("session"))
-    if record is None:
-        raise not_found(
-            "session", args.get("session") or "<active>", "Run session-open first."
-        )
+    # `resolve`, not `get`: `get(None)` never matches, so this command could not target
+    # the active session, which is the one the user means when no --session is given.
+    # It raises a structured session_not_found/session_missing error instead of returning
+    # None, and the CLI renders that as the error payload, so no local guard is needed.
+    # Only the name is forwarded, as in session-close: this command writes the record
+    # back, and resolving by --capture can synthesise a record for a capture that was
+    # never opened, which `put` would then register as a real session.
+    record = context.store.resolve(session=args.get("session"))
 
     if args.get("clear"):
         record.shader_pdb_dirs = []
