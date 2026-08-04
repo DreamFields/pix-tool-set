@@ -72,9 +72,15 @@ class Capture:
 
     @cached_property
     def views(self) -> dict[tuple[int, int], View]:
+        # Only CommandLists_*.cpp is passed in here. Descriptors_*.cpp and
+        # ModifyDescriptors_*.cpp are collected inside parse_descriptors, which
+        # owns their relative order -- ModifyDescriptors must be applied after
+        # the Descriptors filler, and the inline Create*View calls in the command
+        # lists after both. Numeric ordering (via sorted_group rather than a bare
+        # glob) keeps the last-write-wins result reproducible across platforms.
         extra = [
             path
-            for path in self.export_dir.glob("CommandLists*.cpp")
+            for path in cppparse.sorted_group(self.export_dir, "CommandLists")
             if path.exists()
         ]
         return cppparse.parse_descriptors(self.export_dir, extra)

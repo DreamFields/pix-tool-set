@@ -3,6 +3,7 @@
 Passes:
   1. parse_resources         CreateAndInitResources_*.cpp  -> Resource
   2. parse_descriptors       Descriptors_*.cpp             -> View
+                             ModifyDescriptors_*.cpp       (override, see below)
   3. parse_pipeline_states   CreatePSOs.cpp                -> PipelineState + Shader
   4. parse_root_signatures   FrameResources_*.cpp          -> RootSignature
   5. CommandListParser       CommandLists_*.cpp            -> DrawCall
@@ -399,11 +400,72 @@ _VIEW_KIND = {
 }
 
 
+def descriptor_source_files(root: Path, extra_files: Iterable[Path] = ()) -> list[Path]:
+    """Every file that writes descriptors, in the order the frame writes them.
+
+    ORDER IS LOAD-BEARING -- do not sort this list or reshuffle the groups.
+    parse_descriptors keys views by (heap_id, heap_index) and lets a later write
+    replace an earlier one, so file order *is* the override policy:
+
+      1. ``Descriptors_*.cpp``        PIX's initialisation filler. It populates
+                                      the whole heap up front, so almost every
+                                      slot has a value here -- usually a stale
+                                      one that no draw ever reads.
+      2. ``ModifyDescriptors_*.cpp``  the descriptors PIX rewrites so they are
+                                      correct *at the draw/dispatch that uses
+                                      them*. These MUST come after group 1, or
+                                      the filler wins and tables decode to the
+                                      wrong resources (or to nothing at all,
+                                      reported as trust=unavailable/filler).
+      3. ``extra_files``              caller-supplied, normally
+                                      ``CommandLists_*.cpp``, whose inline
+                                      Create*View calls happen last of all.
+
+    Concretely, on Tiled.wpix heap 32: slots 416290 and 416292 are written by
+    Descriptors_031.cpp (rid 786 / 631) and rewritten by ModifyDescriptors_000.cpp
+    (rid 753 / 769). Getting the order backwards silently yields the 786/631
+    pair, which looks plausible but is wrong -- so those two slots double as a
+    regression probe.
+
+    ``sorted_group(root, "Descriptors")`` globs ``Descriptors_*.cpp``, which does
+    NOT match ``ModifyDescriptors_000.cpp`` (fnmatch anchors the whole basename),
+    hence the separate group rather than a widened prefix. If you touch this,
+    re-check that assumption directly, e.g.::
+
+        [p.name for p in sorted_group(root, "Descriptors")
+         if p.name.startswith("Modify")]   # must be []
+
+    Widening the prefix instead would also change parse_resources
+    (``CreateAndInitResources``), parse_root_signatures (``FrameResources``) and
+    CommandListParser (``CommandLists``), which all share sorted_group.
+    """
+    files = list(sorted_group(root, "Descriptors"))
+    files += list(sorted_group(root, "ModifyDescriptors"))
+    files += list(extra_files)
+    # De-duplicate on the last occurrence so a repeated path keeps its latest
+    # (highest-priority) position instead of being pinned to the earliest one.
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in reversed(files):
+        resolved = Path(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    unique.reverse()
+    return unique
+
+
 def parse_descriptors(
     root: Path, extra_files: Iterable[Path] = ()
 ) -> dict[tuple[int, int], View]:
+    """Build the (heap_id, heap_index) -> View map for the whole export.
+
+    Later writes intentionally overwrite earlier ones (see the assignment at the
+    bottom of the loop); descriptor_source_files defines that precedence.
+    """
     views: dict[tuple[int, int], View] = {}
-    files = list(sorted_group(root, "Descriptors")) + list(extra_files)
+    files = descriptor_source_files(root, extra_files)
     for path in files:
         if not path.exists():
             continue
@@ -442,6 +504,11 @@ def parse_descriptors(
                 source_line=lineno,
             )
             if heap_id is not None and heap_index is not None:
+                # Last write wins. A heap slot is legitimately written many
+                # times across the export, and the *latest* write is the one
+                # the shader sees, so this must stay an unconditional assign --
+                # do not turn it into setdefault(). The file iteration order set
+                # up by descriptor_source_files is what makes that correct.
                 views[(heap_id, heap_index)] = view
     return views
 
