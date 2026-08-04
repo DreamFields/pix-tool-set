@@ -400,6 +400,48 @@ class ShaderDisassembler:
 # --------------------------------------------------------------------------
 _BIND_ID = re.compile(r"(?:CB|T|U|S)\d+")
 
+# The Type column of dxc's binding table draws from a small fixed vocabulary. Listed
+# longest-first so prefix matching cannot stop early on a shorter word that happens to
+# be a prefix of a longer one.
+_BIND_TYPE_WORDS = (
+    "SamplerComparison",
+    "structbuf",
+    "byteaddr",
+    "cbuffer",
+    "tbuffer",
+    "texture",
+    "sampler",
+    "UAV",
+    "ROV",
+)
+
+
+def _split_glued_type(token: str) -> list[str]:
+    """Separate a Type cell from a Format cell that overflowed into it.
+
+    dxc renders this table with fixed column widths and pads with a *minimum* of one
+    space, so a value wider than its column swallows the separator and arrives glued to
+    its neighbour. ``unorm_f32`` is 9 characters in a 7-character Format column, which
+    is why ``RWDownsampledWorldNormal2x2`` reaches us as::
+
+        ; RWDownsampledWorldNormal2x2           UAVunorm_f32          2d      U7 ...
+
+    Splitting on whitespace alone then reports ``type="UAVunorm_f32"`` and shifts every
+    later cell one column left, so the register was described as ``format="2d"`` with an
+    empty dimension.
+
+    Slicing by the widths in the table's rule line is not an alternative: the Name column
+    overflows too (``ForwardLightStruct_NumCulledLightsGrid`` is 38 characters in a
+    30-character column), which shifts every following column on that row. Anchoring on
+    the unambiguous ID cell and ungluing by vocabulary is stable against both.
+    """
+    for word in _BIND_TYPE_WORDS:
+        if token == word:
+            return [token]
+        if token.startswith(word):
+            return [word, token[len(word) :]]
+    return [token]
+
 
 def parse_resource_bindings(disassembly: str) -> list[dict[str, Any]]:
     """Read the ``; Resource Bindings:`` table emitted by dxc."""
@@ -435,12 +477,21 @@ def parse_resource_bindings(disassembly: str) -> list[dict[str, Any]]:
         if bind_id is None:
             break
         position = parts.index(bind_id)
+
+        # Cells left of the ID are Name, Type, Format and Dim. ID, HLSL Bind and Count
+        # are narrow enough never to overflow, so only this side can be glued. A head
+        # shorter than four cells is the signal that it happened; attempting the split
+        # unconditionally could damage a well-formed row whose name ends in "UAV".
+        head = parts[:position]
+        if 2 <= len(head) < 4:
+            head = [head[0]] + _split_glued_type(head[1]) + head[2:]
+
         rows.append(
             {
-                "name": parts[0],
-                "type": parts[1] if len(parts) > 1 else "",
-                "format": parts[2] if position > 2 else "",
-                "dimension": parts[3] if position > 3 else "",
+                "name": head[0],
+                "type": head[1] if len(head) > 1 else "",
+                "format": head[2] if len(head) > 2 else "",
+                "dimension": head[3] if len(head) > 3 else "",
                 "id": bind_id,
                 "hlsl_bind": parts[position + 1] if len(parts) > position + 1 else "",
                 "count": parts[position + 2] if len(parts) > position + 2 else "",
