@@ -230,6 +230,20 @@ def _configure_and_build(
     return steps
 
 
+# ----------------------------------------------------------------------
+# Public aliases for the build pipeline.
+#
+# read-uav has to build the very same export with the very same two environment
+# traps handled, so it reuses these rather than growing a second copy that would
+# drift. They are exposed as aliases instead of being renamed so that nothing in
+# this module's own behaviour changes.
+export_root = _export_root
+supply_winpixruntime = _supply_winpixruntime
+repair_nupkgs = _repair_nupkgs
+configure_and_build = _configure_and_build
+run_command = _run
+
+
 def _await_window(pid: int, deadline: float, min_pixels: int) -> screencap.WindowInfo | None:
     """Poll for a window with a usable client area, restoring it if minimised."""
     while time.time() < deadline:
