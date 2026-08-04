@@ -553,7 +553,11 @@ def _patch_export(capture, draw, shader, blob: bytes, dxil_path: Path) -> dict[s
         )
 
     marker = f"// pix-tool-set: {stage} replaced by shader-edit-apply"
-    if marker in text:
+    # Search the function body, not the whole file. The marker names only the stage, so
+    # looking in `text` meant one patched PSO blocked every later patch of the same stage
+    # anywhere in the export: patching CS of 3255 made CS of 3241 report already_patched
+    # even though 3241 was untouched. `body` is the slice for this function alone.
+    if marker in body:
         raise PixToolError(
             code="already_patched",
             message=f"{function} was already patched for {stage}.",
