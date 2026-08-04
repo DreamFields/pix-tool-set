@@ -102,10 +102,39 @@ class SessionStore:
     def get(self, name: str) -> Optional[SessionRecord]:
         payload = self._load()
         raw = payload["sessions"].get(name)
+        if raw is None:
+            resolved = self._match_name(payload, name)
+            raw = payload["sessions"].get(resolved) if resolved else None
         return SessionRecord(**raw) if raw else None
+
+    @staticmethod
+    def _match_name(payload: dict[str, Any], name: str) -> str | None:
+        """Resolve a session name case-insensitively.
+
+        Session names default to the capture's file stem, and Windows paths are not
+        case-sensitive, so `Tiled.wpix` is just as legitimately referred to as
+        ``tiled``. Requiring the exact casing turns a correct request into
+        "No session named 'tiled'", which reads as "the session is gone" rather than
+        "type it differently".
+
+        An exact match always wins; this is only consulted when that fails. An
+        ambiguous fold (two sessions differing only by case) is left unresolved so
+        the caller gets the explicit not-found error listing both, rather than a
+        silent guess between them.
+        """
+        folded = name.casefold()
+        matches = [key for key in payload["sessions"] if key.casefold() == folded]
+        return matches[0] if len(matches) == 1 else None
 
     def put(self, record: SessionRecord, *, make_active: bool = True) -> SessionRecord:
         payload = self._load()
+        # Reuse the stored spelling of an equivalent name. Letting both "Tiled" and
+        # "tiled" exist would make every case-insensitive lookup ambiguous, so the
+        # first spelling registered wins and re-opening updates it in place.
+        if record.name not in payload["sessions"]:
+            existing = self._match_name(payload, record.name)
+            if existing is not None:
+                record.name = existing
         payload["sessions"][record.name] = record.to_dict()
         if make_active:
             payload["active"] = record.name
@@ -116,6 +145,11 @@ class SessionStore:
         payload = self._load()
         entry = payload["sessions"].get(name)
         if entry is None:
+            # Mirror `get`: a name that resolved for reading must also resolve here,
+            # or the session would load fine yet never become the active one.
+            name = self._match_name(payload, name) or name
+            entry = payload["sessions"].get(name)
+        if entry is None:
             return
         entry["last_used_at"] = time.time()
         payload["active"] = name
@@ -123,6 +157,8 @@ class SessionStore:
 
     def remove(self, name: str) -> bool:
         payload = self._load()
+        if name not in payload["sessions"]:
+            name = self._match_name(payload, name) or name
         existed = payload["sessions"].pop(name, None) is not None
         if payload.get("active") == name:
             remaining = sorted(
