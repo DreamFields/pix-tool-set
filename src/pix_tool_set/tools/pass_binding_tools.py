@@ -59,6 +59,24 @@ def _classify_table(binding, declared_counts: dict[str, int]) -> dict[str, Any]:
     elif binding.table_confidence == "exact" and expected and len(views) >= expected:
         trust = "reliable"
         reason = "Table is fully bounded and slot count matches the shader declaration."
+    elif (
+        binding.table_confidence == "bounded"
+        and expected
+        and len(views) >= expected
+        and len(rids) >= expected
+    ):
+        # `bounded` only means the walk stopped before the root parameter's full span,
+        # which is the normal case when a root signature declares more slots than the
+        # shader uses: UE5 declares 16 UAVs here and the shader binds 8, so stopping at
+        # the 9th is correct rather than uncertain. Once the walk yielded one distinct
+        # resource per declared register, the mapping is as confirmed as `exact` is, and
+        # grouping it with genuinely unconfirmed reconstructions told the caller to
+        # distrust an answer that is in fact sound.
+        trust = "reliable"
+        reason = (
+            f"Table stopped at the shader's {expected} declared register(s), each resolving "
+            "to a distinct resource; the root signature simply reserves a wider span."
+        )
     else:
         trust = "partial"
         reason = (
