@@ -420,7 +420,21 @@ def read_uav(args: dict[str, Any], context: ToolContext) -> ToolResult:
     injection = uavprobe.install(root)
     data["probe_injection"] = injection
     try:
-        if args.get("skip_build"):
+        # `--skip-build` is only meaningful when the executable already contains the
+        # probe. If it was injected just now, the built exe predates it and the replay
+        # cannot produce a dump, so honouring the flag would burn a full settle window
+        # to arrive at a guaranteed-empty result. Build instead and say why.
+        skip_build = bool(args.get("skip_build"))
+        downgraded = skip_build and bool(injection.get("rebuild_needed"))
+        if downgraded:
+            skip_build = False
+            diagnostics.append((
+                "warning",
+                "--skip-build was ignored: the readback probe had to be injected just "
+                "now, so the existing executable does not contain it and would produce "
+                "no dump. The project was built instead.",
+            ))
+        if skip_build:
             executables = sorted(
                 (root / "build" / "Release").glob("*.exe"), key=lambda p: -p.stat().st_size
             )
@@ -432,17 +446,14 @@ def read_uav(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 )
             data["build"] = {"skipped": True, "executable": str(executables[0])}
             exe = executables[0]
-            if injection.get("rebuild_needed"):
-                diagnostics.append((
-                    "warning",
-                    "--skip-build was given but the probe had to be injected just now, "
-                    "so the existing executable does not contain it and will produce no "
-                    "dump. Re-run without --skip-build.",
-                ))
         else:
             steps = configure_and_build(
                 root, generator, timeout, bool(args.get("force_reconfigure")), args
             )
+            if downgraded:
+                steps["skip_build_ignored"] = (
+                    "the probe was injected during this run, so a build was required"
+                )
             data["build"] = steps
             exe = Path(steps["executable"])
 

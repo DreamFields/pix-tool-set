@@ -562,21 +562,22 @@ def shader_edit_diff(args: dict[str, Any], context: ToolContext) -> ToolResult:
     data["probe_injection"] = injection
     patch_restored: bool | None = None
     try:
-        if args.get("skip_build"):
-            if injection.get("rebuild_needed"):
-                raise PixToolError(
-                    code="probe_not_built",
-                    message=(
-                        "--skip-build was given but the readback probe had to be injected "
-                        "just now, so the existing executable cannot produce a dump."
-                    ),
-                    stage="build",
-                    paths=[str(root)],
-                    suggestion=(
-                        "Re-run without --skip-build. Refusing here rather than after two "
-                        "replays that would both come back empty."
-                    ),
-                )
+        # `--skip-build` only holds when the probe is already compiled in. Injected just
+        # now means the existing exe predates it, and both replays would come back empty.
+        # Build instead of refusing: the caller's intent is a diff, and a build is the
+        # only way to get one.
+        skip_build = bool(args.get("skip_build"))
+        downgraded = skip_build and bool(injection.get("rebuild_needed"))
+        if downgraded:
+            skip_build = False
+            diagnostics.append((
+                "warning",
+                "--skip-build was ignored: the readback probe had to be injected just "
+                "now, so the existing executable cannot produce a dump. The project was "
+                "built instead, rather than running two replays that would both come "
+                "back empty.",
+            ))
+        if skip_build:
             executables = sorted(
                 (root / "build" / "Release").glob("*.exe"), key=lambda p: -p.stat().st_size
             )
@@ -592,6 +593,10 @@ def shader_edit_diff(args: dict[str, Any], context: ToolContext) -> ToolResult:
             steps = configure_and_build(
                 root, generator, timeout, bool(args.get("force_reconfigure")), args
             )
+            if downgraded:
+                steps["skip_build_ignored"] = (
+                    "the probe was injected during this run, so a build was required"
+                )
             data["build"] = steps
             exe = Path(steps["executable"])
         data["build"]["serves_both_sides"] = (
