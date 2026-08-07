@@ -6,12 +6,20 @@ Passes:
                              ModifyDescriptors_*.cpp       (override, see below)
   3. parse_pipeline_states   CreatePSOs.cpp                -> PipelineState + Shader
   4. parse_root_signatures   FrameResources_*.cpp          -> RootSignature
+  4b. parse_command_signatures FrameResources_*.cpp        -> CommandSignature
   5. CommandListParser       CommandLists_*.cpp            -> DrawCall
 
 The command-list pass is a state machine: it replays the emitted D3D12 calls in
 order, tracking the currently bound PSO / root signature / descriptor heaps /
 render targets / vertex+index buffers / root arguments, and snapshots that state
 at every draw or dispatch.  That snapshot is what PIX shows for a selected draw.
+
+ExecuteIndirect needs the command-signature pass to be snapshotted correctly.
+Its indirect argument buffer only supplies the thread-group / vertex counts; the
+root signature and every descriptor table are still set with ordinary
+Set*Root* calls right before it, exactly like a direct dispatch. Which of the
+two binding sets applies (compute vs graphics) is decided by the command
+signature's D3D12_INDIRECT_ARGUMENT_TYPE, hence parse_command_signatures.
 """
 
 from __future__ import annotations
@@ -854,6 +862,140 @@ def parse_root_signatures(root: Path) -> dict[int, RootSignature]:
 
 
 # --------------------------------------------------------------------------
+# 4b. command signatures
+# --------------------------------------------------------------------------
+# A command signature says what an ExecuteIndirect actually launches. Without it
+# an ExecuteIndirect is just an opaque API call: the pipeline type it drives
+# (graphics vs compute) is not visible at the call site, yet it decides which of
+# the two independent root-binding sets on the command list the shader sees.
+_RE_INDIRECT_ARG_TYPE = re.compile(
+    r"argumentDescs\[(\d+)\]\.Type\s*=\s*D3D12_INDIRECT_ARGUMENT_TYPE_(\w+)"
+)
+_RE_CMDSIG_STRIDE = re.compile(r"commandSignatureDesc\.ByteStride\s*=\s*(\d+)")
+_RE_CREATE_CMDSIG = re.compile(
+    r"CreateAndTrackCommandSignature\(\s*(\d+)\s*,\s*GetRootSignature\((\d+)\)"
+)
+
+# The argument type that terminates the command, i.e. the one that decides
+# whether the indirect call is a draw or a dispatch. Everything else in a
+# signature (root constants, VB/IB views, ...) only patches state beforehand.
+_INDIRECT_DISPATCH_TYPES = {"DISPATCH", "DISPATCH_RAYS", "DISPATCH_MESH"}
+_INDIRECT_DRAW_TYPES = {"DRAW", "DRAW_INDEXED"}
+
+_INDIRECT_TYPE_TO_KIND: dict[str, EventKind] = {
+    "DISPATCH": EventKind.DISPATCH,
+    "DISPATCH_MESH": EventKind.DISPATCH,
+    "DISPATCH_RAYS": EventKind.DISPATCH_RAYS,
+    "DRAW": EventKind.DRAW,
+    "DRAW_INDEXED": EventKind.DRAW,
+}
+
+
+@dataclass(slots=True)
+class CommandSignature:
+    """One ``CreateAndTrackCommandSignature`` block from FrameResources_*.cpp."""
+
+    api_id: int
+    argument_types: list[str] = field(default_factory=list)
+    byte_stride: int = 0
+    root_signature_id: Optional[int] = None
+    source_file: str = ""
+    source_line: int = 0
+
+    @property
+    def command_type(self) -> str:
+        """The terminating argument type, e.g. ``DISPATCH`` or ``DRAW_INDEXED``."""
+        for name in reversed(self.argument_types):
+            if name in _INDIRECT_DISPATCH_TYPES or name in _INDIRECT_DRAW_TYPES:
+                return name
+        return ""
+
+    @property
+    def is_compute(self) -> bool:
+        """True when ExecuteIndirect with this signature consumes compute bindings.
+
+        DISPATCH_MESH is deliberately excluded: mesh shaders are dispatched, but
+        the amplification/mesh stages live on the *graphics* pipeline and read
+        the graphics root arguments, so treating it as compute would snapshot the
+        wrong binding set.
+        """
+        return self.command_type in ("DISPATCH", "DISPATCH_RAYS")
+
+    @property
+    def event_kind(self) -> Optional[EventKind]:
+        return _INDIRECT_TYPE_TO_KIND.get(self.command_type)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command_signature_id": self.api_id,
+            "command_type": self.command_type,
+            "argument_types": list(self.argument_types),
+            "byte_stride": self.byte_stride,
+            "root_signature_id": self.root_signature_id,
+            "is_compute": self.is_compute,
+            "source": f"{self.source_file}:{self.source_line}",
+        }
+
+
+def parse_command_signatures(root: Path) -> dict[int, CommandSignature]:
+    """Map command-signature ApiObjectId -> CommandSignature.
+
+    The blocks sit in the same FrameResources_*.cpp files as the root
+    signatures, shaped like::
+
+        // ApiObjectId     = 3346
+        {
+            static D3D12_INDIRECT_ARGUMENT_DESC argumentDescs[1] = {};
+            argumentDescs[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+            ...
+            CreateAndTrackCommandSignature(3346, GetRootSignature(0), ...);
+        }
+
+    Argument descs accumulate until the CreateAndTrack call closes the block, so
+    a signature with several argument descs (root constants plus a draw, say) is
+    captured in declaration order and ``command_type`` picks the terminator.
+    """
+    signatures: dict[int, CommandSignature] = {}
+    for path in sorted_group(root, "FrameResources"):
+        if not path.exists():
+            continue
+        pending: dict[int, str] = {}
+        stride = 0
+        block_start = 0
+        for lineno, line in iter_lines(path):
+            if _RE_API_ID.search(line):
+                pending = {}
+                stride = 0
+                block_start = lineno
+                continue
+
+            match = _RE_INDIRECT_ARG_TYPE.search(line)
+            if match:
+                pending[int(match.group(1))] = match.group(2)
+                continue
+
+            match = _RE_CMDSIG_STRIDE.search(line)
+            if match:
+                stride = int(match.group(1))
+                continue
+
+            match = _RE_CREATE_CMDSIG.search(line)
+            if match:
+                api_id = int(match.group(1))
+                signatures[api_id] = CommandSignature(
+                    api_id=api_id,
+                    argument_types=[pending[k] for k in sorted(pending)],
+                    byte_stride=stride,
+                    root_signature_id=int(match.group(2)),
+                    source_file=path.name,
+                    source_line=block_start or lineno,
+                )
+                pending = {}
+                stride = 0
+    return signatures
+
+
+# --------------------------------------------------------------------------
 # 5. command lists -> draw calls
 # --------------------------------------------------------------------------
 _RE_CL_FUNC = re.compile(r"^void\s+PopulateCommandList_([\d_]+)\s*\(")
@@ -915,10 +1057,14 @@ class CommandListParser:
         views: dict[tuple[int, int], View] | None = None,
         root_signatures: dict[int, RootSignature] | None = None,
         default_table_span: int = 8,
+        command_signatures: dict[int, CommandSignature] | None = None,
+        pipeline_states: dict[int, PipelineState] | None = None,
     ) -> None:
         self.root = Path(root)
         self.views = views or {}
         self.root_signatures = root_signatures or {}
+        self.command_signatures = command_signatures or {}
+        self.pipeline_states = pipeline_states or {}
         self.default_table_span = default_table_span
         self.draw_calls: list[DrawCall] = []
         self._marker_stack: list[str] = []
@@ -1246,6 +1392,45 @@ class CommandListParser:
                 return view.resource_id
         return state["inline_dsv_res"]
 
+    def _consumes_compute_bindings(
+        self,
+        kind: EventKind,
+        api: str,
+        state: dict,
+        command_signature: "CommandSignature | None",
+    ) -> bool:
+        """Decide which of the two root-binding sets this action reads.
+
+        A command list carries graphics and compute root arguments completely
+        independently, so picking the wrong set does not degrade gracefully -- it
+        reports an empty binding list, which reads as "this action binds nothing"
+        and is indistinguishable from a real missing binding.
+
+        Dispatch / DispatchRays are unambiguously compute and DispatchMesh is
+        unambiguously graphics. ExecuteIndirect is the one case that cannot be
+        decided at the call site: identical C++ drives either pipeline depending
+        on the command signature's argument type, which lives in
+        FrameResources_*.cpp. Resolving it there is the fix; the fallbacks below
+        only cover exports where that block is missing.
+        """
+        if kind in (EventKind.DISPATCH, EventKind.DISPATCH_RAYS):
+            return True
+        if api != "ExecuteIndirect":
+            return False
+
+        if command_signature is not None:
+            return command_signature.is_compute
+
+        # No command signature parsed. Prefer the PSO, which knows its own
+        # pipeline type, over guessing from the API name.
+        pso = self.pipeline_states.get(state["pso"]) if state["pso"] is not None else None
+        if pso is not None:
+            return pso.is_compute
+        # Last resort: only one of the two sets was ever bound on this list.
+        if state["compute_rootsig"] is not None and state["gfx_rootsig"] is None:
+            return True
+        return False
+
     def _emit_draw(
         self,
         path: Path,
@@ -1258,7 +1443,12 @@ class CommandListParser:
         argtext: str,
     ) -> None:
         kind = DRAW_APIS[api]
-        is_compute = kind in (EventKind.DISPATCH, EventKind.DISPATCH_RAYS)
+        command_signature: CommandSignature | None = None
+        if api == "ExecuteIndirect":
+            ids = _ints(argtext)
+            command_signature = self.command_signatures.get(ids[0]) if ids else None
+
+        is_compute = self._consumes_compute_bindings(kind, api, state, command_signature)
         active_rootsig = state["compute_rootsig"] if is_compute else state["gfx_rootsig"]
         source = state["compute_bindings"] if is_compute else state["gfx_bindings"]
 
@@ -1325,6 +1515,16 @@ class CommandListParser:
             indirect = _RE_INDIRECT_BUFFER.search(argtext)
             if indirect:
                 draw.indirect_argument_buffer = indirect.group(1)
+            if len(numbers) >= 2:
+                draw.indirect_max_command_count = numbers[1]
+            if command_signature is not None:
+                draw.command_signature_id = command_signature.api_id
+                draw.indirect_command_type = command_signature.command_type
+                draw.indirect_byte_stride = command_signature.byte_stride
+                # The counts themselves live in GPU memory and are only known at
+                # execution time; the type tells the caller which fields the
+                # indirect argument buffer holds.
+                draw.indirect_arguments_are_gpu_resident = True
 
         self.draw_calls.append(draw)
 

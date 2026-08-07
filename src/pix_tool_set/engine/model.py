@@ -640,6 +640,14 @@ class DrawCall:
     viewports: list[dict[str, Any]] = field(default_factory=list)
     scissor_rects: list[dict[str, Any]] = field(default_factory=list)
     indirect_argument_buffer: Optional[str] = None
+    # Set only for ExecuteIndirect. The command signature is what makes an
+    # indirect call interpretable: it names the pipeline type being launched and
+    # therefore which root bindings above are the ones the shader reads.
+    command_signature_id: Optional[int] = None
+    indirect_command_type: str = ""
+    indirect_byte_stride: int = 0
+    indirect_max_command_count: int = 0
+    indirect_arguments_are_gpu_resident: bool = False
 
     _capture: Any = field(default=None, repr=False)
 
@@ -684,6 +692,23 @@ class DrawCall:
     @property
     def marker(self) -> str:
         return " / ".join(self.marker_path)
+
+    @property
+    def launches_compute(self) -> bool:
+        """Whether this action reads the compute root bindings.
+
+        ExecuteIndirect can be either, and only the command signature knows
+        which; ``indirect_command_type`` carries that answer through from the
+        parser. DispatchMesh dispatches but runs on the graphics pipeline, so it
+        is deliberately not compute here.
+        """
+        if self.kind is EventKind.DISPATCH_RAYS:
+            return True
+        if self.kind is EventKind.DISPATCH:
+            return self.api != "DispatchMesh"
+        if self.kind is EventKind.EXECUTE_INDIRECT:
+            return self.indirect_command_type in ("DISPATCH", "DISPATCH_RAYS")
+        return False
 
     # -- views ----------------------------------------------------------
     def views(self, kind: ViewKind | str | None = None) -> list[View]:
@@ -828,6 +853,19 @@ class DrawCall:
                 self.thread_group_z,
             ]
             payload["thread_count"] = self.thread_count
+        elif self.kind is EventKind.EXECUTE_INDIRECT:
+            # Counts come out of the indirect argument buffer on the GPU, so
+            # reporting zeros as if they were vertex/triangle counts would be a
+            # false negative. Report what is actually known instead.
+            payload["indirect"] = {
+                "command_signature_id": self.command_signature_id,
+                "command_type": self.indirect_command_type,
+                "launches_compute": self.launches_compute,
+                "max_command_count": self.indirect_max_command_count,
+                "byte_stride": self.indirect_byte_stride,
+                "argument_buffer": self.indirect_argument_buffer,
+                "counts_resolved_on_gpu": self.indirect_arguments_are_gpu_resident,
+            }
         else:
             payload["vertex_or_index_count"] = self.vertex_or_index_count
             payload["instance_count"] = self.instance_count

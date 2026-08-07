@@ -103,6 +103,17 @@ class Capture:
         return cppparse.parse_root_signatures(self.export_dir)
 
     @cached_property
+    def command_signatures(self) -> dict[int, cppparse.CommandSignature]:
+        """Command signatures, needed to interpret every ExecuteIndirect.
+
+        Without these an ExecuteIndirect cannot be told apart from a graphics one,
+        and the parser would snapshot the graphics root bindings for what is
+        really a dispatch -- reporting zero SRVs/UAVs/CBVs for a compute pass
+        that in fact binds several.
+        """
+        return cppparse.parse_command_signatures(self.export_dir)
+
+    @cached_property
     def shaders(self) -> list[Shader]:
         out: list[Shader] = []
         for pso in self.pipeline_states.values():
@@ -112,7 +123,11 @@ class Capture:
     @cached_property
     def draw_calls(self) -> list[DrawCall]:
         parser = cppparse.CommandListParser(
-            self.export_dir, self.views, self.root_signatures
+            self.export_dir,
+            self.views,
+            self.root_signatures,
+            command_signatures=self.command_signatures,
+            pipeline_states=self.pipeline_states,
         )
         calls = parser.parse()
         for call in calls:

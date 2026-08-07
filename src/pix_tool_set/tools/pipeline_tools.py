@@ -186,20 +186,57 @@ def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     max_views = int(args.get("max_views") or 128)
     pso = draw.pipeline_state
     signature = capture.root_signatures.get(draw.root_signature_id or -1)
-
-    return ToolResult.success(
-        {
-            "draw_call": draw.to_dict(detail=True, max_views=max_views),
-            "pipeline_state": pso.to_dict(detail=True) if pso else None,
-            "root_signature": signature.to_dict() if signature else None,
-            "event": draw.event.to_dict(detail=True) if draw.event else None,
-            "resource_summary": {
-                "distinct_resources": len(draw.resources()),
-                "buffers": len(draw.buffers),
-                "textures": len(draw.textures),
-            },
-        }
+    command_signature = (
+        capture.command_signatures.get(draw.command_signature_id)
+        if draw.command_signature_id is not None
+        else None
     )
+
+    data = {
+        "draw_call": draw.to_dict(detail=True, max_views=max_views),
+        "pipeline_state": pso.to_dict(detail=True) if pso else None,
+        "root_signature": signature.to_dict() if signature else None,
+        "command_signature": command_signature.to_dict() if command_signature else None,
+        "binding_set": "compute" if draw.launches_compute else "graphics",
+        "event": draw.event.to_dict(detail=True) if draw.event else None,
+        "resource_summary": {
+            "distinct_resources": len(draw.resources()),
+            "buffers": len(draw.buffers),
+            "textures": len(draw.textures),
+        },
+    }
+
+    result = ToolResult.success(data)
+
+    if draw.kind is EventKind.EXECUTE_INDIRECT:
+        if command_signature is None:
+            result.degrade(
+                "No command signature found for this ExecuteIndirect, so the pipeline "
+                "type was inferred from the bound PSO. Bindings may belong to the other "
+                "root-argument set; check FrameResources_*.cpp was exported."
+            )
+        else:
+            result.add_diagnostic(
+                "info",
+                f"ExecuteIndirect via command signature {command_signature.api_id} "
+                f"({command_signature.command_type}); bindings come from the "
+                f"{data['binding_set']} root arguments. Thread group / vertex counts live "
+                "in the indirect argument buffer and are only known on the GPU.",
+            )
+
+    # An unresolved Queue ID is a hole in the exported event list, not a missing
+    # binding. Saying so keeps the two failure modes from being confused: the
+    # bindings above are read from the C++ export and stay valid either way.
+    if draw.queue_id is None:
+        result.add_diagnostic(
+            "warning",
+            f"No Queue ID for this action (global_id={draw.global_id}): the exported "
+            "event list has no row for it, which happens when the capture spans several "
+            "command queues and the CSV covers only one. Bindings come from the C++ "
+            "export and are unaffected; select this action by draw_index.",
+        )
+
+    return result
 
 
 @tool(
