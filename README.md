@@ -171,15 +171,16 @@ pix-tool-set find-pass --name TileClassificationBuildLists               # 只�
 
 ## 八、用 PIX GUI 的 Global ID / Queue ID 定位
 
-PIX GUI 事件列表里每行有两个 id，本工具集都能直接接受，不需要先换算成 `draw_index`：
+导出的事件列表 CSV 里每行有两个 id，工具都能直接接受，不需要先换算成 `draw_index`：
 
-| GUI 列 | 覆盖范围 | 说明 |
+| 列 | 覆盖范围 | 说明 |
 |---|---|---|
 | `Global ID` | 仅 action（draw/dispatch/copy 等），本截帧 5,334 / 22,155 行 | 在 GUI 里选中一次 draw 就能看到 |
-| `Queue ID` | **每一行都有**，22,155 / 22,155 | 唯一全量主键，marker（pass 行）只有这个 |
+| `Queue ID` | 导出 CSV 的每一行都有，22,155 / 22,155 行 | marker（pass 行）只有这个 id |
+| `draw_index` | **全部 2,786 个 action** | 工具自己的序号，来自 C++ 导出，跨队列完整 |
 
-所以查 pass 时只能用 `Queue ID`：pass 的标记行本身没有 Global ID。工具**只接受
-`--queue-id` 作为事件选择器**，`global_id` 仅在返回数据中报告，供与 GUI 交叉核对。
+查 pass 的标记行时只能用 `Queue ID`，因为 marker 没有 Global ID。`global_id` 仅在返回
+数据中报告，不接受作为输入。
 
 ```powershell
 pix-tool-set find-pass --queue-id 18704        # -> pass TileClassificationMark
@@ -187,14 +188,54 @@ pix-tool-set pass-bindings --queue-id 18704    # 直接出 shader 绑定
 pix-tool-set event-timing --queue-id 18704     # 直接出实测耗时
 ```
 
+### 多队列边界：为什么主选择器是 `draw_index`
+
+**`Queue ID` 只覆盖被导出的那一个 command queue。** 事件列表 CSV 是按队列导出的，本截帧
+导出的是 22,155 行的那一个队列；提交到其他队列（典型是 Lumen 的 async compute）的 action
+在 CSV 里**根本没有对应行**，因此 `queue_id` 为 `null`。实测：2,786 个 action 里有 **90 个**
+（分布在 **72 个 pass**）没有 `Queue ID`。这不是解析缺陷，是导出范围的边界。
+
+所以 `draw_index` 是跨队列的主选择器，`queue_id` 只是已导出队列上的便捷别名：
+
+```powershell
+pix-tool-set find-pass --name "CompactTraces WaveOps"     # queue_id 为 null，但给出 draw_index
+pix-tool-set locate-event --pass-name "CompactTraces WaveOps"   # -> draw_index 2671
+pix-tool-set draw-state --draw-index 2671                 # 绑定数据完整，与队列无关
+```
+
+绑定、PSO、资源等数据都来自 C++ 导出，**不受这个边界影响**；缺的只是"用事件列表 id 称呼
+它"这一种寻址方式。所有会回报 `queue_id` 的工具在其为 `null` 时都会给出明确说明
+（`queue_id_unavailable` 字段或 `diagnostics` 里的一条），而不是丢一个裸 `null`。
+
+### ⚠️ 不要把 PIX GUI 里的 Queue ID 直接抄进来
+
+导出 CSV 的 `Queue ID` 实测**恒等于行号**（`qids == range(0, 22155)`）。这意味着任何小于
+行数的整数都能命中*某一行*：从多队列截帧的 PIX GUI 里抄一个 Queue ID 传进来，工具**不会
+报错**，而是会安静地返回另一个不相干事件的数据。这是目前最危险的用法。
+
+工具能做的只是在**未命中**时把话说清楚，并区分两种情况：
+
+```powershell
+pix-tool-set draw-state --queue-id 99999
+#   -> The exported event list has 22155 rows and none carries this id.
+pix-tool-set draw-state --queue-id 3893
+#   -> Row 3893 of the exported event list is 'IASetVertexBuffers', which is not an action.
+```
+
+两条错误都会附上"该列就是行号，优先用 draw_index"的提示。命中错行时无法检测，所以规则很
+简单：**跨队列截帧上一律用 `draw_index` 或 pass 名**，`--queue-id` 只用于工具自己输出过的 id。
+
 `find-pass` 返回里同时给出 `global_id`、`queue_id`、`marker_queue_id`（pass 标记自身的
-Queue ID）和 `draw_index`，四者互通，可用于和 GUI 交叉核对。
+Queue ID）和 `draw_index`，可用于和 GUI 交叉核对。
 
 ### CSV 是否需要改？
 
 不需要加列 —— `Queue ID`、`Parent`、`Name`、`Global ID` 四列已经够了，`Parent` 链就是
 权威的 marker 层级。真正值得做的是**另外导出一份带 GPU 计数器的事件列表**（见第九章），
-因为基础 CSV 不含耗时。
+因为基础 CSV 不含耗时。若要消除上面那 90 个 action 的 `queue_id` 空缺，唯一正确的办法是
+**把其余队列的事件列表也导出**；用"每队列内序号"之类的假设去反推 id 已被实测否决（队列 1
+按记录调用数算出 102,136 行，而事件列表只有 22,155 行），推算出来的 id 会指向错误的行，
+比诚实的 `null` 更糟。
 
 ## 九、实测 GPU 耗时（可选，一次性）
 

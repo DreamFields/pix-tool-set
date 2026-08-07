@@ -285,6 +285,14 @@ def pass_values(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "values_unavailable": unavailable,
         },
     }
+    # Same reasoning as source_tools: a null id is a gap in the event list export, and
+    # saying so keeps it from being read as a failure to resolve the pass. The values
+    # themselves come from the C++ export and are unaffected.
+    if data["queue_id"] is None:
+        data["queue_id_unavailable"] = (
+            "This pass has no row in the exported event list, which covers a single "
+            "command queue. Address it by pass_index or draw_index."
+        )
 
     if stale or unavailable:
         result = ToolResult.partial(data)

@@ -108,8 +108,9 @@ def list_pipeline_states(args: dict[str, Any], context: ToolContext) -> ToolResu
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event to take the PSO from. This id is present "
-                "on every row of the PIX event list."
+                "Exported event list 'Queue ID' of the event to take the PSO from. "
+                "Convenience alias only; prefer draw_index, which also addresses actions "
+                "on queues whose event list was not exported."
             ),
         },
     ),
@@ -127,9 +128,8 @@ def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
         if draw.pso_id is None:
             raise not_found(
                 "pipeline state",
-                f"queue_id={args['queue_id']}"
-                if args.get("queue_id") is not None
-                else f"draw_index={args.get('draw_index')}",
+                f"draw_index={draw.index}",
+                "This action binds no pipeline state; check draw-state for what it does.",
             )
         pso_id = draw.pso_id
 

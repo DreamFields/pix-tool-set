@@ -8,13 +8,47 @@ from typing import Any
 from ..context import ToolContext
 from ..engine.model import EventKind, ViewKind, format_bits_per_pixel
 from ..results import ToolResult
-from ._common import PAGE_PARAMS, page_args, page_envelope, percent, tool, with_session
+from ._common import (
+    PAGE_PARAMS,
+    QUEUE_ID_IS_ROW_ORDER,
+    page_args,
+    page_envelope,
+    percent,
+    queue_id_coverage,
+    tool,
+    with_session,
+)
 
 _ESTIMATE_NOTE = (
     "These figures are derived statically from the captured command stream (bound targets, "
     "draw arguments, resource descriptors). They are estimates for ranking and comparison, "
     "not hardware measurements. Use a PIX timing capture for measured numbers."
 )
+
+
+def _note_queue_id_gaps(result: ToolResult, capture) -> None:
+    """Say so when rows in this report quote a Queue ID that some actions do not have.
+
+    These reports aggregate by pass name and quote one Queue ID per row purely so the row
+    is addressable. On a multi-queue capture that id is null for every pass the exported
+    event list never covered, and a null id in an otherwise confident table reads as a
+    parser bug rather than as a known gap in the export. The counts come from the C++
+    export and are complete either way, so only the addressing is degraded.
+    """
+    coverage = queue_id_coverage(capture)
+    if not coverage["event_list_is_single_queue"]:
+        return
+    result.add_diagnostic(
+        "info",
+        f"{coverage['draws_without_queue_id']} of {coverage['draw_count']} actions "
+        f"(in {coverage['passes_without_queue_id']} passes) have no Queue ID because the "
+        "exported event list covers a single command queue; their rows carry a null "
+        f"queue_id and must be addressed by draw_index. {QUEUE_ID_IS_ROW_ORDER}",
+        **{
+            key: coverage[key]
+            for key in ("draws_without_queue_id", "passes_without_queue_id")
+        },
+    )
 
 
 @tool(
@@ -113,8 +147,12 @@ def analyze_overdraw(args: dict[str, Any], context: ToolContext) -> ToolResult:
             if draw.pass_name and draw.pass_name not in entry["passes"]:
                 entry["passes"].append(draw.pass_name)
                 # Pair each contributing pass with an addressable id, so a caller can
-                # jump straight to it in PIX instead of searching by name.
+                # jump straight to it in PIX instead of searching by name. The Queue ID
+                # is None for a pass whose queue was not exported, so a draw_index goes
+                # alongside it: a list of nulls would name passes the caller then has no
+                # way to open.
                 entry.setdefault("pass_queue_ids", []).append(draw.queue_id)
+                entry.setdefault("pass_draw_indices", []).append(draw.index)
 
     min_draws = int(args.get("min_draws") or 2)
     rows = []
@@ -180,6 +218,7 @@ def analyze_overdraw(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "info",
             f"{unbounded_total} draw(s) had no viewport or scissor recorded; their coverage is bounded heuristically.",
         )
+    _note_queue_id_gaps(result, capture)
     return result
 
 
@@ -291,7 +330,10 @@ def analyze_bandwidth(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     "pass_name": key,
                     # Grouping is by name, so several distinct passes can share a row.
                     # Quote the first contributing action's Queue ID so the row is still
-                    # addressable in the PIX UI rather than being a bare label.
+                    # addressable in the PIX UI rather than being a bare label. It is
+                    # None when that queue's event list was not exported, which is why
+                    # first_draw_index is reported next to it as the selector that always
+                    # resolves.
                     "queue_id": draw.queue_id,
                     "first_draw_index": draw.index,
                     "write_bytes": 0,
@@ -316,7 +358,7 @@ def analyze_bandwidth(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     total = len(rows)
     window = rows[offset : offset + limit] if limit else rows[offset:]
-    return ToolResult.success(
+    result = ToolResult.success(
         {
             "group_by": group_by,
             "totals": {
@@ -329,6 +371,9 @@ def analyze_bandwidth(args: dict[str, Any], context: ToolContext) -> ToolResult:
             **page_envelope(total, offset, limit, len(window)),
         }
     )
+    if group_by != "resource":
+        _note_queue_id_gaps(result, capture)
+    return result
 
 
 @tool(
@@ -384,7 +429,8 @@ def analyze_state_changes(args: dict[str, Any], context: ToolContext) -> ToolRes
         per_pass[name] = {
             "pass_name": name,
             # See analyze-bandwidth: rows are keyed by name, so the first member's
-            # Queue ID is what makes the row addressable in PIX.
+            # Queue ID is what makes the row addressable in PIX, and first_draw_index
+            # carries that addressing for passes with no exported event list row.
             "queue_id": members[0].queue_id if members else None,
             "first_draw_index": members[0].index if members else None,
             "event_count": len(members),
@@ -437,7 +483,7 @@ def analyze_state_changes(args: dict[str, Any], context: ToolContext) -> ToolRes
 
     total = len(rows)
     window = rows[offset : offset + limit] if limit else rows[offset:]
-    return ToolResult.success(
+    result = ToolResult.success(
         {
             "frame_totals": {
                 "events": len(draws),
@@ -454,3 +500,5 @@ def analyze_state_changes(args: dict[str, Any], context: ToolContext) -> ToolRes
             **page_envelope(total, offset, limit, len(window)),
         }
     )
+    _note_queue_id_gaps(result, capture)
+    return result

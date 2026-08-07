@@ -11,9 +11,11 @@ from ..pixtool import find_pixtool
 from ..results import ToolResult
 from ._common import (
     PAGE_PARAMS,
+    QUEUE_ID_IS_ROW_ORDER,
     page_args,
     page_envelope,
     pass_identity,
+    queue_id_coverage,
     tool,
     with_session,
 )
@@ -109,7 +111,14 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "enum": ["event", "pass"],
             "description": "Report individual events or aggregate per pass. Default pass.",
         },
-        queue_id={"type": "integer", "description": "PIX GUI 'Queue ID' to look up."},
+        queue_id={
+            "type": "integer",
+            "description": (
+                "Exported event list 'Queue ID' to look up. Only events whose queue was "
+                "exported have one; do not copy this id out of the PIX GUI on a "
+                "multi-queue capture."
+            ),
+        },
         pass_name={"type": "string", "description": "Restrict to passes matching this substring."},
         no_measure={
             "type": "boolean",
@@ -161,10 +170,24 @@ def event_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if queue_id is not None:
         entry = table.lookup(queue_id=queue_id)
         if entry is None:
+            # A timing miss has two causes and the caller needs to tell them apart: the
+            # id may name no row at all, or it may name a row that simply carries no
+            # counter sample. Reporting the row's own name also catches the multi-queue
+            # trap, where an id copied from the PIX GUI lands on an unrelated event.
+            event = capture.event_by_queue_id(int(queue_id))
+            if event is None:
+                raise not_found(
+                    "timing",
+                    f"queue_id={queue_id}",
+                    f"No such row in the exported event list ({len(capture.events)} rows). "
+                    + QUEUE_ID_IS_ROW_ORDER,
+                )
             raise not_found(
                 "timing",
                 f"queue_id={queue_id}",
-                "That event carries no counter sample in this capture.",
+                f"Row {queue_id} of the exported event list is {event.name!r}, and it "
+                "carries no counter sample in this capture. "
+                + QUEUE_ID_IS_ROW_ORDER,
             )
         event = capture.resolve_event(queue_id=entry.queue_id)
         pass_entry = capture.find_pass_by_event(queue_id=entry.queue_id)
@@ -264,4 +287,18 @@ def event_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
         "Durations are per-event GPU samples; overlapping async work means the sum can "
         "exceed wall-clock frame time.",
     )
+    # The timing table is keyed by the exported event list's rows, so anything on a queue
+    # that was never exported is absent rather than zero. Left unsaid, a missing Lumen
+    # async pass reads as "free" instead of "not measured", which is the wrong conclusion
+    # to draw from an empty row.
+    coverage = queue_id_coverage(capture)
+    if coverage["event_list_is_single_queue"]:
+        result.add_diagnostic(
+            "warning",
+            f"Timing covers only the exported command queue: {coverage['draws_without_queue_id']} "
+            f"of {coverage['draw_count']} actions (in {coverage['passes_without_queue_id']} "
+            "passes) have no event list row and therefore no measurement here. Their "
+            "absence is missing data, not zero cost. " + QUEUE_ID_IS_ROW_ORDER,
+            actions_without_measurement=coverage["draws_without_queue_id"],
+        )
     return result

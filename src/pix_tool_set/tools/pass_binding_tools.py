@@ -19,6 +19,7 @@ from ._common import (
     PASS_SELECTOR,
     page_args,
     page_envelope,
+    pass_identity,
     resolve_pass,
     tool,
     with_session,
@@ -314,8 +315,9 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID'; works for markers as well as actions. This is the "
-                "only event id accepted as input, though Global ID is still reported."
+                "Exported event list row id, for a marker or an action alike. Only passes "
+                "on the exported queue have one; --name reaches every pass and is the "
+                "way in when a pass is missing from the event list."
             ),
         },
     ),
@@ -330,7 +332,7 @@ def find_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
     offset, limit = page_args(args, default_limit=25)
 
     def row(entry: dict[str, Any]) -> dict[str, Any]:
-        return {
+        payload = {
             "pass_index": entry["pass_index"],
             "name": entry["name"],
             "marker_path": entry["marker_path"],
@@ -345,6 +347,13 @@ def find_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "dispatch_count": entry["dispatch_count"],
             "pso_ids": entry["pso_ids"],
         }
+        # find-pass exists to hand out identifiers, so it is the one place a null id is
+        # most likely to be read as "this pass is broken". Borrow the shared explanation
+        # rather than leaving the caller to infer why two of the four ids are empty.
+        identity = pass_identity(entry)
+        if "queue_id_unavailable" in identity:
+            payload["queue_id_unavailable"] = identity["queue_id_unavailable"]
+        return payload
 
     queue_id = args.get("queue_id")
     if queue_id is not None:

@@ -193,7 +193,10 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of any row inside a pass. Reports just that pass."
+                "Exported event list 'Queue ID' of any row inside a pass. Reports just "
+                "that pass. Available for the exported queue only; pass_name reaches the "
+                "rest."
+
             ),
         },
         sort_by={

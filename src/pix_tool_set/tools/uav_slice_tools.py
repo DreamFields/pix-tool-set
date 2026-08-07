@@ -167,9 +167,9 @@ def _read_uint_field(capture, draw, cbuffer: dict, field: dict) -> int | None:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the pass. Present on every row of the PIX event "
-                "list, and the only event id accepted as input; Global ID is reported in "
-                "the results only."
+                "Exported event list 'Queue ID' of the pass. Present on every row of that "
+                "export, which covers a single command queue; use draw_index for a pass "
+                "outside it. Global ID is reported in the results only."
             ),
         },
         draw_index={"type": "integer", "description": "Draw index of the pass."},

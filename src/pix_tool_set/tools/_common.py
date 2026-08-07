@@ -36,18 +36,20 @@ DRAW_SELECTOR: dict[str, Any] = {
     "draw_index": {
         "type": "integer",
         "description": (
-            "Zero-based index into the draw call list (see list-draw-calls). This is the "
-            "only selector that works for actions on a queue the exported event list "
-            "does not cover, since those have no Queue ID."
+            "Zero-based index into the draw call list (see list-draw-calls). Primary "
+            "selector: it addresses every action in the capture, and it is the only one "
+            "that works for actions on a queue the exported event list does not cover, "
+            "since those have no Queue ID at all."
         ),
     },
     "queue_id": {
         "type": "integer",
         "description": (
-            "PIX GUI 'Queue ID' of the event. This is the single event identifier the "
-            "toolkit accepts: it is present on every row of the PIX event list, so it "
-            "also addresses pass markers. Global ID is reported in results but is not "
-            "accepted as input."
+            "Row identifier from the exported event list, usable only for events whose "
+            "own queue is covered by that export; it is absent for the rest. Not "
+            "interchangeable with the 'Queue ID' column shown in the PIX GUI on a "
+            "multi-queue capture. Global ID is reported in results but not accepted as "
+            "input."
         ),
     },
     # Queue qualifiers narrow an id, they do not locate on their own -- a queue
@@ -79,13 +81,93 @@ PASS_SELECTOR: dict[str, Any] = {
     "queue_id": {
         "type": "integer",
         "description": (
-            "PIX GUI 'Queue ID' of any row inside the pass, or of the pass marker "
-            "itself. This is the id visible on every PIX event list row."
+            "Exported event list row id of any event inside the pass, or of the pass "
+            "marker itself. Available only for passes on the exported queue; use "
+            "pass_index or pass_name to reach the others."
         ),
     },
 }
 
+# One sentence, reused wherever a Queue ID miss is reported, because the failure is
+# counter-intuitive enough that repeating it is cheaper than a support round trip: the
+# exported list numbers its rows sequentially, so any integer below the row count
+# resolves to *some* row. A Queue ID copied from the PIX GUI of a multi-queue capture is
+# therefore not rejected, it silently addresses an unrelated event.
+QUEUE_ID_IS_ROW_ORDER = (
+    "Note: in this export the Queue ID column is simply the row number of the event "
+    "list, so an id taken from the PIX GUI of a multi-queue capture will resolve to a "
+    "different event instead of failing. Prefer draw_index, which is unambiguous."
+)
 
+
+def queue_id_coverage(capture) -> dict[str, Any]:
+    """How much of the capture the exported event list can actually address.
+
+    Callers need this to phrase a missing Queue ID as a known gap in the export rather
+    than as a parse failure. The two are indistinguishable from a null field alone, and
+    reading a null as a bug sent one investigation down the wrong path entirely.
+
+    ``event_list_is_single_queue`` is inferred from actions that carry no row at all: if
+    even one exists, the export cannot be covering every queue the frame submitted to.
+    It is deliberately not derived from queue names, since attributing an action to a
+    queue is a separate problem this module does not attempt.
+    """
+    draws = capture.draw_calls
+    missing = [draw for draw in draws if draw.queue_id is None]
+    return {
+        "draw_count": len(draws),
+        "draws_without_queue_id": len(missing),
+        "draws_with_queue_id": len(draws) - len(missing),
+        "passes_without_queue_id": len({draw.pass_name for draw in missing}),
+        "event_list_rows": len(capture.events),
+        "event_list_is_single_queue": bool(missing),
+    }
+
+
+def note_missing_queue_id(result, draw, *, level: str = "warning") -> bool:
+    """Explain a null queue_id in terms of the queue that action actually ran on.
+
+    Lives here rather than in the one tool that needs it because a null queue_id is
+    not specific to draw-state: any payload quoting an id can hit it, and the
+    explanation has to stay identical everywhere or the two failure modes it
+    separates will get confused again.
+
+    The distinction worth preserving: a missing Queue ID means the exported event
+    list has no row for the action, not that the action or its bindings are
+    missing. Bindings come from the C++ export and are unaffected. Naming the
+    queue turns "we have no idea what this is" into "it ran on the compute queue,
+    whose event list was not exported", which is a fact the caller can act on --
+    and it names the selector that does work instead of leaving them to guess.
+
+    ``level`` exists because the same fact is a warning where the caller asked for
+    an id and an aside where they only asked "where am I": locate-event already
+    answers with the draw index, so flagging its own reply as degraded would be
+    noise. Returns whether a diagnostic was added, so a caller can decide what
+    else to say without re-testing the condition.
+    """
+    if draw.queue_id is not None:
+        return False
+
+    attribution = draw.queue_attribution
+    queue_name = attribution.get("queue_name") or "an unidentified queue"
+    queue_object_id = attribution.get("queue_object_id")
+    where = (
+        f"{queue_name} (queue object {queue_object_id})"
+        if queue_object_id is not None
+        else queue_name
+    )
+    result.add_diagnostic(
+        level,
+        f"No Queue ID for this action (draw_index={draw.index}, "
+        f"global_id={draw.global_id}). It ran on {where}, "
+        "and the exported event list does not cover that queue, so PIX never wrote a "
+        "Queue ID for it. The id cannot be derived: Queue ID is not a per-queue call "
+        "count, and a synthesised one would address a different row. Bindings and "
+        "counts read from the C++ export are unaffected -- select this action with "
+        f"draw_index={draw.index}.",
+        draw_index=draw.index,
+    )
+    return True
 
 
 def object_schema(
@@ -144,15 +226,21 @@ def percent(part: float, whole: float) -> float:
 # PIX identifiers
 # --------------------------------------------------------------------------
 def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a pass from a name, a pass index, or a PIX GUI Queue ID.
+    """Resolve a pass from a name, a pass index, or an exported-event-list Queue ID.
 
-    Queue ID is the toolkit's single event identifier. The PIX GUI also shows a Global
-    ID, but only for actions, so it cannot name a pass marker and cannot address every
-    row the user can see. Accepting both meant two ways to say the same thing, with one
-    of them silently unable to express half the cases; results still report Global ID
-    for cross-referencing.
+    Queue ID was originally the toolkit's single event identifier: it appears on every
+    row of the exported list, whereas Global ID appears only on actions and so cannot
+    name a pass marker. That reasoning still holds *within* one queue and is why Global
+    ID remains output-only.
 
-    An id wins over a name, because it is unambiguous while a name is a substring
+    What it missed is that the export covers a single command queue. Passes submitted to
+    another queue have no row at all, so an identifier defined by that list cannot be the
+    only way in -- on Tiled.wpix it leaves 74 passes unreachable. ``pass_index`` and
+    ``pass_name`` come from marker grouping in the C++ export, which sees every pass, so
+    they are the selectors that always work; Queue ID is now a convenience for the
+    exported queue.
+
+    An id still wins over a name, because it is unambiguous while a name is a substring
     match that can hit several passes.
     """
     from ..errors import invalid_argument, not_found
@@ -161,10 +249,21 @@ def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
     if queue_id is not None:
         entry = capture.find_pass_by_event(queue_id=queue_id)
         if entry is None:
+            row = capture.event_by_queue_id(int(queue_id))
+            if row is None:
+                raise not_found(
+                    "pass",
+                    f"queue_id={queue_id}",
+                    f"The exported event list has {len(capture.events)} rows and none "
+                    f"carries this id. Use list-passes or find-pass --name instead. "
+                    + QUEUE_ID_IS_ROW_ORDER,
+                )
             raise not_found(
                 "pass",
                 f"queue_id={queue_id}",
-                "Use locate-event to check the id, or list-passes to browse passes.",
+                f"Row {queue_id} of the exported event list is {row.name!r} and no marker "
+                f"encloses it. Use list-passes or find-pass --name instead. "
+                + QUEUE_ID_IS_ROW_ORDER,
             )
         return entry
 
@@ -199,7 +298,7 @@ def draw_selector_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
-    """Resolve a draw call from a Queue ID or a draw index, or raise.
+    """Resolve a draw call from a draw index or an exported-event-list Queue ID.
 
     Centralised so the "which event?" question has exactly one answer across the
     toolkit, and so the not-found error names the selector the caller actually used.
@@ -207,83 +306,82 @@ def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
     ``queue_name`` / ``queue_object_id`` are optional qualifiers on top of that id.
     They are forwarded verbatim; when absent this behaves exactly as before, which
     is why every existing caller needed no change.
-    """
-    from ..errors import not_found
 
+    The Queue ID failure is split into several messages because they call for opposite
+    reactions, and one of them is a trap. An id beyond the row count simply does not
+    exist. An id *within* the row count always names a row -- the column is row order in
+    this export -- so a miss means the row is a marker or a state-setting call rather
+    than an action, and, worse, a hit proves nothing about intent: an id lifted from the
+    PIX GUI of a multi-queue capture lands on an unrelated row and returns confident
+    data for the wrong event. Naming the row we landed on is the only way the caller can
+    notice, so the message quotes it. A queue qualifier is the one mechanism that can
+    reject such a cross-queue id instead of answering it, which is why the qualified
+    failure gets its own hint.
+    """
+    from ..errors import invalid_argument, not_found
+
+    draw_index = args.get("draw_index")
+    queue_id = args.get("queue_id")
     queue_name = args.get("queue_name")
     queue_object_id = args.get("queue_object_id")
+    if draw_index is None and queue_id is None:
+        raise invalid_argument(
+            "draw_index/queue_id",
+            "provide draw_index (addresses every action) or queue_id (exported queue only)",
+        )
+
     draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        queue_id=args.get("queue_id"),
+        draw_index=draw_index,
+        queue_id=queue_id,
         queue_name=queue_name,
         queue_object_id=queue_object_id,
     )
-    if draw is None:
-        selector = (
-            f"queue_id={args['queue_id']}"
-            if args.get("queue_id") is not None
-            else f"draw_index={args.get('draw_index')}"
+    if draw is not None:
+        return draw
+
+    qualifiers = [
+        f"{key}={value!r}"
+        for key, value in (
+            ("queue_name", queue_name),
+            ("queue_object_id", queue_object_id),
         )
-        qualifiers = [
-            f"{key}={value!r}"
-            for key, value in (
-                ("queue_name", queue_name),
-                ("queue_object_id", queue_object_id),
-            )
-            if value is not None
-        ]
+        if value is not None
+    ]
+
+    if queue_id is not None:
+        selector = f"queue_id={queue_id}"
         if qualifiers:
-            selector = f"{selector} on {', '.join(qualifiers)}"
-            hint = (
+            # The id may well name a real action -- just not on the queue asked for.
+            # Say that plainly, because the alternative is answering with the wrong
+            # queue's data, which is exactly what the qualifier exists to prevent.
+            raise not_found(
+                what,
+                f"{selector} on {', '.join(qualifiers)}",
                 "The id resolved to a draw on a different queue, or to nothing at all. "
                 "Run queue-attribution to see the queues and drop the queue restriction "
-                "to find out which one the id belongs to."
+                "to find out which one the id belongs to.",
             )
-        else:
-            hint = "Use list-draw-calls to find a valid Queue ID or draw index."
-        raise not_found(what, selector, hint)
-    return draw
+        row = capture.event_by_queue_id(int(queue_id))
+        if row is None:
+            raise not_found(
+                what,
+                selector,
+                f"The exported event list has {len(capture.events)} rows and none carries "
+                f"this id. " + QUEUE_ID_IS_ROW_ORDER,
+            )
+        raise not_found(
+            what,
+            selector,
+            f"Row {queue_id} of the exported event list is {row.name!r}, which is not an "
+            f"action, so no {what} corresponds to it. " + QUEUE_ID_IS_ROW_ORDER,
+        )
 
-
-def note_missing_queue_id(result, draw) -> bool:
-    """Explain a null queue_id in terms of the queue that action actually ran on.
-
-    Lives here rather than in the one tool that needs it because a null queue_id is
-    not specific to draw-state: any payload quoting an id can hit it, and the
-    explanation has to stay identical everywhere or the two failure modes it
-    separates will get confused again.
-
-    The distinction worth preserving: a missing Queue ID means the exported event
-    list has no row for the action, not that the action or its bindings are
-    missing. Bindings come from the C++ export and are unaffected. Naming the
-    queue turns "we have no idea what this is" into "it ran on the compute queue,
-    whose event list was not exported", which is a fact the caller can act on --
-    and it names the selector that does work instead of leaving them to guess.
-
-    Returns whether a diagnostic was added, so a caller can decide what else to
-    say without re-testing the condition.
-    """
-    if draw.queue_id is not None:
-        return False
-
-    attribution = draw.queue_attribution
-    queue_name = attribution.get("queue_name") or "an unidentified queue"
-    queue_object_id = attribution.get("queue_object_id")
-    where = (
-        f"{queue_name} (queue object {queue_object_id})"
-        if queue_object_id is not None
-        else queue_name
+    raise not_found(
+        what,
+        f"draw_index={draw_index}",
+        f"Valid draw indices are 0..{len(capture.draw_calls) - 1}. Run list-draw-calls "
+        "or find-draw-calls to locate one.",
     )
-    result.add_diagnostic(
-        "warning",
-        f"No Queue ID for this action (global_id={draw.global_id}). It ran on {where}, "
-        "and the exported event list does not cover that queue, so PIX never wrote a "
-        "Queue ID for it. The id cannot be derived: Queue ID is not a per-queue call "
-        "count, and a synthesised one would address a different row. Bindings above "
-        f"come from the C++ export and are unaffected -- select this action with "
-        f"draw_index={draw.index}.",
-    )
-    return True
 
 
 def pass_identity(entry: dict[str, Any]) -> dict[str, Any]:
@@ -299,11 +397,24 @@ def pass_identity(entry: dict[str, Any]) -> dict[str, Any]:
         selector for reading bindings, values or shaders.
       * ``marker_queue_id`` is the marker row that opens the pass. Markers carry no
         Global ID, so this is the only id addressing the pass row itself.
+
+    Both are null for a pass on a queue the export missed. A bare null there is
+    indistinguishable from a parsing failure, so ``queue_id_unavailable`` states the
+    reason and ``draw_index`` carries the selector that still works -- a caller should
+    never have to guess which of the two situations it is looking at.
     """
-    return {
+    identity = {
         "queue_id": entry.get("first_queue_id"),
         "marker_queue_id": entry.get("marker_queue_id"),
         "first_queue_id": entry.get("first_queue_id"),
         "last_queue_id": entry.get("last_queue_id"),
         "first_global_id": entry.get("first_global_id"),
+        "draw_index": entry.get("first_draw_index"),
     }
+    if identity["queue_id"] is None and identity["marker_queue_id"] is None:
+        identity["queue_id_unavailable"] = (
+            "This pass has no row in the exported event list, which covers a single "
+            "command queue. Address it by pass_index or draw_index."
+        )
+    return identity
+

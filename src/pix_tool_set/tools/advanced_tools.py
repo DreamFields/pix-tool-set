@@ -300,7 +300,8 @@ def analyze_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "type": "integer",
             "description": (
                 "PIX GUI 'Queue ID' of the event whose contents to sample. This id is "
-                "present on every row of the PIX event list."
+                "present only for events on the queue the event list export covers; use "
+                "draw_index for the rest."
             ),
         },
         depth={"type": "boolean", "description": "Sample the depth buffer."},
@@ -407,7 +408,7 @@ def sample_pixel_region(args: dict[str, Any], context: ToolContext) -> ToolResul
             "type": "integer",
             "description": (
                 "PIX GUI 'Queue ID' of the event to use instead of the coverage search. "
-                "This id is present on every row of the PIX event list."
+                "Present only for events on the exported queue; draw_index always works."
             ),
         },
         max_lines={"type": "integer", "description": "Disassembly lines to inline. Default 200."},

@@ -514,8 +514,9 @@ def texture_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event whose contents to capture. This id is "
-                "present on every row of the PIX event list."
+                "Exported event list 'Queue ID' of the event whose contents to capture. "
+                "Present only for events on the queue that export covers; use draw_index "
+                "or pass_name for the rest."
             ),
         },
         rtv={"type": "integer", "description": "Render target slot index. Default 0."},
@@ -691,8 +692,9 @@ def export_draw_textures(args: dict[str, Any], context: ToolContext) -> ToolResu
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event whose contents to read. This id is "
-                "present on every row of the PIX event list."
+                "Exported event list 'Queue ID' of the event whose contents to read. "
+                "Present only for events on the queue that export covers; use draw_index "
+                "or pass_name for the rest."
             ),
         },
         x={"type": "integer", "description": "Left edge. Default 0."},
@@ -786,8 +788,9 @@ def read_texture_pixels(args: dict[str, Any], context: ToolContext) -> ToolResul
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event whose contents to analyse. This id is "
-                "present on every row of the PIX event list."
+                "Exported event list 'Queue ID' of the event whose contents to analyse. "
+                "Present only for events on the queue that export covers; use draw_index "
+                "or pass_name for the rest."
             ),
         },
         x={"type": "integer", "description": "Region left edge."},
@@ -866,8 +869,9 @@ def texture_pixel_stats(args: dict[str, Any], context: ToolContext) -> ToolResul
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event whose contents to sample. This id is "
-                "present on every row of the PIX event list."
+                "Exported event list 'Queue ID' of the event whose contents to sample. "
+                "Present only for events on the queue that export covers; use draw_index "
+                "or pass_name for the rest."
             ),
         },
         depth={"type": "boolean", "description": "Sample the depth buffer."},
