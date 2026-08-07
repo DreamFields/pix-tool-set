@@ -497,9 +497,9 @@ def shader_edit_diff(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     if args.get("queue_id") is None and args.get("draw_index") is None:
         raise invalid_argument(
-            "queue_id",
+            "draw_index/queue_id",
             "the event says which PSO's patch to toggle, so it cannot be inferred from a "
-            "resource alone; pass --queue-id",
+            "resource alone; pass --draw-index (always available) or --queue-id",
         )
 
     draw = resolve_draw(capture, args, what="dispatch")

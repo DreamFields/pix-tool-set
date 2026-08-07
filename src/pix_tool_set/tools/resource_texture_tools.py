@@ -282,9 +282,9 @@ def _encode_png(pixels: bytearray, width: int, height: int) -> bytes:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' to take the target from. Present on every row of the "
-                "PIX event list, and the only event id accepted as input; Global ID is "
-                "reported in the results only."
+                "Exported event list 'Queue ID' to take the target from. Present on every "
+                "row of that export, which covers a single command queue; use pass_name "
+                "or pass_index otherwise. Global ID is reported in the results only."
             ),
         },
         pass_name={"type": "string", "description": "Pass name to take the target from."},

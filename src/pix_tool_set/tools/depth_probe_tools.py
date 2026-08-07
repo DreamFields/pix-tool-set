@@ -50,9 +50,10 @@ def _depth_events(capture, resource_id: int) -> list:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event to take the depth target from. Every row "
-                "of the PIX event list has one, so this is the only event id accepted as "
-                "input; Global ID is reported in the results only."
+                "Exported event list 'Queue ID' of the event to take the depth target "
+                "from. Every row of that export has one, but the export covers a single "
+                "command queue, so use draw_index for actions outside it; Global ID is "
+                "reported in the results only."
             ),
         },
         draw_index={"type": "integer", "description": "Take the depth target from this draw."},

@@ -254,6 +254,14 @@ def pass_shader_source(args: dict[str, Any], context: ToolContext) -> ToolResult
             "unavailable": "Neither source nor disassembly could be produced.",
         },
     }
+    # A null queue_id here means the pass sits on a queue the event list export missed,
+    # not that the shader lookup failed. The two look identical in the payload, and the
+    # shader data itself comes from the PDB and export, so it is unaffected.
+    if data["queue_id"] is None:
+        data["queue_id_unavailable"] = (
+            "This pass has no row in the exported event list, which covers a single "
+            "command queue. Address it by pass_index or draw_index."
+        )
 
     if tiers <= {"pdb-hlsl", "embedded-hlsl"}:
         result = ToolResult.success(data, output_paths=output_paths)

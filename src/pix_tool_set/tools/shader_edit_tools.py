@@ -91,7 +91,15 @@ def _resolve_shader(capture, args: dict[str, Any]):
             raise not_found(
                 "draw", draw_index, "Run list-draw-calls or find-draw-calls for valid indices."
             )
-        entry = capture.find_pass_by_event(queue_id=draw.queue_id)
+        # Match the enclosing pass on the marker path rather than on the draw's Queue ID.
+        # Going through the id loses the pass for any action whose queue was not in the
+        # exported event list: queue_id is None there, the lookup fails, and the edit fell
+        # back to a nameless minimal entry even though marker grouping knew the pass all
+        # along.
+        entry = next(
+            (p for p in capture.passes if tuple(p["marker_path"]) == draw.marker_path),
+            None,
+        )
         if entry is None:
             # The draw exists but no marker encloses it; carry on with a minimal entry so
             # the edit still works rather than refusing over a cosmetic detail.
@@ -289,6 +297,16 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
         "include paths. Keep the entry point name and its resource declarations intact; "
         "shader-edit-apply refuses a replacement whose bindings moved.",
     )
+    if entry.get("first_queue_id") is None:
+        # The file names and the next_step above already fell back to the draw index; say
+        # why, so a caller comparing two edit sessions does not read the different naming
+        # as a bug. This is the normal case for a pass on a queue the event list missed.
+        result.add_diagnostic(
+            "info",
+            f"This pass has no Queue ID (its queue is absent from the exported event "
+            f"list), so the files are tagged with draw index {draw.index} and "
+            "shader-edit-apply must be called with --draw-index.",
+        )
     return result
 
 

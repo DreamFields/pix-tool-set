@@ -12,6 +12,7 @@ from ..results import ToolResult
 from ._common import (
     DRAW_SELECTOR,
     PAGE_PARAMS,
+    note_missing_queue_id,
     page_args,
     page_envelope,
     resolve_draw,
@@ -107,8 +108,9 @@ def list_pipeline_states(args: dict[str, Any], context: ToolContext) -> ToolResu
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event to take the PSO from. This id is present "
-                "on every row of the PIX event list."
+                "Exported event list 'Queue ID' of the event to take the PSO from. "
+                "Convenience alias only; prefer draw_index, which also addresses actions "
+                "on queues whose event list was not exported."
             ),
         },
     ),
@@ -126,9 +128,8 @@ def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
         if draw.pso_id is None:
             raise not_found(
                 "pipeline state",
-                f"queue_id={args['queue_id']}"
-                if args.get("queue_id") is not None
-                else f"draw_index={args.get('draw_index')}",
+                f"draw_index={draw.index}",
+                "This action binds no pipeline state; check draw-state for what it does.",
             )
         pso_id = draw.pso_id
 
@@ -227,14 +228,7 @@ def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     # An unresolved Queue ID is a hole in the exported event list, not a missing
     # binding. Saying so keeps the two failure modes from being confused: the
     # bindings above are read from the C++ export and stay valid either way.
-    if draw.queue_id is None:
-        result.add_diagnostic(
-            "warning",
-            f"No Queue ID for this action (global_id={draw.global_id}): the exported "
-            "event list has no row for it, which happens when the capture spans several "
-            "command queues and the CSV covers only one. Bindings come from the C++ "
-            "export and are unaffected; select this action by draw_index.",
-        )
+    note_missing_queue_id(result, draw)
 
     return result
 

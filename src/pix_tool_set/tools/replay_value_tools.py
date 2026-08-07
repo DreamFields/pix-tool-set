@@ -150,9 +150,10 @@ def _read_depth_levels(
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event. Present on every row of the PIX event "
-                "list, and the only event id accepted as input; Global ID is reported in "
-                "the results only."
+                "Exported event list 'Queue ID' of the event. Present on every row of that "
+                "export, but the export covers a single command queue, so draw_index is "
+                "the selector that always resolves; Global ID is reported in the results "
+                "only."
             ),
         },
         pass_name={"type": "string", "description": "Pass name (substring match)."},

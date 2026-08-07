@@ -11,13 +11,16 @@ from ..results import ToolResult
 from ._common import (
     DRAW_SELECTOR,
     PAGE_PARAMS,
+    note_missing_queue_id,
     page_args,
     page_envelope,
     pass_identity,
+    resolve_draw,
     resolve_pass,
     tool,
     with_session,
 )
+
 
 _KIND_VALUES = [kind.value for kind in EventKind]
 
@@ -111,10 +114,12 @@ def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of the event. Every row of the PIX event list has "
-                "one, so this addresses markers as well as actions."
+                "Row id from the exported event list; it addresses markers as well as "
+                "actions, but only for the queue that export covers. For an action on "
+                "another queue use locate-event --draw-index instead."
             ),
         },
+
         include_children={
             "type": "boolean",
             "description": "Include the immediate child events.",
@@ -213,10 +218,13 @@ def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of any row inside a pass. Restricts the search to "
-                "that one pass, which a name cannot do when passes share a label."
+                "Exported event list row id of any event inside a pass. Restricts the "
+                "search to that one pass, which a name cannot do when passes share a "
+                "label. Only works for the exported queue; pass_name or marker reach "
+                "every pass."
             ),
         },
+
         marker={"type": "string", "description": "Substring match on the full marker path."},
         kind={
             "type": "string",
@@ -290,6 +298,14 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     category="events",
     parameters=with_session(
         DRAW_SELECTOR,
+        pass_name={
+            "type": "string",
+            "description": (
+                "Pass name as shown in the PIX GUI marker tree (substring match). Resolves "
+                "to the pass's first action, so a name read off the screen is enough to "
+                "start from even when the pass has no event list row."
+            ),
+        },
         neighbours={
             "type": "integer",
             "description": "How many draws before and after to include. Default 3.",
@@ -299,18 +315,37 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     examples=[
         "pix-tool-set locate-event --queue-id 18461",
         "pix-tool-set locate-event --draw-index 2461 --neighbours 5",
+        'pix-tool-set locate-event --pass-name "CompactTraces WaveOps"',
     ],
 )
 def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
+
+    # A pass name is what the user can actually read off the PIX GUI, and for a pass on
+    # an unexported queue it is the only thing they have: there is no Queue ID to copy and
+    # the draw index is precisely what they are trying to find out. Resolving it here
+    # closes that loop in one call instead of sending them through find-pass first.
+    matched_pass = None
+    if args.get("pass_name") and args.get("draw_index") is None and args.get("queue_id") is None:
+        needle = str(args["pass_name"]).lower()
+        candidates = [p for p in capture.passes if needle in p["name"].lower()]
+        if not candidates:
+            raise not_found(
+                "pass",
+                args["pass_name"],
+                "Run list-passes or find-pass to browse the marker tree.",
+            )
+        matched_pass = candidates[0]
+        args = {**args, "draw_index": matched_pass["first_draw_index"]}
+
     draw = capture.resolve_draw(
         draw_index=args.get("draw_index"),
         queue_id=args.get("queue_id"),
     )
     if draw is None:
-        # The id may name a marker rather than an action. Markers carry no Global
-        # ID in the PIX GUI, which is exactly why Queue ID is the only selector the
-        # toolkit accepts; answer with the marker and the pass it opens.
+        # The id may name a marker rather than an action. Markers carry no Global ID at
+        # all, so a marker's Queue ID is the only way to name the pass row itself;
+        # answer with the marker and the pass it opens.
         event = capture.resolve_event(queue_id=args.get("queue_id"))
         if event is not None:
             pass_entry = capture.find_pass_by_event(queue_id=event.queue_id)
@@ -337,11 +372,10 @@ def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "for draw-level tools.",
             )
             return result
-        raise not_found(
-            "event",
-            args.get("queue_id") or args.get("draw_index"),
-            "Use list-draw-calls or list-actions to find a valid Queue ID.",
-        )
+        # Delegate the miss so the two Queue ID failure modes are described in one place;
+        # a bare "not found" here would hide the row-order trap that makes a wrong id look
+        # like a right one elsewhere.
+        resolve_draw(capture, args, what="event")
 
     span = int(args.get("neighbours") or 3)
     lo = max(draw.index - span, 0)
@@ -356,6 +390,7 @@ def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
         "global_id": draw.global_id,
         "api": draw.api,
         "kind": draw.kind.value,
+        "queue_id": draw.queue_id,
         "position": {
             "draw_index": draw.index,
             "total_draw_calls": total_draws,
@@ -381,4 +416,15 @@ def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
     event = draw.event
     if event is not None:
         data["event"] = event.to_dict(detail=True)
-    return ToolResult.success(data)
+    result = ToolResult.success(data)
+    if matched_pass is not None:
+        result.add_diagnostic(
+            "info",
+            f"Matched pass {matched_pass['name']!r} (pass_index="
+            f"{matched_pass['pass_index']}) and located its first action; the pass spans "
+            f"draw indices {matched_pass['first_draw_index']}..{matched_pass['last_draw_index']}.",
+            pass_index=matched_pass["pass_index"],
+        )
+    note_missing_queue_id(result, draw, level="info")
+    return result
+

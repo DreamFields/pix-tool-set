@@ -217,8 +217,10 @@ def draw_call_stats(args: dict[str, Any], context: ToolContext) -> ToolResult:
         queue_id={
             "type": "integer",
             "description": (
-                "PIX GUI 'Queue ID' of any row inside a pass. Lists only that pass's "
-                "draws, which a name cannot do when several passes share a label."
+                "Exported event list 'Queue ID' of any row inside a pass. Lists only that "
+                "pass's draws, which a name cannot do when several passes share a label. "
+                "Available for the exported queue only."
+
             ),
         },
         detail={"type": "boolean", "description": "Include the full bound state per draw."},
@@ -284,12 +286,19 @@ def list_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
         right_draw={"type": "integer", "description": "Second draw index."},
         left_queue_id={
             "type": "integer",
-            "description": "First draw by PIX GUI 'Queue ID'.",
+            "description": (
+                "First draw by exported event list 'Queue ID'. Use left_draw for actions "
+                "outside the exported queue."
+            ),
         },
         right_queue_id={
             "type": "integer",
-            "description": "Second draw by PIX GUI 'Queue ID'.",
+            "description": (
+                "Second draw by exported event list 'Queue ID'. Use right_draw for actions "
+                "outside the exported queue."
+            ),
         },
+
         include_same={"type": "boolean", "description": "Also list fields that match."},
     ),
     returns="Field-level differences with a same/different verdict per group.",
