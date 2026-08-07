@@ -11,6 +11,7 @@ from ..results import ToolResult
 from ._common import (
     DRAW_SELECTOR,
     PAGE_PARAMS,
+    draw_selector_args,
     page_args,
     page_envelope,
     pass_identity,
@@ -303,10 +304,7 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
-    draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        queue_id=args.get("queue_id"),
-    )
+    draw = capture.resolve_draw(**draw_selector_args(args))
     if draw is None:
         # The id may name a marker rather than an action. Markers carry no Global
         # ID in the PIX GUI, which is exactly why Queue ID is the only selector the
@@ -382,3 +380,107 @@ def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if event is not None:
         data["event"] = event.to_dict(detail=True)
     return ToolResult.success(data)
+
+
+@tool(
+    name="queue-attribution",
+    summary=(
+        "Which command queues the frame was submitted to, how many draws ran on each, "
+        "and which of those queues the exported event list actually covers."
+    ),
+    category="events",
+    parameters=with_session(
+        queue_name={
+            "type": "string",
+            "description": (
+                "Substring match on a queue name, e.g. 'Compute'. Also lists that queue's "
+                "draws, which is the only way to browse a queue with no event list."
+            ),
+        },
+        queue_object_id={
+            "type": "integer",
+            "description": "Same, by ID3D12CommandQueue ApiObjectId instead of name.",
+        },
+        limit={
+            "type": "integer",
+            "description": "Cap on listed draws when a queue is selected. Default 50.",
+        },
+    ),
+    returns="Per-queue submission and draw counts, event-list coverage, and optionally the draws on one queue.",
+    examples=[
+        "pix-tool-set queue-attribution",
+        "pix-tool-set queue-attribution --queue-name Compute --limit 10",
+    ],
+    notes=(
+        "Queue ownership is derived from the ExecuteCommandLists calls in the C++ export, "
+        "so it is known even for actions the event list omits. It does not recover their "
+        "Queue ID: that number is PIX's and is not reconstructible, so those actions stay "
+        "addressable by draw_index only."
+    ),
+)
+def queue_attribution(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    attribution = capture.queue_attribution
+
+    data: dict[str, Any] = dict(attribution)
+    queue_name = args.get("queue_name")
+    queue_object_id = args.get("queue_object_id")
+
+    if queue_name is not None or queue_object_id is not None:
+        limit = int(args.get("limit") or 50)
+        selected = capture.draws_on_queue(
+            queue_name=queue_name,
+            queue_object_id=None if queue_object_id is None else int(queue_object_id),
+        )
+        data["selected_queue"] = {
+            "queue_name": queue_name,
+            "queue_object_id": queue_object_id,
+            "draw_count": len(selected),
+            "draws_with_queue_id": sum(1 for d in selected if d.queue_id is not None),
+            "draws": [
+                {
+                    "draw_index": draw.index,
+                    "global_id": draw.global_id,
+                    "queue_id": draw.queue_id,
+                    "api": draw.api,
+                    "pass_name": draw.pass_name,
+                }
+                for draw in selected[:limit]
+            ],
+        }
+
+    result = ToolResult.success(data)
+    if not attribution["event_list_is_complete"]:
+        # Reported as a warning rather than folded into the payload because it is
+        # the reason a caller's Queue ID lookups can come back empty for real work,
+        # and that is easy to misread as the capture being incomplete.
+        uncovered = [
+            entry
+            for entry in attribution["queues"]
+            if entry.get("draw_count") and not entry.get("draws_with_queue_id")
+        ]
+        listed = ", ".join(
+            f"{entry.get('queue_name') or 'unnamed'} "
+            f"(object {entry['queue_object_id']}, {entry['draw_count']} draws)"
+            for entry in uncovered
+        )
+        result.add_diagnostic(
+            "warning",
+            f"The exported event list covers only some of the queues used this frame. "
+            f"Actions on {listed} have no Queue ID and must be selected by draw_index.",
+        )
+    if attribution["draws_without_queue_owner"]:
+        result.add_diagnostic(
+            "warning",
+            f"{attribution['draws_without_queue_owner']} draws could not be attributed to "
+            "a queue, which means a command list was submitted in a form this parser does "
+            "not recognise. Re-check RenderFrameWorker_*.cpp before trusting the counts.",
+        )
+    if attribution["ambiguous_command_lists"]:
+        result.add_diagnostic(
+            "warning",
+            "Some command lists were submitted to more than one queue, so the draws in "
+            "them have no single owner: "
+            f"{sorted(attribution['ambiguous_command_lists'])}",
+        )
+    return result

@@ -5,8 +5,10 @@ Passes:
   2. parse_descriptors       Descriptors_*.cpp             -> View
                              ModifyDescriptors_*.cpp       (override, see below)
   3. parse_pipeline_states   CreatePSOs.cpp                -> PipelineState + Shader
-  4. parse_root_signatures   FrameResources_*.cpp          -> RootSignature
+  4. parse_root_signatures     FrameResources_*.cpp          -> RootSignature
   4b. parse_command_signatures FrameResources_*.cpp        -> CommandSignature
+  4c. parse_command_queues   RenderFrameWorker_*.cpp       -> CommandQueue
+                             FrameResources_*.cpp          (queue names)
   5. CommandListParser       CommandLists_*.cpp            -> DrawCall
 
 The command-list pass is a state machine: it replays the emitted D3D12 calls in
@@ -20,6 +22,13 @@ root signature and every descriptor table are still set with ordinary
 Set*Root* calls right before it, exactly like a direct dispatch. Which of the
 two binding sets applies (compute vs graphics) is decided by the command
 signature's D3D12_INDIRECT_ARGUMENT_TYPE, hence parse_command_signatures.
+
+parse_command_queues exists because the exported event list covers a single
+command queue. On a capture that spans several queues every action on the other
+queues has no row in the CSV and therefore no Queue ID, which used to surface as
+a bare null. The submissions recorded in RenderFrameWorker_*.cpp let us say
+*which* queue such an action ran on without inventing an identifier for it -- see
+the warning in that function about why synthesising a Queue ID is not an option.
 """
 
 from __future__ import annotations
@@ -993,6 +1002,259 @@ def parse_command_signatures(root: Path) -> dict[int, CommandSignature]:
                 pending = {}
                 stride = 0
     return signatures
+
+
+# --------------------------------------------------------------------------
+# 4c. command queues -> which queue each command list was submitted to
+# --------------------------------------------------------------------------
+# WHY THIS PASS EXISTS
+#
+# ``pixtool export-event-list`` writes one CSV covering exactly one command
+# queue. On a capture that spans several queues (Tiled.wpix has three) every
+# action recorded on the other queues is simply absent from that CSV, so its
+# Queue ID resolves to None. On Tiled.wpix that is 90 draws across 72 passes,
+# nearly all of them Lumen async-compute -- reported as a bare null, which reads
+# as "unknown" when in fact we know a great deal: exactly which queue ran it.
+#
+# DO NOT SYNTHESISE A QUEUE ID HERE. It was tried and it is wrong. The hypothesis
+# was that Queue ID is a per-queue running index, so it could be recomputed by
+# counting API calls on a queue. Counting queue 1 that way yields 102136 rows
+# while the real exported event list for queue 1 has 22155 -- the numbering is
+# not a call count and does not reconstruct. A fabricated id would look valid,
+# would be accepted by every selector, and would silently address a *different*
+# action than the caller meant. That is strictly worse than None. This pass
+# therefore only attributes ownership; callers that need to address one of those
+# draws must use draw_index.
+#
+# Submissions look like this in RenderFrameWorker_*.cpp:
+#
+#     ID3D12CommandList* commandLists[2];
+#     commandLists[0] = GetCommandList(2971).Get();
+#     commandLists[1] = GetCommandList(3058).Get();
+#     GetCommandQueue(1)->ExecuteCommandLists(_countof(commandLists), commandLists);
+#
+# The assignments accumulate until an ExecuteCommandLists consumes them, exactly
+# like the argument descs in parse_command_signatures. Some slots are filled with
+# PIX's own helper lists (``commandLists[0] = g_utilityCommandList.Get();``, used
+# for the Present blit) which have no ApiObjectId at all; those are recorded as
+# utility entries and never enter the mapping, because attributing a draw to them
+# is meaningless and crashing on them would lose the whole frame.
+_RE_CL_ASSIGN = re.compile(r"commandLists\[(\d+)\]\s*=\s*GetCommandList\((\d+)\)")
+_RE_CL_UTILITY = re.compile(r"commandLists\[(\d+)\]\s*=\s*(g_\w*CommandList)")
+_RE_EXECUTE_LISTS = re.compile(r"GetCommandQueue\((\d+)\)->ExecuteCommandLists")
+_RE_CREATE_QUEUE = re.compile(
+    r"CreateAndTrackCommandQueue\(\s*(\d+)\s*,\s*g_device"
+)
+_RE_QUEUE_DESC = re.compile(
+    r"D3D12_COMMAND_QUEUE_DESC\s+\w+\s*=\s*\{\s*D3D12_COMMAND_LIST_TYPE_(\w+)"
+)
+# PIX emits object names as wide raw string literals so a name may contain
+# quotes and parentheses; `3D Queue (GPU 0)` does contain parentheses, so the
+# body must be matched non-greedily up to the closing )".
+_RE_OBJECT_NAME = re.compile(r"GetObject\((\d+)\)->SetName\(LR\"\((.*?)\)\"\)")
+
+# D3D12_COMMAND_LIST_TYPE_* -> the short name used everywhere in the payloads.
+_QUEUE_TYPE_MAP = {
+    "DIRECT": "direct",
+    "COMPUTE": "compute",
+    "COPY": "copy",
+    "BUNDLE": "bundle",
+    "VIDEO_DECODE": "video_decode",
+    "VIDEO_PROCESS": "video_process",
+    "VIDEO_ENCODE": "video_encode",
+}
+
+# Fallback when the queue desc was not exported: UE5 names its queues after their
+# role, and PIX passes that name straight through. Matched on the name only after
+# the desc lookup fails, so a real D3D12_COMMAND_LIST_TYPE always wins.
+_QUEUE_NAME_HINTS = (
+    ("compute", "compute"),
+    ("copy", "copy"),
+    ("3d", "direct"),
+    ("direct", "direct"),
+    ("graphics", "direct"),
+)
+
+
+@dataclass(slots=True)
+class CommandQueue:
+    """One ID3D12CommandQueue from the export, with what was submitted to it."""
+
+    api_id: int
+    name: str = ""
+    list_type: str = ""
+    command_list_ids: list[int] = field(default_factory=list)
+    submission_count: int = 0
+    utility_submission_count: int = 0
+    source_file: str = ""
+    source_line: int = 0
+
+    @property
+    def queue_type(self) -> str:
+        """direct / compute / copy, from the queue desc or failing that the name."""
+        mapped = _QUEUE_TYPE_MAP.get(self.list_type.upper())
+        if mapped:
+            return mapped
+        lowered = self.name.lower()
+        for needle, kind in _QUEUE_NAME_HINTS:
+            if needle in lowered:
+                return kind
+        return ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "queue_object_id": self.api_id,
+            "queue_name": self.name,
+            "queue_type": self.queue_type,
+            "command_list_type": self.list_type,
+            "submission_count": self.submission_count,
+            "command_list_count": len(self.command_list_ids),
+            "utility_submission_count": self.utility_submission_count,
+            "source": f"{self.source_file}:{self.source_line}" if self.source_file else "",
+        }
+
+
+@dataclass(slots=True)
+class QueueOwnership:
+    """command list -> queue, plus the queues themselves.
+
+    ``ambiguous_command_lists`` must stay empty for the mapping to mean anything.
+    A command list submitted to two different queues would make "which queue did
+    this draw run on" unanswerable from the C++ alone, and the honest response is
+    to report no owner rather than pick one. It has never happened on any capture
+    inspected so far (90/90 lists on Tiled.wpix resolve to exactly one queue), but
+    if you extend this parser, keep checking: silently choosing the first queue
+    would mislabel real work.
+    """
+
+    queues: dict[int, CommandQueue] = field(default_factory=dict)
+    command_list_to_queue: dict[int, int] = field(default_factory=dict)
+    ambiguous_command_lists: dict[int, list[int]] = field(default_factory=dict)
+    submissions: list[tuple[int, list[int]]] = field(default_factory=list)
+
+    def queue_for_command_list(self, command_list_id: int) -> Optional[CommandQueue]:
+        queue_id = self.command_list_to_queue.get(command_list_id)
+        if queue_id is None:
+            return None
+        return self.queues.get(queue_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "queues": [q.to_dict() for q in self.queues.values()],
+            "queue_count": len(self.queues),
+            "command_lists_attributed": len(self.command_list_to_queue),
+            "ambiguous_command_lists": {
+                str(k): v for k, v in self.ambiguous_command_lists.items()
+            },
+        }
+
+
+def _parse_queue_objects(root: Path) -> dict[int, CommandQueue]:
+    """Queue objects declared in FrameResources_*.cpp, with their names.
+
+    The desc sits on the line *above* CreateAndTrackCommandQueue inside the same
+    `if (g_constructionNeeded)` block, so the type is carried forward from the
+    most recent desc seen rather than parsed out of the create call, which only
+    takes a pointer. SetName calls live thousands of lines further down in the
+    same file and are keyed by object id, hence the second sweep.
+    """
+    queues: dict[int, CommandQueue] = {}
+    for path in sorted_group(root, "FrameResources"):
+        if not path.exists():
+            continue
+        pending_type = ""
+        for lineno, line in iter_lines(path):
+            match = _RE_QUEUE_DESC.search(line)
+            if match:
+                pending_type = match.group(1)
+                continue
+            match = _RE_CREATE_QUEUE.search(line)
+            if match:
+                api_id = int(match.group(1))
+                queues[api_id] = CommandQueue(
+                    api_id=api_id,
+                    list_type=pending_type,
+                    source_file=path.name,
+                    source_line=lineno,
+                )
+                pending_type = ""
+
+    # Names are applied to whatever object ids exist; a SetName on a
+    # non-queue object is simply ignored here.
+    for path in sorted_group(root, "FrameResources"):
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in _RE_OBJECT_NAME.finditer(text):
+            api_id = int(match.group(1))
+            queue = queues.get(api_id)
+            if queue is not None and not queue.name:
+                queue.name = match.group(2)
+    return queues
+
+
+def parse_command_queues(root: Path) -> QueueOwnership:
+    """Attribute every submitted command list to the queue that executed it.
+
+    This is the whole basis for reporting queue ownership on actions whose Queue
+    ID is missing, and it is derived purely from the export -- pixtool is not
+    involved and no identifier is invented. Read the block comment above before
+    changing anything here.
+
+    Queues seen only in ExecuteCommandLists but never in a
+    CreateAndTrackCommandQueue block still get an entry, so an unusual export
+    cannot make a draw's owner disappear; such a queue simply has no name and no
+    type. If you touch the regexes, re-verify against the export directly, e.g.::
+
+        parse_command_queues(root).ambiguous_command_lists   # must be {}
+
+    and confirm the queue count still matches what FrameResources declares
+    (3 on Tiled.wpix: obj 1 direct, obj 11 compute, obj 2988 copy).
+    """
+    ownership = QueueOwnership(queues=_parse_queue_objects(root))
+    seen: dict[int, set[int]] = {}
+
+    for path in sorted(root.glob("RenderFrameWorker_*.cpp")):
+        pending: list[int] = []
+        utility = 0
+        for lineno, line in iter_lines(path):
+            match = _RE_CL_ASSIGN.search(line)
+            if match:
+                pending.append(int(match.group(2)))
+                continue
+            if _RE_CL_UTILITY.search(line):
+                # PIX's own helper list: no ApiObjectId, so it can never be the
+                # command_list_id of a parsed draw. Counted, not mapped.
+                utility += 1
+                continue
+
+            match = _RE_EXECUTE_LISTS.search(line)
+            if not match:
+                continue
+            queue_id = int(match.group(1))
+            queue = ownership.queues.get(queue_id)
+            if queue is None:
+                queue = CommandQueue(
+                    api_id=queue_id, source_file=path.name, source_line=lineno
+                )
+                ownership.queues[queue_id] = queue
+            queue.submission_count += 1
+            queue.utility_submission_count += utility
+            for command_list_id in pending:
+                seen.setdefault(command_list_id, set()).add(queue_id)
+                if command_list_id not in queue.command_list_ids:
+                    queue.command_list_ids.append(command_list_id)
+            ownership.submissions.append((queue_id, list(pending)))
+            pending = []
+            utility = 0
+
+    for command_list_id, queue_ids in seen.items():
+        if len(queue_ids) == 1:
+            ownership.command_list_to_queue[command_list_id] = next(iter(queue_ids))
+        else:
+            # Deliberately left out of command_list_to_queue: see QueueOwnership.
+            ownership.ambiguous_command_lists[command_list_id] = sorted(queue_ids)
+    return ownership
 
 
 # --------------------------------------------------------------------------
