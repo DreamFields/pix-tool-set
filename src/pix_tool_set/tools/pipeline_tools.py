@@ -12,6 +12,7 @@ from ..results import ToolResult
 from ._common import (
     DRAW_SELECTOR,
     PAGE_PARAMS,
+    note_missing_queue_id,
     page_args,
     page_envelope,
     resolve_draw,
@@ -225,16 +226,9 @@ def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
             )
 
     # An unresolved Queue ID is a hole in the exported event list, not a missing
-    # binding. Saying so keeps the two failure modes from being confused: the
-    # bindings above are read from the C++ export and stay valid either way.
-    if draw.queue_id is None:
-        result.add_diagnostic(
-            "warning",
-            f"No Queue ID for this action (global_id={draw.global_id}): the exported "
-            "event list has no row for it, which happens when the capture spans several "
-            "command queues and the CSV covers only one. Bindings come from the C++ "
-            "export and are unaffected; select this action by draw_index.",
-        )
+    # binding. Saying which queue ran the action keeps the two failure modes apart:
+    # the bindings above are read from the C++ export and stay valid either way.
+    note_missing_queue_id(result, draw)
 
     return result
 

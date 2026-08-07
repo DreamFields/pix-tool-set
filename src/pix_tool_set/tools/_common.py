@@ -35,7 +35,11 @@ PAGE_PARAMS: dict[str, Any] = {
 DRAW_SELECTOR: dict[str, Any] = {
     "draw_index": {
         "type": "integer",
-        "description": "Zero-based index into the draw call list (see list-draw-calls).",
+        "description": (
+            "Zero-based index into the draw call list (see list-draw-calls). This is the "
+            "only selector that works for actions on a queue the exported event list "
+            "does not cover, since those have no Queue ID."
+        ),
     },
     "queue_id": {
         "type": "integer",
@@ -44,6 +48,27 @@ DRAW_SELECTOR: dict[str, Any] = {
             "toolkit accepts: it is present on every row of the PIX event list, so it "
             "also addresses pass markers. Global ID is reported in results but is not "
             "accepted as input."
+        ),
+    },
+    # Queue qualifiers narrow an id, they do not locate on their own -- a queue
+    # holds hundreds of draws. They exist because a capture can span several
+    # queues while the exported event list covers only one, so a Queue ID read off
+    # such a capture is only unique within that queue; passing the queue alongside
+    # turns a wrong-queue hit into a clean not-found instead of a plausible-looking
+    # wrong answer. Omitting both keeps the pre-existing behaviour exactly.
+    "queue_name": {
+        "type": "string",
+        "description": (
+            "Optional queue restriction, substring match on the queue name as PIX shows "
+            "it, e.g. 'Compute' for 'Compute Queue (GPU 0)'. Narrows the selectors above; "
+            "it cannot select a draw on its own."
+        ),
+    },
+    "queue_object_id": {
+        "type": "integer",
+        "description": (
+            "Optional queue restriction by ID3D12CommandQueue ApiObjectId (see "
+            "queue-attribution). This is an object id, not a Queue ID."
         ),
     },
 }
@@ -156,17 +181,42 @@ def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
+def draw_selector_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Extract the DRAW_SELECTOR keys for a direct ``capture.resolve_draw`` call.
+
+    A handful of tools cannot use ``resolve_draw`` below because they fall back to
+    a marker or answer with an event when no draw matches. Without this helper they
+    would hand-pick draw_index/queue_id and silently drop the queue qualifiers that
+    DRAW_SELECTOR advertises -- a parameter accepted and ignored is worse than one
+    rejected, because the caller believes the restriction was applied.
+    """
+    return {
+        "draw_index": args.get("draw_index"),
+        "queue_id": args.get("queue_id"),
+        "queue_name": args.get("queue_name"),
+        "queue_object_id": args.get("queue_object_id"),
+    }
+
+
 def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
     """Resolve a draw call from a Queue ID or a draw index, or raise.
 
     Centralised so the "which event?" question has exactly one answer across the
     toolkit, and so the not-found error names the selector the caller actually used.
+
+    ``queue_name`` / ``queue_object_id`` are optional qualifiers on top of that id.
+    They are forwarded verbatim; when absent this behaves exactly as before, which
+    is why every existing caller needed no change.
     """
     from ..errors import not_found
 
+    queue_name = args.get("queue_name")
+    queue_object_id = args.get("queue_object_id")
     draw = capture.resolve_draw(
         draw_index=args.get("draw_index"),
         queue_id=args.get("queue_id"),
+        queue_name=queue_name,
+        queue_object_id=queue_object_id,
     )
     if draw is None:
         selector = (
@@ -174,13 +224,66 @@ def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
             if args.get("queue_id") is not None
             else f"draw_index={args.get('draw_index')}"
         )
-        raise not_found(
-            what,
-            selector,
-            "Use list-draw-calls to find a valid Queue ID or draw index.",
-        )
+        qualifiers = [
+            f"{key}={value!r}"
+            for key, value in (
+                ("queue_name", queue_name),
+                ("queue_object_id", queue_object_id),
+            )
+            if value is not None
+        ]
+        if qualifiers:
+            selector = f"{selector} on {', '.join(qualifiers)}"
+            hint = (
+                "The id resolved to a draw on a different queue, or to nothing at all. "
+                "Run queue-attribution to see the queues and drop the queue restriction "
+                "to find out which one the id belongs to."
+            )
+        else:
+            hint = "Use list-draw-calls to find a valid Queue ID or draw index."
+        raise not_found(what, selector, hint)
     return draw
 
+
+def note_missing_queue_id(result, draw) -> bool:
+    """Explain a null queue_id in terms of the queue that action actually ran on.
+
+    Lives here rather than in the one tool that needs it because a null queue_id is
+    not specific to draw-state: any payload quoting an id can hit it, and the
+    explanation has to stay identical everywhere or the two failure modes it
+    separates will get confused again.
+
+    The distinction worth preserving: a missing Queue ID means the exported event
+    list has no row for the action, not that the action or its bindings are
+    missing. Bindings come from the C++ export and are unaffected. Naming the
+    queue turns "we have no idea what this is" into "it ran on the compute queue,
+    whose event list was not exported", which is a fact the caller can act on --
+    and it names the selector that does work instead of leaving them to guess.
+
+    Returns whether a diagnostic was added, so a caller can decide what else to
+    say without re-testing the condition.
+    """
+    if draw.queue_id is not None:
+        return False
+
+    attribution = draw.queue_attribution
+    queue_name = attribution.get("queue_name") or "an unidentified queue"
+    queue_object_id = attribution.get("queue_object_id")
+    where = (
+        f"{queue_name} (queue object {queue_object_id})"
+        if queue_object_id is not None
+        else queue_name
+    )
+    result.add_diagnostic(
+        "warning",
+        f"No Queue ID for this action (global_id={draw.global_id}). It ran on {where}, "
+        "and the exported event list does not cover that queue, so PIX never wrote a "
+        "Queue ID for it. The id cannot be derived: Queue ID is not a per-queue call "
+        "count, and a synthesised one would address a different row. Bindings above "
+        f"come from the C++ export and are unaffected -- select this action with "
+        f"draw_index={draw.index}.",
+    )
+    return True
 
 
 def pass_identity(entry: dict[str, Any]) -> dict[str, Any]:

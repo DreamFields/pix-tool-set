@@ -39,12 +39,19 @@ _SHADER_SELECTOR: dict[str, Any] = {
 
 
 def _resolve_shader(capture, args: dict[str, Any]):
+    # A pso_id / stage / shader_hash lookup does not go through a draw at all, so
+    # the queue qualifiers only constrain the draw-based path; find_shader resolves
+    # that draw itself and is handed them there. _SHADER_SELECTOR splices in the
+    # whole DRAW_SELECTOR, so dropping them here would advertise a restriction the
+    # tool silently ignores.
     shader = capture.find_shader(
         pso_id=args.get("pso_id"),
         stage=args.get("stage"),
         shader_hash=args.get("shader_hash"),
         draw_index=args.get("draw_index"),
         queue_id=args.get("queue_id"),
+        queue_name=args.get("queue_name"),
+        queue_object_id=args.get("queue_object_id"),
     )
     if shader is None:
         raise not_found(

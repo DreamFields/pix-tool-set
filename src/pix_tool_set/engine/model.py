@@ -681,9 +681,79 @@ class DrawCall:
         addresses every row in the event list, whereas Global ID only exists for
         actions. Exposing it here means any payload built from a DrawCall can quote
         the same id the user is looking at, instead of forcing them to translate.
+
+        None means the exported event list has no row for this action, which happens
+        when the capture spans several command queues -- not that the action is
+        unidentified. ``queue_name`` below says which queue it actually ran on.
         """
         event = self.event
         return getattr(event, "queue_id", None) if event is not None else None
+
+    # Queue ownership is modelled as derived links rather than stored fields for
+    # the same reason queue_id is: it belongs to the capture, not to the draw, and
+    # duplicating it into every DrawCall would give two sources of truth that can
+    # disagree after a re-parse. The lookup is a dict hit into a cached_property.
+    @property
+    def _queue_owner(self) -> Any:
+        if self._capture is None:
+            return None
+        return self._capture.command_queues.queue_for_command_list(self.command_list_id)
+
+    @property
+    def queue_object_id(self) -> Optional[int]:
+        """ApiObjectId of the ID3D12CommandQueue that executed this action.
+
+        This is an object id, NOT a Queue ID -- the two are unrelated numbering
+        schemes and must never be passed to a selector expecting the other. It
+        comes from the ExecuteCommandLists calls in the C++ export, so it is
+        available even for actions the exported event list omits.
+        """
+        owner = self._queue_owner
+        return owner.api_id if owner is not None else None
+
+    @property
+    def queue_name(self) -> str:
+        """Queue name as PIX shows it, e.g. ``Compute Queue (GPU 0)``."""
+        owner = self._queue_owner
+        return owner.name if owner is not None else ""
+
+    @property
+    def queue_type(self) -> str:
+        """direct / compute / copy, from D3D12_COMMAND_LIST_TYPE or the queue name."""
+        owner = self._queue_owner
+        return owner.queue_type if owner is not None else ""
+
+    @property
+    def queue_attribution(self) -> dict[str, Any]:
+        """Where this action ran, and whether it is addressable by Queue ID.
+
+        Always carries the queue even when ``queue_id`` is None, so a payload can
+        state "this ran on the compute queue, whose event list was not exported"
+        instead of emitting a null that reads as "we have no idea".
+        """
+        addressable = self.queue_id is not None
+        payload: dict[str, Any] = {
+            "queue_object_id": self.queue_object_id,
+            "queue_name": self.queue_name,
+            "queue_type": self.queue_type,
+            "queue_id": self.queue_id,
+            "queue_id_available": addressable,
+            "selector": (
+                {"queue_id": self.queue_id}
+                if addressable
+                else {"draw_index": self.index}
+            ),
+        }
+        if not addressable:
+            payload["reason"] = (
+                "The exported event list does not cover this queue, so PIX's Queue ID "
+                "for this action was never exported. It cannot be derived or "
+                "synthesised -- Queue ID is not a per-queue call count (recomputing it "
+                "that way overshoots the real row count by 4x). Select this action by "
+                "draw_index instead."
+            )
+        return payload
+
 
     @property
     def pass_name(self) -> str:
@@ -840,6 +910,11 @@ class DrawCall:
             "kind": self.kind.value,
             "api": self.api,
             "queue_id": self.queue_id,
+            # Kept alongside queue_id, not behind `detail`, because a null
+            # queue_id on its own is unactionable: this block is what tells the
+            # caller the action is real, says which queue ran it, and names the
+            # selector that does work.
+            "queue": self.queue_attribution,
             "global_id": self.global_id,
             "command_list_id": self.command_list_id,
             "pass_name": self.pass_name,

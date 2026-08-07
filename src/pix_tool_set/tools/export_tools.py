@@ -11,7 +11,7 @@ from ..context import ToolContext
 from ..engine.model import ShaderStage
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
-from ._common import DRAW_SELECTOR, resolve_draw, tool, with_session
+from ._common import DRAW_SELECTOR, draw_selector_args, resolve_draw, tool, with_session
 
 _FORMAT_DECODERS: dict[str, tuple[str, int, int]] = {
     # name -> (struct code per component, component count, bytes)
@@ -287,10 +287,7 @@ def save_render_target(args: dict[str, Any], context: ToolContext) -> ToolResult
         )
 
     marker = args.get("marker")
-    draw = capture.resolve_draw(
-        draw_index=args.get("draw_index"),
-        queue_id=args.get("queue_id"),
-    )
+    draw = capture.resolve_draw(**draw_selector_args(args))
     if draw is None and marker is None:
         raise invalid_argument(
             "draw_index/queue_id/marker", "provide one way to select the event"

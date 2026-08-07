@@ -114,6 +114,71 @@ class Capture:
         return cppparse.parse_command_signatures(self.export_dir)
 
     @cached_property
+    def command_queues(self) -> cppparse.QueueOwnership:
+        """Which command queue executed each command list.
+
+        The exported event list covers one queue, so on a multi-queue capture the
+        actions on the other queues have no Queue ID. This mapping is what lets a
+        payload still say where such an action ran, instead of reporting a bare
+        null that is indistinguishable from "unknown". It is derived entirely from
+        RenderFrameWorker_*.cpp; no identifier is synthesised, because a made-up
+        Queue ID would be accepted by the selectors and point at the wrong row.
+        """
+        return cppparse.parse_command_queues(self.export_dir)
+
+    @cached_property
+    def queue_attribution(self) -> dict[str, Any]:
+        """Frame-level summary of queue ownership and event-list coverage.
+
+        Published so a caller can tell "this queue's actions are missing from the
+        CSV" apart from "these actions do not exist", which is the same class of
+        false negative that descriptor_coverage guards against.
+        """
+        ownership = self.command_queues
+        per_queue: dict[int, dict[str, Any]] = {}
+        for queue in ownership.queues.values():
+            entry = queue.to_dict()
+            entry.update({"draw_count": 0, "draws_with_queue_id": 0})
+            per_queue[queue.api_id] = entry
+
+        unattributed = 0
+        for draw in self.draw_calls:
+            queue = ownership.queue_for_command_list(draw.command_list_id)
+            if queue is None:
+                unattributed += 1
+                continue
+            entry = per_queue.setdefault(
+                queue.api_id, {"queue_object_id": queue.api_id, "draw_count": 0,
+                               "draws_with_queue_id": 0}
+            )
+            entry["draw_count"] += 1
+            if draw.queue_id is not None:
+                entry["draws_with_queue_id"] += 1
+
+        covered = [
+            entry["queue_object_id"]
+            for entry in per_queue.values()
+            if entry.get("draws_with_queue_id")
+        ]
+        return {
+            "queues": sorted(per_queue.values(), key=lambda e: e["queue_object_id"]),
+            "queue_count": len(ownership.queues),
+            "draws_without_queue_owner": unattributed,
+            "ambiguous_command_lists": {
+                str(k): v for k, v in ownership.ambiguous_command_lists.items()
+            },
+            "event_list_covers_queue_object_ids": covered,
+            "event_list_is_complete": len(covered) >= len(
+                [e for e in per_queue.values() if e.get("draw_count")]
+            ),
+            "caveat": (
+                "Queue ownership is derived from the ExecuteCommandLists calls in the "
+                "C++ export. Actions on a queue the exported event list does not cover "
+                "have no Queue ID and cannot be given one; address them by draw_index."
+            ),
+        }
+
+    @cached_property
     def shaders(self) -> list[Shader]:
         out: list[Shader] = []
         for pso in self.pipeline_states.values():
@@ -659,20 +724,64 @@ class Capture:
         draw_index: int | None = None,
         global_id: int | None = None,
         queue_id: int | None = None,
+        queue_name: str | None = None,
+        queue_object_id: int | None = None,
     ) -> Optional[DrawCall]:
+        """Locate one draw from an event id, an index, or a queue-qualified id.
+
+        The queue qualifiers are additive filters, never a lookup of their own: a
+        queue names 90 to 2696 draws, so resolving one from a queue alone would be
+        arbitrary. When present they narrow an already-resolved candidate and make
+        the resolution fail loudly if it landed on a different queue -- which is
+        the point, since Queue IDs are only unique within the queue whose event
+        list was exported, and a caller reading ids off a multi-queue capture can
+        legitimately want to assert which queue they meant.
+
+        Existing callers that pass only draw_index or only queue_id are unaffected:
+        with both qualifiers None the filter is skipped entirely.
+        """
+        qualified = queue_name is not None or queue_object_id is not None
+
+        def matches(candidate: DrawCall | None) -> DrawCall | None:
+            if candidate is None or not qualified:
+                return candidate
+            if queue_object_id is not None and candidate.queue_object_id != queue_object_id:
+                return None
+            if queue_name is not None:
+                # Substring, case-insensitive: the real names carry a GPU index
+                # (`Compute Queue (GPU 0)`) that a caller should not have to spell.
+                needle = queue_name.lower()
+                if needle not in (candidate.queue_name or "").lower():
+                    return None
+            return candidate
+
         if global_id is not None:
-            found = self.draw_call_by_global_id(global_id)
+            found = matches(self.draw_call_by_global_id(global_id))
             if found is not None:
                 return found
         if queue_id is not None:
             event = self.event_by_queue_id(queue_id)
             if event is not None and event.global_id is not None:
-                found = self.draw_call_by_global_id(event.global_id)
+                found = matches(self.draw_call_by_global_id(event.global_id))
                 if found is not None:
                     return found
         if draw_index is not None:
-            return self.draw_call(draw_index)
+            return matches(self.draw_call(draw_index))
         return None
+
+    def draws_on_queue(
+        self, *, queue_name: str | None = None, queue_object_id: int | None = None
+    ) -> list[DrawCall]:
+        """Every draw attributed to one queue, for browsing a queue with no event list."""
+        needle = queue_name.lower() if queue_name else None
+        out: list[DrawCall] = []
+        for draw in self.draw_calls:
+            if queue_object_id is not None and draw.queue_object_id != queue_object_id:
+                continue
+            if needle is not None and needle not in (draw.queue_name or "").lower():
+                continue
+            out.append(draw)
+        return out
 
     def resource(self, resource_id: int) -> Optional[Resource]:
         return self.resources.get(resource_id)
@@ -873,10 +982,16 @@ class Capture:
         draw_index: int | None = None,
         global_id: int | None = None,
         queue_id: int | None = None,
+        queue_name: str | None = None,
+        queue_object_id: int | None = None,
     ) -> Optional[Shader]:
         if draw_index is not None or global_id is not None or queue_id is not None:
             draw = self.resolve_draw(
-                draw_index=draw_index, global_id=global_id, queue_id=queue_id
+                draw_index=draw_index,
+                global_id=global_id,
+                queue_id=queue_id,
+                queue_name=queue_name,
+                queue_object_id=queue_object_id,
             )
             if draw is None:
                 return None
