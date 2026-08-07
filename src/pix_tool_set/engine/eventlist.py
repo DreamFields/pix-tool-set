@@ -74,6 +74,32 @@ def _to_int(text: str | None) -> int | None:
         return None
 
 
+def _clean_name(row: list[str], name_col: int, global_col: int) -> str:
+    """Recover the Name cell even when it was split on an embedded comma.
+
+    pixtool writes ``Queue ID, Parent, Name, Global ID`` with a space after each
+    comma, and quotes a Name that itself contains commas. Because the quote then
+    starts one character late (after that space), a strict CSV reader does not
+    treat it as a quoting character and splits the name into several cells, e.g.
+    ``"AccessModePass[Graphics] (Textures: 0`` + ``Buffers: 2)"``. That silently
+    corrupted 28 rows in Tiled.events.csv: the visible name was truncated and
+    the Global ID column shifted, so an event could look like it had no id.
+
+    ``skipinitialspace=True`` fixes the parse going forward. This stays as the
+    repair path for a row that still arrives over-split (the quote convention is
+    pixtool's, not ours, so it may vary by version): everything from the name
+    column up to the trailing Global ID column is rejoined with ", ".
+    """
+    # A well-formed row has exactly one Name cell, so this is a no-op for it.
+    # An over-split row has extra cells between Name and the trailing columns
+    # (Global ID plus any counters), and all of them belong to the name.
+    extra = max(len(row) - global_col - 1, 0)
+    end = name_col + 1 + extra
+    parts = [cell.strip() for cell in row[name_col:end]]
+    joined = ", ".join(part for part in parts if part)
+    return joined.strip().strip('"').strip()
+
+
 def parse_event_list(path: str | Path) -> list[Event]:
     """Read the CSV and return the flat event list with tree links set."""
     csv_path = Path(path)
@@ -81,7 +107,7 @@ def parse_event_list(path: str | Path) -> list[Event]:
     by_queue: dict[int, Event] = {}
 
     with open(csv_path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-        reader = csv.reader(handle)
+        reader = csv.reader(handle, skipinitialspace=True)
         header = next(reader, None)
         if not header:
             return []
@@ -103,17 +129,25 @@ def parse_event_list(path: str | Path) -> list[Event]:
             queue_id = _to_int(row[queue_col])
             if queue_id is None:
                 continue
-            name = row[name_col].strip()
+            name = _clean_name(row, name_col, global_col)
+            # An over-split name pushes every later column right by the same
+            # amount, so the trailing columns must be read from the end.
+            shift = max(len(row) - len(columns), 0)
             event = Event(
                 queue_id=queue_id,
                 parent_queue_id=_to_int(row[parent_col]) if len(row) > parent_col else -1,
                 name=name,
-                global_id=_to_int(row[global_col]) if len(row) > global_col else None,
+                global_id=(
+                    _to_int(row[global_col + shift])
+                    if len(row) > global_col + shift
+                    else None
+                ),
                 kind=classify(name),
             )
             for position, counter_name in counter_columns:
-                if position < len(row) and row[position].strip():
-                    event.counters[counter_name] = row[position].strip()
+                shifted = position + shift
+                if shifted < len(row) and row[shifted].strip():
+                    event.counters[counter_name] = row[shifted].strip()
             events.append(event)
             by_queue[queue_id] = event
 
