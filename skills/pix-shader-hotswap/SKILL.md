@@ -12,8 +12,20 @@ description: >-
 
 # PIX Shader 热替换与 UAV 验证
 
-`pix-tool-set` 有 74 个工具。本 skill 只覆盖"改 shader → 看 GPU 结果"这条链，
+`pix-tool-set` 有 81 个工具。本 skill 覆盖"改 shader → 看 GPU 结果 → 全帧调试"这条链，
 目的是让你**一次选对工具**，而不是靠试错逼近。
+
+新增工具（2.0.0+）：
+- `shader-edit-apply --scope` (pso/shader/auto)：多 PSO 作用域补丁
+- `shader-info` → `sibling_psos`：同一 shader 被多少 PSO 引用
+- `replay-baseline-check`：null-patch 基线检查（D5 信任门）
+- `replay-edits`：查看当前补丁列表
+- `replay-reset`：一键回退所有补丁
+- `frame-replay-dump`：全帧资源 dump
+- `pixel-value-history`：像素值变化历史
+- `trace-downstream`：下游影响链追踪
+- `shader-edit-diff --checkpoint`：跨编辑检查点对比
+- `pixel-trace`：逐 draw 像素追踪
 
 ## 0. 铁律
 

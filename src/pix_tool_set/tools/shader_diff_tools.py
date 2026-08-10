@@ -50,6 +50,7 @@ from typing import Any, Iterator
 
 from ..context import ToolContext
 from ..engine import screencap, uavprobe
+from ..engine.editledger import EditLedger
 from ..engine.model import ShaderStage
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
@@ -479,6 +480,29 @@ def _decode(dump_path: Path) -> tuple[Any, Any, dict[str, Any]]:
                 "Default 8 (UNORDERED_ACCESS), where a compute UAV is left."
             ),
         },
+        checkpoint={
+            "type": "string",
+            "description": (
+                "Save this diff result as a named checkpoint in the edit ledger. "
+                "Use with --list-checkpoints and --compare-checkpoints to track how "
+                "the diff changes across incremental shader edits."
+            ),
+        },
+        list_checkpoints={
+            "type": "boolean",
+            "description": (
+                "List all saved checkpoints instead of running a new diff. The tool "
+                "returns immediately without replaying."
+            ),
+        },
+        compare_checkpoints={
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Compare two named checkpoints (pass exactly two names) and return "
+                "their delta: how the changed pixel count and share changed between them."
+            ),
+        },
     ),
     returns=(
         "The patch that was toggled and the confirmation it was restored, per-channel "
@@ -494,6 +518,38 @@ def _decode(dump_path: Path) -> tuple[Any, Any, dict[str, Any]]:
 def shader_edit_diff(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     root = export_root(context, args)
+
+    # --- Checkpoint management: --list-checkpoints and --compare-checkpoints
+    # short-circuit before any replay, so they are instant.
+    if args.get("list_checkpoints"):
+        ledger = EditLedger(root)
+        checkpoints = ledger.list_checkpoints()
+        data = {
+            "checkpoints": checkpoints,
+            "count": len(checkpoints),
+            "ledger_path": str(ledger._path),
+        }
+        result = ToolResult.success(data)
+        if not checkpoints:
+            result.add_diagnostic(
+                "info",
+                "No checkpoints saved yet. Run shader-edit-diff --checkpoint <name> "
+                "after a diff to save one.",
+            )
+        return result
+
+    compare = args.get("compare_checkpoints")
+    if compare and len(compare) == 2:
+        ledger = EditLedger(root)
+        delta = ledger.compare_checkpoints(compare[0], compare[1])
+        if "error" in delta:
+            raise not_found("checkpoint", delta["error"])
+        data = {
+            "comparison": delta,
+            "checkpoint_a": ledger.get_checkpoint(compare[0]),
+            "checkpoint_b": ledger.get_checkpoint(compare[1]),
+        }
+        return ToolResult.success(data)
 
     if args.get("queue_id") is None and args.get("draw_index") is None:
         raise invalid_argument(
@@ -739,6 +795,23 @@ def shader_edit_diff(args: dict[str, Any], context: ToolContext) -> ToolResult:
             },
         ])
         data["files"] = files
+
+        # --- Save checkpoint if --checkpoint was given.
+        checkpoint_name = args.get("checkpoint")
+        if checkpoint_name:
+            ledger = EditLedger(root)
+            ledger.add_checkpoint(
+                name=str(checkpoint_name),
+                comparison=comparison,
+                before_stats=before_stats,
+                after_stats=after_stats,
+                patch_info=patch_info,
+                files=files,
+            )
+            data["checkpoint_saved"] = {
+                "name": str(checkpoint_name),
+                "ledger_path": str(ledger._path),
+            }
     finally:
         # The patch name outlives everything else here, so it is checked last and
         # reported even when the body raised.

@@ -202,6 +202,15 @@ def shader_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
         if draw.pso_id == shader.pso_id
     ]
 
+    # D1: sibling PSOs — every PSO that references the same (stage, shader_hash).
+    # This is the list the caller needs to decide whether --scope shader is needed
+    # before patching. When it's non-empty and >1, the shader is shared and patching
+    # only the selected PSO would be a partial change.
+    stage_val = shader.stage.value
+    shader_hash = shader.shader_hash or shader.hash_md5
+    sibling_psos = capture.sibling_psos(stage_val, shader_hash)
+    has_siblings = len(sibling_psos) > 1
+
     data = {
         "shader": shader.to_dict(detail=True),
         "pipeline_state": (
@@ -212,10 +221,27 @@ def shader_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
         "consumers": consumers[:max_draws],
         "consumer_count": len(consumers),
         "has_embedded_source": shader.has_embedded_source,
+        "sibling_psos": sibling_psos,
+        "patch_scope_warning": (
+            f"Shader {stage_val}:{shader_hash} is used by {len(sibling_psos)} PSOs. "
+            f"Patching only pso {shader.pso_id} would leave the other "
+            f"{len(sibling_psos) - 1} unchanged. Pass --scope shader to "
+            f"shader-edit-apply to patch all {len(sibling_psos)} PSOs, or --scope pso "
+            f"to explicitly patch only this one."
+            if has_siblings
+            else None
+        ),
     }
     result = ToolResult.success(data)
     if not capture.disassembly_available:
         result.degrade("Disassembly unavailable; entry point and thread size are unknown.")
+    if has_siblings:
+        result.add_diagnostic(
+            "warning",
+            f"Shader {stage_val}:{shader_hash} is shared by {len(sibling_psos)} PSOs. "
+            "The default 'auto' scope in shader-edit-apply will refuse to patch until you "
+            "choose --scope shader or --scope pso explicitly.",
+        )
     return result
 
 

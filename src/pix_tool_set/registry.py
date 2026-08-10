@@ -46,6 +46,7 @@ CATEGORY_TITLES: dict[str, str] = {
     "performance": "Performance analysis",
     "diagnostics": "Diagnostics",
     "meta": "Toolkit meta",
+    "pixels": "Pixel-level debugging",
 }
 
 

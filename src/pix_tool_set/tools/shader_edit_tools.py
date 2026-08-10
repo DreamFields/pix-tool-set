@@ -31,6 +31,7 @@ from typing import Any
 
 from ..context import ToolContext
 from ..engine import dxbc, shaderpdb
+from ..engine.editledger import EditLedger
 from ..engine.hlslcompile import require_compiler
 from ..engine.model import ShaderStage
 from ..errors import PixToolError, invalid_argument, not_found
@@ -367,6 +368,19 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "effect."
             ),
         },
+        scope={
+            "type": "string",
+            "enum": ["pso", "shader", "auto"],
+            "description": (
+                "Patch scope. 'pso' patches only the selected PSO (for targeted "
+                "experiments). 'shader' patches every PSO that references the same "
+                "(stage, shader_hash) — this is the scope needed for full-frame replay. "
+                "'auto' (default) is 'pso' when only one PSO uses this shader, and "
+                "errors when multiple do, listing every pso_id so the caller can choose "
+                "explicitly. The default is 'auto' because a silent partial change is the "
+                "most expensive failure mode: it looks exactly like a successful edit."
+            ),
+        },
     ),
     returns="Compile outcome, binding comparison against the captured shader, and any patch made.",
     examples=[
@@ -517,19 +531,96 @@ def shader_edit_apply(args: dict[str, Any], context: ToolContext) -> ToolResult:
         )
         return result
 
+    # --- scope resolution (D1): the patch unit is a PSO, the intent unit is a shader.
+    # UE5 reuses one shader bytecode across many PSOs (blend/depth/RT-format variants
+    # share the same shader), so patching only the PSO the selected draw happens to use
+    # produces a partial change: some draws change, others do not, and the inconsistency
+    # looks like "compiler optimisation" or "incremental build miss" rather than a scope
+    # error. The default is `auto`, which errors when the shader has siblings, because a
+    # silent partial change is the most expensive failure mode — it looks like success.
+    stage_val = shader.stage.value
+    shader_hash = shader.shader_hash or shader.hash_md5
+    scope = args.get("scope") or "auto"
+    sibling_pso_ids = capture.sibling_psos(stage_val, shader_hash)
+
+    if scope == "auto" and len(sibling_pso_ids) > 1:
+        raise PixToolError(
+            code="ambiguous_shader_scope",
+            message=(
+                f"Shader {stage_val}:{shader_hash or '<unknown>'} is used by "
+                f"{len(sibling_pso_ids)} PSOs, so patching only the selected one "
+                f"(pso {draw.pso_id}) would change {draw.pso_id} while leaving the "
+                f"other {len(sibling_pso_ids) - 1} untouched. The frame would be "
+                f"partially patched — some draws change, others do not — which "
+                f"looks exactly like a successful edit."
+            ),
+            stage="shader",
+            details={
+                "stage": stage_val,
+                "shader_hash": shader_hash,
+                "sibling_psos": sibling_pso_ids,
+                "selected_pso": draw.pso_id,
+            },
+            suggestion=(
+                f"Pass --scope shader to patch all {len(sibling_pso_ids)} PSOs, or "
+                f"--scope pso to patch only PSO {draw.pso_id} (for targeted experiments)."
+            ),
+        )
+
+    target_pso_ids = sibling_pso_ids if scope == "shader" and sibling_pso_ids else [draw.pso_id]
+    data["scope"] = {
+        "requested": scope,
+        "resolved": "shader" if len(target_pso_ids) > 1 else "pso",
+        "target_psos": target_pso_ids,
+        "sibling_psos": sibling_pso_ids,
+        "shader_hash": shader_hash,
+    }
+
     if args.get("patch"):
-        patch = _patch_export(
-            capture, draw, shader, outcome.blob, dxil_path, bool(args.get("force"))
+        patches: list[dict[str, Any]] = []
+        bytecode_files: dict[int, str] = {}
+        for pso_id in target_pso_ids:
+            patch = _patch_export(
+                capture, pso_id, stage_val, outcome.blob, dxil_path, bool(args.get("force"))
+            )
+            patches.append(patch)
+            written.extend(patch.get("files_written", []))
+            bc_path = patch.get("payload_file") or patch.get("bytecode_file", "")
+            if bc_path:
+                bytecode_files[pso_id] = bc_path
+
+        # Record the patch(es) in the edit ledger so replay-edits can list them
+        # and replay-reset can revert them. One group_id ties all sibling-PSO
+        # patches together; the ledger is the source of truth for "what did I change?"
+        ledger = EditLedger(capture.export_dir)
+        group_id = ledger.add_group(
+            stage=stage_val,
+            shader_hash=shader_hash,
+            scope=scope,
+            target_psos=target_pso_ids,
+            source_file=str(args.get("source") or ""),
+            compile_args_file=str(args.get("args") or ""),
+            bytecode_files=bytecode_files,
+            binding_check=data.get("binding_check", {}),
         )
-        data["patch"] = patch
-        written.extend(patch.get("files_written", []))
+        data["patch"] = patches if len(patches) > 1 else patches[0]
+        data["ledger_group_id"] = group_id
         result = ToolResult.success(data, output_paths=written)
-        result.add_diagnostic(
-            "info",
-            "The exported C++ project now loads the new bytecode from a file instead of "
-            "resources.bin. Rebuild it with CMake and run it to see the edited shader "
-            "execute; the .wpix itself is unchanged.",
-        )
+        if len(patches) > 1:
+            result.add_diagnostic(
+                "info",
+                f"Patched {len(patches)} PSOs that reference {stage_val}:{shader_hash}. "
+                "Each PSO's override reads its own .dxil file, so the same compiled "
+                "bytecode is loaded by every sibling PSO. Rebuild and run to see the "
+                "edited shader execute across all of them.",
+            )
+        else:
+            result.add_diagnostic(
+                "info",
+                "The exported C++ project now loads the new bytecode from a file instead of "
+                "resources.bin. Rebuild it with CMake and run it to see the edited shader "
+                "execute; the .wpix itself is unchanged.",
+            )
         _warn_unchanged_hash(result, data)
         if not compatible:
             result.degrade(
@@ -609,32 +700,36 @@ def _override_pattern(marker: str, stage: str) -> re.Pattern[str]:
 
 def _patch_export(
     capture,
-    draw,
-    shader,
+    pso_id,
+    stage: str,
     blob: bytes,
     dxil_path: Path,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Redirect the PSO's stage bytecode to a file, in the exported C++ project.
+    """Redirect one PSO's stage bytecode to a file, in the exported C++ project.
 
-    The generated `CreatePipelineState_<pso>` reads a packed blob out of
+    The generated ``CreatePipelineState_<pso>`` reads a packed blob out of
     resources.bin and slices each stage out of it by size.  Rather than rewrite that
     stream, the stage assignment is replaced with a read of a side file, which keeps
     the edit small, reviewable and reversible.
+
+    Takes ``pso_id`` and ``stage`` directly (not a ``DrawCall``) so the same function
+    serves both single-PSO and multi-PSO (``--scope shader``) patching: the caller
+    decides which PSOs to patch, this function patches one.
     """
     export_dir = Path(capture.export_dir)
     target = export_dir / "CreatePSOs.cpp"
     if not target.exists():
         raise not_found("CreatePSOs.cpp", str(target), "Re-run session-open to export again.")
 
-    function = f"CreatePipelineState_{draw.pso_id}"
+    function = f"CreatePipelineState_{pso_id}"
     text = target.read_text(encoding="utf-8", errors="replace")
     start = text.find(f"void {function}()")
     if start == -1:
         raise not_found(
             "PSO creation function",
             function,
-            f"pso {draw.pso_id} may be a state object rather than a pipeline state.",
+            f"pso {pso_id} may be a state object rather than a pipeline state.",
         )
     end = text.find("\n}\n", start)
     if end == -1:
@@ -646,7 +741,6 @@ def _patch_export(
         )
     body = text[start:end]
 
-    stage = shader.stage.value
     match = next(
         (m for m in _STAGE_ASSIGN.finditer(body) if m.group(1) == stage),
         None,

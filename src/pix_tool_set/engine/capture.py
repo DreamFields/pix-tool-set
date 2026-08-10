@@ -186,6 +186,45 @@ class Capture:
         return out
 
     @cached_property
+    def shader_pso_index(self) -> dict[tuple[str, str], list[int]]:
+        """Reverse index: ``{(stage, shader_hash): [pso_id, ...]}``.
+
+        The patch unit in the exported C++ project is a PSO stage, but the *intent*
+        unit is a shader. UE5 reuses one shader bytecode across many PSOs (blend /
+        depth / RT-format variants share the same shader), so patching only the PSO
+        a draw happens to reference produces a partial change that looks exactly like
+        success — the patched PSO's draws change, the sibling PSOs' draws do not,
+        and the inconsistency reads as "compiler optimisation" or "incremental build
+        miss" rather than the scope error it really is.
+
+        This index turns "the shader this draw uses" into "every PSO that uses that
+        shader", which is the scope RenderDoc's ``ReplaceResource`` covers natively
+        ("the shader will be replaced everywhere it is used in the frame").
+
+        The key includes **stage** alongside hash: UE5 has VS/PS hash-collision edge
+        cases, and carrying the stage makes the key unambiguous without needing to
+        trust that a hash is globally unique.
+        """
+        index: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for pso in self.pipeline_states.values():
+            for shader in pso.shaders:
+                key = (shader.stage.value, shader.shader_hash or shader.hash_md5)
+                if pso.api_id not in index[key]:
+                    index[key].append(pso.api_id)
+        return dict(index)
+
+    def sibling_psos(self, stage: str, shader_hash: str) -> list[int]:
+        """All PSO IDs that reference the same ``(stage, shader_hash)``.
+
+        Returns an empty list when the shader is unknown (no hash), so callers can
+        treat "no siblings" and "unidentifiable" the same way: patching proceeds in
+        single-PSO scope, which is safe because there is nothing to be partial about.
+        """
+        if not shader_hash:
+            return []
+        return list(self.shader_pso_index.get((stage, shader_hash), []))
+
+    @cached_property
     def draw_calls(self) -> list[DrawCall]:
         parser = cppparse.CommandListParser(
             self.export_dir,
