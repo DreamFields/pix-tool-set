@@ -246,13 +246,35 @@ def main() -> int:
         f"queue_id={probe.queue_id} -> draw_index={resolved_index} (expected {probe.index})",
     )
 
-    print("\n9. Global ID remains output-only")
+    print("\n9. Global ID is now an accepted selector")
     payload = run("find-pass", global_id=probe.global_id)
-    check(
-        "find-pass still rejects a global_id",
-        payload["status"] == "error",
-        f"status={payload['status']}",
+    matched = (
+        (payload.get("data") or {}).get("matches", [{}])[0]
+        if payload["status"] != "error"
+        else {}
     )
+    check(
+        "find-pass --global-id resolves the pass",
+        payload["status"] != "error" and matched.get("name") == probe.pass_name,
+        f"status={payload['status']} name={matched.get('name')!r}",
+    )
+    # The 90 actions without a Queue ID are the ones Global ID is for: they
+    # sit on a queue the exported event list does not cover, so no amount of
+    # Queue ID wizardry will ever reach them.
+    queueless = [d for d in capture.draw_calls if d.queue_id is None and d.global_id is not None]
+    if queueless:
+        target = queueless[0]
+        payload = run("draw-state", global_id=target.global_id)
+        resolved = (
+            (payload.get("data") or {}).get("draw_call", {}).get("draw_index")
+            if payload["status"] != "error"
+            else None
+        )
+        check(
+            "draw-state --global-id reaches a queue-less action",
+            payload["status"] != "error" and resolved == target.index,
+            f"global_id={target.global_id} -> draw_index={resolved} (expected {target.index})",
+        )
 
     print("\n" + "=" * 78)
     print(f"{sum(PASSED)}/{len(PASSED)} checks passed")

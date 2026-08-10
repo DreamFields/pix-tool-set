@@ -207,7 +207,7 @@ pass_index=270  name=TileClassificationBuildLists
   dispatch_count=1  thread_groups=[24,12,1]  pso_ids=[3321]
 ```
 
-> **要点**：`draw_index` 不是 PIX 的 global_id，而是 pix-tool-set 内部的 draw 调用列表索引。`shader-bindings` / `draw-state` 都用它定位。若只有 global_id，也可用 `--global-id` 参数。
+> **要点**：`draw_index` 不是 PIX 的 global_id，而是 pix-tool-set 内部的 draw 调用列表索引。`shader-bindings` / `draw-state` 都用它定位。`global_id` 现在也接受作为输入（`--global-id`），且是跨队列唯一选择器，推荐从 PIX GUI 抄 id 时使用。若只有 `global_id`，可直接 `draw-state --global-id <N>` 而无需先换算。
 
 ### 3.2 第二步：调 shader-bindings 拿反射声明
 
@@ -311,7 +311,7 @@ resource-usage --resource-id <rid>
 1. **`max_views` 默认值会截断**：`shader-bindings` 默认 16、`draw-state` 默认 12。UE5 FrameResources 的 SRV table 声明 64 项，不调大会丢绑定。建议统一传 `--max-views 80`。
 2. **`declared_registers` 与 `root_bindings.views` 是两层数据**：前者是 shader 字节码反射的"声明"（可信），后者是 descriptor heap 的"运行时快照"（在 UE5 子分配 table 下 register 映射不可靠，见 2.3）。回答"绑定了哪些 shader 资源"用前者；回答"某个 register 实际指向哪个 rid"需配合反汇编或 PIX GUI。
 3. **pass 名可能重复**：`TileClassificationBuildLists` 命中 3 个 pass（分属 StochasticLighting / LumenReflections / LumenScreenProbeGather），要用 `marker_path` 区分所属子系统。
-4. **draw_index ≠ global_id**：pix-tool-set 工具默认用 `draw_index`（draw 调用列表索引），也接受 `--global-id`（PIX 事件 ID）。`list-passes` 同时给出 `first_draw_index` 和 `first_global_id`，两者都能用。
+4. **draw_index、global_id 与 queue_id 的关系**：pix-tool-set 工具接受 `draw_index`（draw 调用列表索引）、`global_id`（PIX 事件 ID，跨队列唯一，推荐从 GUI 抄 id 时使用）和 `queue_id`（导出 CSV 行号，仅覆盖已导出队列）。`list-passes` 同时给出 `first_draw_index` 和 `first_global_id`。多队列截帧（本报告 90 个 async compute action 无 `queue_id`）下 `global_id` 和 `draw_index` 是全量选择器，`queue_id` 只覆盖一条队列。
 
 ---
 

@@ -112,12 +112,21 @@ def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
     ),
     category="events",
     parameters=with_session(
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID. Resolves across all queues, including actions the "
+                "exported event list does not cover. For an ExecuteIndirect expansion "
+                "(an id the GUI shows but the export did not emit), the parent "
+                "ExecuteIndirect's action is reported."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Row id from the exported event list; it addresses markers as well as "
                 "actions, but only for the queue that export covers. For an action on "
-                "another queue use locate-event --draw-index instead."
+                "another queue use --global-id instead."
             ),
         },
 
@@ -127,40 +136,56 @@ def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
         },
     ),
     returns="Event detail, ancestor chain, and linked draw call summary.",
-    examples=["pix-tool-set action-info --queue-id 18704"],
+    examples=[
+        "pix-tool-set action-info --queue-id 18704",
+        "pix-tool-set action-info --global-id 5099",
+    ],
 )
 def action_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
+    global_id = args.get("global_id")
     queue_id = args.get("queue_id")
-    if queue_id is None:
-        raise invalid_argument("queue_id", "provide the event's PIX Queue ID")
+    if global_id is None and queue_id is None:
+        raise invalid_argument("global_id/queue_id", "provide one of them")
 
-    event = capture.event_by_queue_id(int(queue_id))
-    if event is None:
+    event = None
+    draw = None
+    if global_id is not None:
+        # Try the event list first (covers the exported queue), then the draw
+        # list (covers every queue, and ExecuteIndirect expansions). The draw
+        # path is what reaches the 90 async-compute actions and the sub-actions
+        # the export did not emit.
+        event = capture.event_by_global_id(int(global_id))
+        draw = capture.resolve_draw(global_id=int(global_id))
+    elif queue_id is not None:
+        event = capture.event_by_queue_id(int(queue_id))
+
+    if event is None and draw is None:
         raise not_found(
             "action",
-            f"queue_id={queue_id}",
-            "Use list-actions or search-actions to find a valid Queue ID.",
+            f"global_id={global_id}" if global_id is not None else f"queue_id={queue_id}",
+            "Use list-actions, search-actions, or find-draw-calls to locate a valid id.",
         )
 
     ancestors = []
-    node = event.parent
-    while node is not None:
-        ancestors.append(node.to_dict())
-        node = node.parent
-    ancestors.reverse()
+    if event is not None:
+        node = event.parent
+        while node is not None:
+            ancestors.append(node.to_dict())
+            node = node.parent
+        ancestors.reverse()
+        if draw is None:
+            draw = event.draw_call
 
     data: dict[str, Any] = {
-        "event": event.to_dict(detail=True),
+        "event": event.to_dict(detail=True) if event is not None else None,
         "ancestors": ancestors,
-        "draw_call": None,
+        "draw_call": draw.to_dict() if draw is not None else None,
+        "effective_kind": draw.effective_kind.value if draw is not None else None,
     }
-    if bool(args.get("include_children")):
+    if bool(args.get("include_children")) and event is not None:
         data["children"] = [child.to_dict() for child in event.children]
 
-    draw = event.draw_call
-    if draw is not None:
-        data["draw_call"] = draw.to_dict()
     return ToolResult.success(data)
 
 
@@ -230,7 +255,17 @@ def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
         kind={
             "type": "string",
             "enum": ["draw", "dispatch", "dispatch_rays", "execute_indirect"],
-            "description": "Restrict to one draw kind.",
+            "description": "Restrict to one API call kind (the literal D3D12 API).",
+        },
+        effective_kind={
+            "type": "string",
+            "enum": ["draw", "dispatch", "dispatch_rays", "execute_indirect"],
+            "description": (
+                "Restrict by what the GPU actually runs. An ExecuteIndirect on a "
+                "DISPATCH_RAYS command signature has effective_kind=dispatch_rays, so "
+                "this is how raytracing work is found in a frame whose export has no "
+                "literal DispatchRays call. Use --kind for the raw API call name."
+            ),
         },
         pso_id={"type": "integer", "description": "Only draws using this pipeline state."},
         uses_resource={"type": "integer", "description": "Only draws touching this resource id."},
@@ -281,6 +316,42 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
             offset=offset,
             limit=limit,
         )
+
+    # effective_kind is a derived field the engine does not index, so it is applied
+    # as a post-filter here. It is the only way to list raytracing work: the export
+    # has no DispatchRays API calls, only ExecuteIndirect on a DISPATCH_RAYS
+    # signature, so --kind dispatch_rays returns nothing while --effective-kind
+    # dispatch_rays returns the two actions that actually trace rays.
+    eff = args.get("effective_kind")
+    if eff is not None:
+        # The engine paginates before this filter runs, so a page that contains no
+        # matching actions would report total=0 even though later pages have them.
+        # Re-run without pagination, filter, then apply the caller's page.
+        if args.get("queue_id") is not None:
+            wanted = tuple(resolve_pass(capture, args)["marker_path"])
+            candidates, _ = capture.find_draw_calls(
+                kind=args.get("kind"),
+                pso_id=args.get("pso_id"),
+                uses_resource=args.get("uses_resource"),
+                shader_hash=args.get("shader_hash"),
+                min_instances=args.get("min_instances"),
+                min_triangles=args.get("min_triangles"),
+            )
+            all_matched = [d for d in candidates if d.marker_path == wanted]
+        else:
+            all_matched, _ = capture.find_draw_calls(
+                pass_name=args.get("pass_name"),
+                marker=args.get("marker"),
+                kind=args.get("kind"),
+                pso_id=args.get("pso_id"),
+                uses_resource=args.get("uses_resource"),
+                shader_hash=args.get("shader_hash"),
+                min_instances=args.get("min_instances"),
+                min_triangles=args.get("min_triangles"),
+            )
+        filtered = [d for d in all_matched if d.effective_kind.value == eff]
+        total = len(filtered)
+        window = filtered[offset : offset + limit] if limit else filtered[offset:]
     detail = bool(args.get("detail"))
     return ToolResult.success(
         {

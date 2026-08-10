@@ -628,6 +628,11 @@ class DrawCall:
     thread_group_z: int = 0
 
     pso_id: Optional[int] = None
+    # Set when the action runs under a raytracing state object
+    # (SetPipelineState1). Mutually exclusive with pso_id: when this is set,
+    # pso_id is None and the pipeline is a state object this toolkit does not yet
+    # model, so callers must not fall back to the last PSO they saw.
+    state_object_id: Optional[int] = None
     root_signature_id: Optional[int] = None
     primitive_topology: str = ""
 
@@ -657,6 +662,41 @@ class DrawCall:
         if self._capture is None or self.pso_id is None:
             return None
         return self._capture.pipeline_states.get(self.pso_id)
+
+    @property
+    def effective_kind(self) -> EventKind:
+        """What the GPU actually runs, as opposed to the API call name.
+
+        ``kind`` describes the D3D12 API call verbatim (an ExecuteIndirect stays
+        an ExecuteIndirect), which is the right thing for a payload to quote.
+        But an ExecuteIndirect whose command signature is DISPATCH_RAYS runs a
+        raytracing dispatch, and a frame that has two of those should be findable
+        as raytracing work -- not invisible because no API call was literally
+        ``DispatchRays``. This derived field carries that distinction without
+        overwriting ``kind``, so a caller filtering by either gets a true answer.
+        """
+        if self.kind is EventKind.EXECUTE_INDIRECT:
+            mapping = {
+                "DISPATCH": EventKind.DISPATCH,
+                "DISPATCH_RAYS": EventKind.DISPATCH_RAYS,
+                "DISPATCH_MESH": EventKind.DISPATCH,
+                "DRAW": EventKind.DRAW,
+                "DRAW_INDEXED": EventKind.DRAW,
+            }
+            return mapping.get(self.indirect_command_type, self.kind)
+        return self.kind
+
+    @property
+    def is_raytracing(self) -> bool:
+        """True when the action runs under a raytracing state object.
+
+        Set by SetPipelineState1; the companion ``state_object_id`` is None when
+        the pipeline was a plain PSO. Exposed separately so a caller can ask
+        "is this a raytracing dispatch" without having to know that an
+        ExecuteIndirect on a DISPATCH_RAYS signature is the only way one shows up
+        in this export.
+        """
+        return self.state_object_id is not None or self.effective_kind is EventKind.DISPATCH_RAYS
 
     @property
     def shaders(self) -> list[Shader]:
@@ -908,6 +948,7 @@ class DrawCall:
         payload: dict[str, Any] = {
             "draw_index": self.index,
             "kind": self.kind.value,
+            "effective_kind": self.effective_kind.value,
             "api": self.api,
             "queue_id": self.queue_id,
             # Kept alongside queue_id, not behind `detail`, because a null
@@ -919,6 +960,10 @@ class DrawCall:
             "command_list_id": self.command_list_id,
             "pass_name": self.pass_name,
             "pso_id": self.pso_id,
+            # Reported alongside pso_id so a raytracing action is never answered
+            # with a stale compute PSO: when this is set, pso_id is None and the
+            # pipeline is a state object this toolkit does not yet model.
+            "state_object_id": self.state_object_id,
             "root_signature_id": self.root_signature_id,
         }
         if self.kind in (EventKind.DISPATCH, EventKind.DISPATCH_RAYS):

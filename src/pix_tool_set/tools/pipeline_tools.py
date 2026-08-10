@@ -209,6 +209,20 @@ def draw_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     result = ToolResult.success(data)
 
+    # Disclose when the requested Global ID was an ExecuteIndirect expansion.
+    # The caller asked about gid N but got the draw for gid N-1; if that is not
+    # said out loud, the only way to check the answer is to already know it.
+    requested_gid = args.get("global_id")
+    if requested_gid is not None and draw.global_id is not None and int(requested_gid) != draw.global_id:
+        result.add_diagnostic(
+            "info",
+            f"Global ID {requested_gid} is the sub-action PIX expanded out of "
+            f"ExecuteIndirect (Global ID {draw.global_id}, draw_index={draw.index}). "
+            f"The export only records the ExecuteIndirect itself, so its draw is "
+            f"reported. The sub-action's work runs on the GPU and is not separately "
+            f"captured.",
+        )
+
     if draw.kind is EventKind.EXECUTE_INDIRECT:
         if command_signature is None:
             result.degrade(

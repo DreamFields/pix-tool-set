@@ -130,6 +130,16 @@ def main() -> int:
             unreachable.append(draw.index)
     check("draws_unreachable_by_index", len(unreachable), 0)
 
+    print("\n6b. every draw must also be addressable by global_id")
+    unreachable_gid = []
+    for draw in draws:
+        if draw.global_id is None:
+            continue
+        resolved = capture.resolve_draw(global_id=draw.global_id)
+        if resolved is None or resolved.index != draw.index:
+            unreachable_gid.append(draw.global_id)
+    check("draws_unreachable_by_global_id", len(unreachable_gid), 0)
+
     print("\n7. no synthesised Queue IDs (guard against a tempting wrong fix)")
     # If a branch invents ids for the missing queue, these draws would suddenly
     # have queue_id set. That must only happen with a real event list, never by

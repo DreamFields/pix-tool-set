@@ -376,6 +376,44 @@ def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     shaders = [draw.shader(stage)] if stage else draw.shaders
     shaders = [shader for shader in shaders if shader is not None]
     if not shaders:
+        # A raytracing state object is not modelled as a PSO, so this is the path
+        # a DispatchRays takes. Reporting it as a generic "no shader" would hide
+        # the one fact the caller needs: the pipeline is a state object, not a
+        # gap. Degrade with that reason so the caller knows the root bindings are
+        # still valid and which object to look up in the PIX GUI.
+        if draw.state_object_id is not None:
+            result = ToolResult.success(
+                {
+                    "draw_index": draw.index,
+                    "global_id": draw.global_id,
+                    "pass_name": draw.pass_name,
+                    "pso_id": None,
+                    "state_object_id": draw.state_object_id,
+                    "effective_kind": draw.effective_kind.value,
+                    "root_signature": (
+                        capture.root_signatures.get(draw.root_signature_id or -1).to_dict()
+                        if draw.root_signature_id
+                        and draw.root_signature_id in capture.root_signatures
+                        else None
+                    ),
+                    "stages": [],
+                    "root_bindings": [],
+                    "descriptor_heap_ids": draw.descriptor_heap_ids,
+                    "pipeline_note": (
+                        f"This action runs under raytracing state object "
+                        f"{draw.state_object_id} (SetPipelineState1). State objects are not "
+                        "yet modelled, so no shader stages are reported. The root bindings "
+                        "above are still the compute root arguments the dispatch reads; "
+                        "view the state object in the PIX GUI for the raytracing shaders."
+                    ),
+                }
+            )
+            result.degrade(
+                "Raytracing state object is not modelled; shader stages are unavailable. "
+                "Root bindings are still reported.",
+                reason="state_object_unmodelled",
+            )
+            return result
         raise not_found("shader", stage or "any", "This draw has no shader for that stage.")
 
     max_views = int(args.get("max_views") or 128)

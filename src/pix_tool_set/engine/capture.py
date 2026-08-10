@@ -456,6 +456,54 @@ class Capture:
         return {d.global_id: d for d in self.draw_calls if d.global_id is not None}
 
     @cached_property
+    def _passes_by_marker_path(self) -> dict[tuple[str, ...], dict[str, Any]]:
+        """Pass entry keyed by marker_path, for O(1) lookup from a draw's path.
+
+        The pass list is built by grouping draws on marker_path, so this is just
+        the same entries re-indexed. It exists because ``find_pass_by_event``
+        needs to answer from a draw's marker_path when the CSV has no row for the
+        action (the compute-queue case), and scanning the pass list each time is
+        O(passes) per query.
+        """
+        return {tuple(p["marker_path"]): p for p in self.passes}
+
+    @cached_property
+    def global_id_index(self) -> dict[int, DrawCall]:
+        """Every Global ID that resolves to an action, including ExecuteIndirect
+        expansions.
+
+        ``_draws_by_global_id`` only covers the ids the C++ export attached
+        directly to a draw (the ExecuteIndirect's own id). PIX also numbers the
+        sub-actions an ExecuteIndirect expands into -- those ids exist in the
+        event list and in the PIX GUI but not in the export, so they have no
+        DrawCall. This index adds them by mapping each such id to its parent
+        ExecuteIndirect's draw, following the ``child_gid = parent_gid + 1`` rule
+        measured on every capture examined so far (144/144 sub-dispatches, 2/2
+        sub-DispatchRays, all delta=+1).
+
+        The mapping is deliberately conservative: only ``N-1`` is checked, never
+        "nearest preceding action", because 178 of the 221 unused ids in the
+        range sit after a WriteBufferImmediate or a barrier and snapping to the
+        nearest action would answer confidently and wrongly for all of them.
+        """
+        if not self._draws_by_global_id:
+            return {}
+        # Start from the draws themselves.
+        index: dict[int, DrawCall] = dict(self._draws_by_global_id)
+        # Add the +1 expansion of every ExecuteIndirect that is itself a draw.
+        for gid, draw in self._draws_by_global_id.items():
+            if draw.api != "ExecuteIndirect":
+                continue
+            child_gid = gid + 1
+            # Only claim the id if nothing else already owns it. The CSV has rows
+            # for some of these children (the DispatchRays case), and the draw
+            # itself already owns its own id, so the claim is only for ids that
+            # are currently unmapped.
+            if child_gid not in index:
+                index[child_gid] = draw
+        return index
+
+    @cached_property
     def passes(self) -> list[dict[str, Any]]:
         """Render passes derived from the deepest marker of each draw."""
         buckets: dict[tuple[str, ...], list[DrawCall]] = defaultdict(list)
@@ -661,8 +709,10 @@ class Capture:
     def event_by_queue_id(self, queue_id: int) -> Optional[Event]:
         """Look up an event by the Queue ID column of the exported event list.
 
-        Queue ID is present on every row (Global ID only appears on actions), so
-        it is the one identifier that can address markers as well as draws.
+        Queue ID is present on every row of the exported event list. Global ID is
+        present on actions and on many non-action commands (barriers, copies,
+        clears, queries), but not on markers, so Queue ID is still the only
+        identifier that can address a pass marker row directly.
         """
         cache = getattr(self, "_events_by_queue_id", None)
         if cache is None:
@@ -692,26 +742,92 @@ class Capture:
 
         Works for a draw/dispatch id and for the enclosing marker id alike,
         because both resolve to the same marker_path.
+
+        Two resolution paths are tried, and they must not disagree:
+
+          * the exported event list (CSV), which covers one command queue;
+          * the C++ export's draw list, which covers every queue. This path is
+            what reaches the 90 async-compute actions the CSV omits, and it is
+            also the only way to place a Global ID that is an ExecuteIndirect
+            expansion (the child id exists in the GUI but not in the export).
+
+        Range containment (``first_global_id <= gid <= last_global_id``) is
+        deliberately not used: marker paths repeat, so a pass's draws are not
+        contiguous and its gid range swallows interleaved passes. Exact
+        marker_path equality is the only safe match.
         """
+        # Path 1: the CSV. Authoritative for the queue it covers, and the only
+        # way to reach a marker row (markers carry no Global ID, so the draw
+        # path cannot name them).
         event = self.resolve_event(global_id=global_id, queue_id=queue_id)
-        if event is None:
-            return None
-        path = tuple(event.marker_path)
-        if not path:
-            return None
-        for entry in self.passes:
-            if tuple(entry["marker_path"]) == path:
-                return entry
-        # The id may name the marker itself rather than a child action, in which
-        # case the pass path is the event path plus the event's own name.
-        extended = path + (event.name,)
-        for entry in self.passes:
-            if tuple(entry["marker_path"]) == extended:
-                return entry
+        if event is not None:
+            path = tuple(event.marker_path)
+            if path:
+                entry = self._passes_by_marker_path.get(path)
+                if entry is not None:
+                    return entry
+                # The id may name the marker itself rather than a child action.
+                extended = path + (event.name,)
+                entry = self._passes_by_marker_path.get(extended)
+                if entry is not None:
+                    return entry
+
+        # Path 2: the draw list. Reaches actions the CSV does not cover, and
+        # resolves ExecuteIndirect expansions to their parent draw's pass.
+        if global_id is not None:
+            draw = self.global_id_index.get(global_id)
+            if draw is not None:
+                path = tuple(draw.marker_path)
+                if path:
+                    entry = self._passes_by_marker_path.get(path)
+                    if entry is not None:
+                        return entry
         return None
 
     def draw_call_by_global_id(self, global_id: int) -> Optional[DrawCall]:
         return self._draws_by_global_id.get(global_id)
+
+    def command_by_global_id(self, global_id: int) -> Optional[dict[str, Any]]:
+        """Look up a Global ID in the full C++ export, not just the draws.
+
+        Returns ``{api, marker_path, source_file, source_line}`` for any command
+        the export emitted a ``// GlobalId = N`` for -- draws, copies, barriers,
+        clears, queries, the lot. Used by the tool layer to tell a caller exactly
+        what their id names when it is not an action, instead of a generic
+        'not found'. Returns None for ids the export did not emit at all.
+        """
+        # Re-scan the export on demand. This is only called on the miss path,
+        # so the cost is paid once per failed resolution, not per capture load.
+        # A cached full index would be better, but it is not needed for
+        # correctness here.
+        import re
+
+        from .cppparse import _RE_GLOBAL_ID as _RE_GID  # type: ignore
+
+        if not hasattr(self, "_command_index_cache"):
+            self._command_index_cache: dict[int, dict[str, Any]] = {}
+            pattern = re.compile(r"//\s*GlobalId\s*=\s*(\d+)")
+            call_re = re.compile(r"GetCommandList\((\d+)\)->(\w+)\(")
+            for path in sorted(self.export_dir.glob("CommandLists_*.cpp")):
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                for i, line in enumerate(lines):
+                    m = pattern.search(line)
+                    if not m:
+                        continue
+                    gid = int(m.group(1))
+                    api = None
+                    for j in range(i + 1, min(i + 6, len(lines))):
+                        c = call_re.search(lines[j])
+                        if c:
+                            api = c.group(2)
+                            break
+                    self._command_index_cache[gid] = {
+                        "global_id": gid,
+                        "api": api or "<unknown>",
+                        "source_file": path.name,
+                        "source_line": i + 1,
+                    }
+        return self._command_index_cache.get(global_id)
 
     def draw_call(self, index: int) -> Optional[DrawCall]:
         if 0 <= index < len(self.draw_calls):
@@ -757,6 +873,15 @@ class Capture:
 
         if global_id is not None:
             found = matches(self.draw_call_by_global_id(global_id))
+            if found is not None:
+                return found
+            # The id may be an ExecuteIndirect expansion: PIX numbers the
+            # sub-action the ExecuteIndirect launches, but the C++ export only
+            # records the ExecuteIndirect itself. The child id is parent+1 on
+            # every capture measured (see global_id_index), so resolve through
+            # that index. This is what makes a GUI id like 5099 (a sub-Dispatch
+            # the export never emitted) reachable.
+            found = matches(self.global_id_index.get(global_id))
             if found is not None:
                 return found
         if queue_id is not None:

@@ -124,8 +124,13 @@ session-set-pdb-dirs --pdb-dirs <Project>\Saved\ShaderSymbols\PCD3D_SM6
 → shader-edit-apply ... --patch                                 确认无误再打补丁
 ```
 `--draw-index` 是最精确的选择器，因为一个 pass 可能含多个使用不同 PSO 的 draw；
-也可用 `--queue-id` / `--pass-name`（取该 pass 的首个 draw）。事件选择器只接受
-Queue ID，`global_id` 仅在返回数据中报告。
+也可用 `--queue-id` / `--pass-name`（取该 pass 的首个 draw）。
+**多队列截帧（含 async compute）时 `draw_index` 是唯一全量选择器**：事件列表 CSV
+只覆盖一条队列，其余队列（典型是 Lumen 的异步计算）上的 action 没有 `queue_id`，
+只有 `draw_index` 和 `global_id`。`queue_id` 仅对已导出队列上的事件有效，且不与 PIX GUI 里的
+Queue ID 互通（GUI 的 ID 按队列各自编号）。从 GUI 抄 ID 回来查时，**推荐用 `--global-id`**
+——它是跨队列唯一的，不需要先确认队列。`queue_id` 只用于工具自己输出过的 id；如果误把
+一个 `global_id` 当 `queue_id` 传入，未命中时错误消息会提示改用 `--global-id`。
 `apply` 不带 `--patch` 时只编译并校验绑定签名，不改动任何文件，适合先试错。
 返回 `partial` 且 `binding_check.identical=false` 表示替换不是 slot 兼容的，
 已被拒绝打补丁，需要先恢复原有资源声明。
@@ -148,6 +153,15 @@ activity-viewer                    本地网页实时跟随 + 历史逐步回放
 ```
 diff-draw-calls --left-draw <a> --right-draw <b>
 ```
+
+**「这个帧跑在哪几条队列上」**
+```
+queue-attribution                                   全帧队列归属与事件列表覆盖率
+queue-attribution --queue-name Compute --limit 10   列出某条队列上的 draw（含无 queue_id 的）
+```
+多队列截帧（含 async compute）下，`queue-attribution` 是唯一能回答"这个 action 在哪条
+队列"的工具——事件列表 CSV 只覆盖一条队列，其余队列上的 action 没有 `queue_id`。
+返回的 `event_list_is_complete: false` 意味着部分 action 只能用 `draw_index` 寻址。
 
 ## 七、给用户汇报时的注意事项
 

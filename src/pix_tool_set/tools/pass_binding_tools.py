@@ -35,6 +35,27 @@ _TRUST_NOTE = (
 _STAGES = [stage.value for stage in ShaderStage]
 
 
+def _pipeline_note(draw) -> str:
+    """State, in words, what the pipeline field means for this action.
+
+    A raytracing state object is not modelled as a PSO, so ``pso_id`` is None
+    and ``stages`` is empty for a DispatchRays. Returning an empty stages list
+    with no explanation would read as "PIX recorded nothing", which is the same
+    shape as a real gap -- so the note has to say which one it is.
+    """
+    if draw.state_object_id is not None:
+        return (
+            f"This action runs under raytracing state object {draw.state_object_id} "
+            "(SetPipelineState1). State objects are not yet modelled, so no shader "
+            "stages are reported; the root bindings above are still the compute root "
+            "arguments the dispatch reads. Do not infer a shader from pso_id -- it is "
+            "null on purpose."
+        )
+    if draw.pso_id is None:
+        return "No pipeline state was bound before this action."
+    return ""
+
+
 def _classify_table(binding, declared_counts: dict[str, int]) -> dict[str, Any]:
     """Decide how much to trust one descriptor table's reconstructed contents."""
     views = binding.resolved_views
@@ -162,13 +183,16 @@ def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[st
         "draw_index": draw.index,
         "global_id": draw.global_id,
         "api": draw.api,
+        "effective_kind": draw.effective_kind.value,
         "pso_id": draw.pso_id,
+        "state_object_id": draw.state_object_id,
         "root_signature_id": draw.root_signature_id,
         "stages": stage_rows,
         "declared_totals": declared_counts,
         "root_descriptors": root_descriptors,
         "descriptor_tables": tables,
         "descriptor_heap_ids": draw.descriptor_heap_ids,
+        "pipeline_note": _pipeline_note(draw),
     }
 
 
@@ -312,12 +336,20 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         PAGE_PARAMS,
         name={"type": "string", "description": "Pass name or substring to look up."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of any event inside the pass. Resolves across all "
+                "queues, including passes the exported event list does not cover. "
+                "The pass is found by exact marker_path match, never by gid range."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list row id, for a marker or an action alike. Only passes "
-                "on the exported queue have one; --name reaches every pass and is the "
-                "way in when a pass is missing from the event list."
+                "on the exported queue have one; --name or --global-id reaches every pass "
+                "and is the way in when a pass is missing from the event list."
             ),
         },
     ),
@@ -325,6 +357,7 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     examples=[
         'pix-tool-set find-pass --name TileClassificationBuildLists',
         "pix-tool-set find-pass --queue-id 18704",
+        "pix-tool-set find-pass --global-id 5099",
     ],
 )
 def find_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -354,6 +387,47 @@ def find_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
         if "queue_id_unavailable" in identity:
             payload["queue_id_unavailable"] = identity["queue_id_unavailable"]
         return payload
+
+    global_id = args.get("global_id")
+    if global_id is not None:
+        entry = capture.find_pass_by_event(global_id=global_id)
+        if entry is None:
+            # The id may name a real event whose marker has no draws (so no pass
+            # entry was built). That is a different case from "id is not in this
+            # capture at all", and the caller's next step differs: the former still
+            # has a marker context worth naming.
+            ev = capture.event_by_global_id(int(global_id))
+            if ev is not None:
+                marker = ev.marker_path[-1] if ev.marker_path else ev.name
+                raise not_found(
+                    "pass",
+                    f"global_id={global_id}",
+                    f"Global ID {global_id} is {ev.name!r} under marker {marker!r}, but "
+                    f"that marker contains no draw calls, so no pass entry was built for "
+                    f"it. Use --name to find a neighbouring pass, or list-draw-calls to "
+                    f"see the draws in the surrounding passes.",
+                )
+            cmd = capture.command_by_global_id(int(global_id)) if hasattr(capture, "command_by_global_id") else None
+            if cmd is not None:
+                raise not_found(
+                    "pass",
+                    f"global_id={global_id}",
+                    f"Global ID {global_id} is a {cmd['api']} command not enclosed by a "
+                    f"pass marker. Use --name to find a pass by name.",
+                )
+            raise not_found(
+                "pass",
+                f"global_id={global_id}",
+                f"No event carries Global ID {global_id}, and it is not an ExecuteIndirect "
+                f"expansion. Use --name to find a pass by name.",
+            )
+        return ToolResult.success(
+            {
+                "query": f"global_id={global_id}",
+                "matches": [row(entry)],
+                **page_envelope(1, 1, limit, 1),
+            }
+        )
 
     queue_id = args.get("queue_id")
     if queue_id is not None:

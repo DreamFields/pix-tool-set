@@ -56,11 +56,14 @@ def main() -> int:
               f"global_id={m['global_id']}")
         check("draw_index resolved", m["draw_index"] is not None, f"draw_index={m['draw_index']}")
 
-    print("\n3. a global id is no longer accepted as input")
+    print("\n3. a global id is now accepted as input")
     payload = run("find-pass", global_id=GLOBAL_ID)
-    check("find-pass rejects global_id",
-          payload["status"] == "error",
-          f"status={payload['status']}")
+    if payload["status"] == "error":
+        check("find-pass --global_id", False, payload["error"]["message"])
+    else:
+        m = payload["data"]["matches"][0]
+        check("find-pass --global_id resolves",
+              m["name"] == EXPECT, f"name={m['name']}")
 
     print("\n4. pass-bindings --queue-id")
     payload = run("pass-bindings", queue_id=QUEUE_ID, stage="CS")

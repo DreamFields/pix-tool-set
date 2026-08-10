@@ -36,10 +36,19 @@ DRAW_SELECTOR: dict[str, Any] = {
     "draw_index": {
         "type": "integer",
         "description": (
-            "Zero-based index into the draw call list (see list-draw-calls). Primary "
-            "selector: it addresses every action in the capture, and it is the only one "
-            "that works for actions on a queue the exported event list does not cover, "
-            "since those have no Queue ID at all."
+            "Zero-based index into the draw call list (see list-draw-calls). Addresses "
+            "every action in the capture, including those on a queue the exported event "
+            "list does not cover."
+        ),
+    },
+    "global_id": {
+        "type": "integer",
+        "description": (
+            "PIX Global ID, as shown in the PIX GUI. Unique across the whole capture "
+            "(not just one queue), so it is the selector to use when copying an id out "
+            "of PIX. Also resolves ExecuteIndirect expansions: an id that names the "
+            "sub-action PIX expanded out of an ExecuteIndirect is mapped to that "
+            "ExecuteIndirect's draw, with a diagnostic saying so."
         ),
     },
     "queue_id": {
@@ -48,8 +57,8 @@ DRAW_SELECTOR: dict[str, Any] = {
             "Row identifier from the exported event list, usable only for events whose "
             "own queue is covered by that export; it is absent for the rest. Not "
             "interchangeable with the 'Queue ID' column shown in the PIX GUI on a "
-            "multi-queue capture. Global ID is reported in results but not accepted as "
-            "input."
+            "multi-queue capture: that column is per-queue, while this export numbers "
+            "rows sequentially."
         ),
     },
     # Queue qualifiers narrow an id, they do not locate on their own -- a queue
@@ -78,12 +87,20 @@ DRAW_SELECTOR: dict[str, Any] = {
 PASS_SELECTOR: dict[str, Any] = {
     "pass_name": {"type": "string", "description": "Pass name (substring match)."},
     "pass_index": {"type": "integer", "description": "Pass index from list-passes."},
+    "global_id": {
+        "type": "integer",
+        "description": (
+            "PIX Global ID of any event inside the pass, or of the pass marker's "
+            "child action. Works across all queues; the pass is found by exact "
+            "marker_path match, never by gid-range containment."
+        ),
+    },
     "queue_id": {
         "type": "integer",
         "description": (
             "Exported event list row id of any event inside the pass, or of the pass "
             "marker itself. Available only for passes on the exported queue; use "
-            "pass_index or pass_name to reach the others."
+            "pass_index, pass_name or global_id to reach the others."
         ),
     },
 }
@@ -226,24 +243,43 @@ def percent(part: float, whole: float) -> float:
 # PIX identifiers
 # --------------------------------------------------------------------------
 def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a pass from a name, a pass index, or an exported-event-list Queue ID.
+    """Resolve a pass from a name, a pass index, a Global ID, or a Queue ID.
 
-    Queue ID was originally the toolkit's single event identifier: it appears on every
-    row of the exported list, whereas Global ID appears only on actions and so cannot
-    name a pass marker. That reasoning still holds *within* one queue and is why Global
-    ID remains output-only.
-
-    What it missed is that the export covers a single command queue. Passes submitted to
-    another queue have no row at all, so an identifier defined by that list cannot be the
-    only way in -- on Tiled.wpix it leaves 74 passes unreachable. ``pass_index`` and
-    ``pass_name`` come from marker grouping in the C++ export, which sees every pass, so
-    they are the selectors that always work; Queue ID is now a convenience for the
-    exported queue.
+    ``global_id`` is the recommended selector for ids copied out of the PIX GUI:
+    it resolves across every queue (the exported event list covers only one), and
+    it reaches the async-compute passes Queue ID cannot. ``pass_index`` and
+    ``pass_name`` also work across all queues. ``queue_id`` is a convenience for
+    the exported queue only.
 
     An id still wins over a name, because it is unambiguous while a name is a substring
     match that can hit several passes.
     """
     from ..errors import invalid_argument, not_found
+
+    global_id = args.get("global_id")
+    if global_id is not None:
+        entry = capture.find_pass_by_event(global_id=global_id)
+        if entry is not None:
+            return entry
+        # Distinguish "the id names a non-action command in a real marker" from
+        # "the id is not in this capture at all", because the caller's next step
+        # differs. The former still has a pass context; the latter does not.
+        cmd = capture.command_by_global_id(int(global_id)) if hasattr(capture, "command_by_global_id") else None
+        if cmd is not None:
+            raise not_found(
+                "pass",
+                f"global_id={global_id}",
+                f"Global ID {global_id} is a {cmd.api} command. It is not enclosed by a "
+                f"pass marker, so no pass contains it. Use find-pass with a pass name or "
+                f"index instead.",
+            )
+        raise not_found(
+            "pass",
+            f"global_id={global_id}",
+            f"No event carries Global ID {global_id}, and it is not the expansion of an "
+            f"ExecuteIndirect. The id is either unused or out of range. Use list-passes "
+            f"or find-pass --name to locate a pass.",
+        )
 
     queue_id = args.get("queue_id")
     if queue_id is not None:
@@ -272,7 +308,7 @@ def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
         key = args.get("pass_name")
     if key is None:
         raise invalid_argument(
-            "pass_name/pass_index/queue_id", "provide one of them"
+            "pass_name/pass_index/global_id/queue_id", "provide one of them"
         )
     entry = capture.find_pass(key)
     if entry is None:
@@ -291,6 +327,7 @@ def draw_selector_args(args: dict[str, Any]) -> dict[str, Any]:
     """
     return {
         "draw_index": args.get("draw_index"),
+        "global_id": args.get("global_id"),
         "queue_id": args.get("queue_id"),
         "queue_name": args.get("queue_name"),
         "queue_object_id": args.get("queue_object_id"),
@@ -298,14 +335,20 @@ def draw_selector_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
-    """Resolve a draw call from a draw index or an exported-event-list Queue ID.
+    """Resolve a draw call from a draw index, Global ID, or Queue ID.
 
     Centralised so the "which event?" question has exactly one answer across the
     toolkit, and so the not-found error names the selector the caller actually used.
 
-    ``queue_name`` / ``queue_object_id`` are optional qualifiers on top of that id.
-    They are forwarded verbatim; when absent this behaves exactly as before, which
-    is why every existing caller needed no change.
+    ``global_id`` is the recommended selector for ids copied out of the PIX GUI:
+    it is unique across the whole capture and covers queues the exported event
+    list does not. ``draw_index`` addresses every action too, but is an internal
+    index, not something the GUI shows. ``queue_id`` is a row in the exported
+    event list and only works for one queue; see QUEUE_ID_IS_ROW_ORDER.
+
+    ``queue_name`` / ``queue_object_id`` are optional qualifiers on top of
+    ``queue_id``. They are forwarded verbatim; when absent this behaves exactly
+    as before, which is why every existing caller needed no change.
 
     The Queue ID failure is split into several messages because they call for opposite
     reactions, and one of them is a trap. An id beyond the row count simply does not
@@ -321,17 +364,20 @@ def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
     from ..errors import invalid_argument, not_found
 
     draw_index = args.get("draw_index")
+    global_id = args.get("global_id")
     queue_id = args.get("queue_id")
     queue_name = args.get("queue_name")
     queue_object_id = args.get("queue_object_id")
-    if draw_index is None and queue_id is None:
+    if draw_index is None and global_id is None and queue_id is None:
         raise invalid_argument(
-            "draw_index/queue_id",
-            "provide draw_index (addresses every action) or queue_id (exported queue only)",
+            "draw_index/global_id/queue_id",
+            "provide draw_index (addresses every action), global_id (PIX GUI id, "
+            "cross-queue), or queue_id (exported queue only)",
         )
 
     draw = capture.resolve_draw(
         draw_index=draw_index,
+        global_id=global_id,
         queue_id=queue_id,
         queue_name=queue_name,
         queue_object_id=queue_object_id,
@@ -347,6 +393,28 @@ def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
         )
         if value is not None
     ]
+
+    if global_id is not None:
+        # The id is not a draw and not an ExecuteIndirect expansion. The two
+        # remaining cases call for different reactions, and conflating them would
+        # either send the caller on a wrong hunt or hide a real gap.
+        cmd = capture.command_by_global_id(int(global_id)) if hasattr(capture, "command_by_global_id") else None
+        if cmd is not None:
+            raise not_found(
+                what,
+                f"global_id={global_id}",
+                f"Global ID {global_id} is a {cmd['api']} command, not an action (draw, "
+                f"dispatch, or dispatch rays). It cannot be used with this tool; use "
+                f"find-pass to see the pass context, or draw_index of an action in that "
+                f"pass.",
+            )
+        raise not_found(
+            what,
+            f"global_id={global_id}",
+            f"No action carries Global ID {global_id}, and it is not the expansion of "
+            f"an ExecuteIndirect. The id is either unused in this capture or out of "
+            f"range. Run list-draw-calls to see the action ids that exist.",
+        )
 
     if queue_id is not None:
         selector = f"queue_id={queue_id}"
@@ -369,11 +437,24 @@ def resolve_draw(capture, args: dict[str, Any], *, what: str = "draw call"):
                 f"The exported event list has {len(capture.events)} rows and none carries "
                 f"this id. " + QUEUE_ID_IS_ROW_ORDER,
             )
+        # Cross-hint: the same integer is very likely a Global ID the caller
+        # copied from the PIX GUI. The two id spaces overlap (5424 integers are
+        # valid as both), and 0 actions have queue_id == global_id, so a
+        # cross-queue mix-up is always wrong but undetectable on a hit. Pointing
+        # this out on a miss is the one moment the caller can still course-correct.
+        suggestion = ""
+        draw_by_gid = capture.draw_call_by_global_id(int(queue_id))
+        if draw_by_gid is not None:
+            suggestion = (
+                f" But {queue_id} is a valid Global ID (draw_index={draw_by_gid.index}, "
+                f"api={draw_by_gid.api}, pass={draw_by_gid.pass_name!r}) -- if you copied "
+                f"this id from the PIX GUI, use --global-id {queue_id} instead."
+            )
         raise not_found(
             what,
             selector,
             f"Row {queue_id} of the exported event list is {row.name!r}, which is not an "
-            f"action, so no {what} corresponds to it. " + QUEUE_ID_IS_ROW_ORDER,
+            f"action, so no {what} corresponds to it. " + QUEUE_ID_IS_ROW_ORDER + suggestion,
         )
 
     raise not_found(

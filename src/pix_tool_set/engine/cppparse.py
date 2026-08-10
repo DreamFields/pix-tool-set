@@ -1294,6 +1294,8 @@ _RE_DSV_INLINE = re.compile(
     r"CreateDepthStencilView(?:_[A-Za-z0-9]+)?\s*\(\s*GetResource\((\d+)\)"
 )
 _RE_INDIRECT_BUFFER = re.compile(r'g_indirectArgumentBuffers\["([^"]+)"\]')
+_RE_STATE_OBJECT = re.compile(r"GetStateObject\((\d+)\)")
+_RE_RT_PSO_IN_RESET = re.compile(r"GetStateObject\((\d+)\)")
 _RE_VIEWPORT = re.compile(
     r"\{\s*" + _NUM + r"\s*,\s*" + _NUM + r"\s*,\s*" + _NUM + r"\s*,\s*" + _NUM
     + r"\s*,\s*" + _NUM + r"\s*,\s*" + _NUM + r"\s*\}"
@@ -1360,6 +1362,7 @@ class CommandListParser:
     def _fresh_state(self) -> dict:
         return {
             "pso": None,
+            "state_object": None,
             "gfx_rootsig": None,
             "compute_rootsig": None,
             "heaps": [],
@@ -1433,6 +1436,13 @@ class CommandListParser:
                     pso = re.search(r"GetPipelineState\((\d+)\)", argtext)
                     if pso:
                         fresh["pso"] = int(pso.group(1))
+                    # A command list's inherited state can also be a raytracing
+                    # state object; the same clearing rule as SetPipelineState1
+                    # applies, so report it rather than letting a stale PSO leak.
+                    so = _RE_RT_PSO_IN_RESET.search(argtext)
+                    if so:
+                        fresh["state_object"] = int(so.group(1))
+                        fresh["pso"] = None
                     states[cl_id] = fresh
                     continue
 
@@ -1502,6 +1512,23 @@ class CommandListParser:
         if api == "SetPipelineState":
             ids = _ints(argtext)
             state["pso"] = ids[0] if ids else None
+            # A plain SetPipelineState binds a graphics/compute PSO. It clears any
+            # raytracing state object bound by SetPipelineState1, because the two
+            # pipeline types are mutually exclusive on a command list and reporting
+            # both would let a payload quote a state object that is no longer bound.
+            state["state_object"] = None
+        elif api == "SetPipelineState1":
+            # SetPipelineState1 binds a raytracing state object (ID3D12StateObject),
+            # not a PSO. Keeping the previous ``pso`` here is the stale-PSO hazard:
+            # a DispatchRays executed via ExecuteIndirect would be answered with an
+            # unrelated compute shader bound 99 lines earlier. State objects are not
+            # modelled yet, so the honest value is None -- the caller is told the
+            # pipeline is a state object via ``state_object`` and can degrade.
+            state["state_object"] = None
+            so = _RE_STATE_OBJECT.search(argtext)
+            if so:
+                state["state_object"] = int(so.group(1))
+            state["pso"] = None
         elif api == "SetGraphicsRootSignature":
             ids = _ints(argtext)
             state["gfx_rootsig"] = ids[0] if ids else None
@@ -1745,6 +1772,7 @@ class CommandListParser:
             source_file=path.name,
             source_line=lineno,
             pso_id=state["pso"],
+            state_object_id=state["state_object"],
             root_signature_id=active_rootsig,
             primitive_topology=state["topology"],
             bindings=snapshot,

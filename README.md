@@ -1,7 +1,7 @@
 # pix-tool-set
 
 面向 AI 客户端的 PIX 截帧（`.wpix`）脚本化分析工具集。
-按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **66 个 CLI 工具**，
+按 [requirement.md](Doc/requirement.md) 的 12 大类需求实现，共 **74 个 CLI 工具**，
 每个工具都自带 JSON Schema，输出统一的 JSON 信封，无需读文档即可被程序驱动。
 
 ## 一、为什么这样设计
@@ -62,12 +62,12 @@ pix-tool-set disassemble-shader --draw-index 2461 --stage PS -o ps.txt
 pix-tool-set diagnose-mobile-risks                        # 移动端风险体检
 ```
 
-## 五、工具总览（71 个）
+## 五、工具总览（74 个）
 
 **会话管理（4）** `session-open` `session-close` `session-list` `capture-info`
 
-**事件与 Action 导航（6）** `list-actions` `action-info` `search-actions`
-`find-draw-calls` `locate-event` `find-pass`
+**事件与 Action 导航（7）** `list-actions` `action-info` `search-actions`
+`find-draw-calls` `locate-event` `find-pass` `queue-attribution`
 
 **实测耗时（2）** `export-timing` `event-timing`
 
@@ -76,16 +76,17 @@ pix-tool-set diagnose-mobile-risks                        # 移动端风险体�
 **纹理分析（8）** `list-textures` `texture-stats` `texture-info` `export-texture`
 `export-draw-textures` `read-texture-pixels` `texture-pixel-stats` `pick-pixel`
 
-**Shader 分析（12）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
+**Shader 分析（13）** `shader-stats` `list-shaders` `shader-info` `disassemble-shader`
 `shader-reflection` `shader-bindings` `constant-buffer` `pass-bindings`
 `pass-shader-source` `pass-values` `shader-edit-begin` `shader-edit-apply`
+`shader-edit-diff`
 
 **Shader 源码与编辑（3）** `session-set-pdb-dirs` `shader-edit-begin` `shader-edit-apply`
 —— 从引擎 shader PDB 恢复真实 HLSL，改完重编译并校验绑定签名后打补丁到导出工程，
 是 PIX Debug 面板 Apply 按钮的可脚本化等价物。
 
-**纹理数值读取（4）** `read-resource-texture` `read-replay-target` `find-depth-content`
-`export-uav-slice`
+**纹理数值读取（5）** `read-resource-texture` `read-replay-target` `find-depth-content`
+`export-uav-slice` `read-uav`
 
 **模型与 DrawCall（4）** `model-stats` `draw-call-stats` `list-draw-calls` `diff-draw-calls`
 
@@ -175,32 +176,37 @@ pix-tool-set find-pass --name TileClassificationBuildLists               # 只�
 
 | 列 | 覆盖范围 | 说明 |
 |---|---|---|
-| `Global ID` | 仅 action（draw/dispatch/copy 等），本截帧 5,334 / 22,155 行 | 在 GUI 里选中一次 draw 就能看到 |
-| `Queue ID` | 导出 CSV 的每一行都有，22,155 / 22,155 行 | marker（pass 行）只有这个 id |
+| `Global ID` | 全部 2,786 个 action（跨队列），外加 2,548 个非 action 命令 | 在 GUI 里选中一次 draw 就能看到；跨队列唯一 |
+| `Queue ID` | 导出 CSV 的每一行都有，22,155 / 22,155 行 | marker（pass 行）只有这个 id；**仅覆盖被导出的那一个队列** |
 | `draw_index` | **全部 2,786 个 action** | 工具自己的序号，来自 C++ 导出，跨队列完整 |
 
-查 pass 的标记行时只能用 `Queue ID`，因为 marker 没有 Global ID。`global_id` 仅在返回
-数据中报告，不接受作为输入。
+`Global ID` 是跨队列的主选择器，推荐从 PIX GUI 抄 id 时使用。它也支持 ExecuteIndirect
+展开：如果 GUI 里看到的一个 id 在导出里不存在（PIX 把 ExecuteIndirect 展开成了子 action），
+工具会自动解析到父 ExecuteIndirect 并在诊断里说明。
+
+查 pass 的标记行时只能用 `Queue ID`（或 `pass_name`/`pass_index`），因为 marker 没有
+Global ID。
 
 ```powershell
-pix-tool-set find-pass --queue-id 18704        # -> pass TileClassificationMark
-pix-tool-set pass-bindings --queue-id 18704    # 直接出 shader 绑定
-pix-tool-set event-timing --queue-id 18704     # 直接出实测耗时
+pix-tool-set find-pass --global-id 5099      # -> CompactTraces WaveOps:1 (compute 队列)
+pix-tool-set find-pass --queue-id 18704      # -> pass TileClassificationMark
+pix-tool-set pass-bindings --queue-id 18704  # 直接出 shader 绑定
+pix-tool-set draw-state --global-id 5367     # DispatchRays，跨队列可达
 ```
 
-### 多队列边界：为什么主选择器是 `draw_index`
+### 多队列边界
 
 **`Queue ID` 只覆盖被导出的那一个 command queue。** 事件列表 CSV 是按队列导出的，本截帧
 导出的是 22,155 行的那一个队列；提交到其他队列（典型是 Lumen 的 async compute）的 action
 在 CSV 里**根本没有对应行**，因此 `queue_id` 为 `null`。实测：2,786 个 action 里有 **90 个**
 （分布在 **72 个 pass**）没有 `Queue ID`。这不是解析缺陷，是导出范围的边界。
 
-所以 `draw_index` 是跨队列的主选择器，`queue_id` 只是已导出队列上的便捷别名：
+`Global ID` 和 `draw_index` 都跨队列覆盖全部 2,786 个 action。推荐用 `Global ID`——它是
+PIX GUI 原生显示的 id，不需要先换算：
 
 ```powershell
-pix-tool-set find-pass --name "CompactTraces WaveOps"     # queue_id 为 null，但给出 draw_index
-pix-tool-set locate-event --pass-name "CompactTraces WaveOps"   # -> draw_index 2671
-pix-tool-set draw-state --draw-index 2671                 # 绑定数据完整，与队列无关
+pix-tool-set find-pass --global-id 5099             # compute 队列的 action，queue_id 为 null
+pix-tool-set draw-state --global-id 5099            # 绑定数据完整，与队列无关
 ```
 
 绑定、PSO、资源等数据都来自 C++ 导出，**不受这个边界影响**；缺的只是"用事件列表 id 称呼
@@ -213,20 +219,78 @@ pix-tool-set draw-state --draw-index 2671                 # 绑定数据完整�
 行数的整数都能命中*某一行*：从多队列截帧的 PIX GUI 里抄一个 Queue ID 传进来，工具**不会
 报错**，而是会安静地返回另一个不相干事件的数据。这是目前最危险的用法。
 
+`Global ID` 和 `Queue ID` 的整数空间重叠（5,424 个整数在两个空间都合法），且 0 个 action
+满足 `queue_id == global_id`，所以混用**永远错**且无法自动判别。规则很简单：**从 PIX GUI
+抄 id 时一律用 `--global-id`**，`--queue-id` 只用于工具自己输出过的 id。
+
 工具能做的只是在**未命中**时把话说清楚，并区分两种情况：
 
 ```powershell
 pix-tool-set draw-state --queue-id 99999
 #   -> The exported event list has 22155 rows and none carries this id.
-pix-tool-set draw-state --queue-id 3893
-#   -> Row 3893 of the exported event list is 'IASetVertexBuffers', which is not an action.
+pix-tool-set draw-state --queue-id 1611
+#   -> Row 1611 is 'IASetVertexBuffers'. But 1611 is a valid Global ID
+#      (draw_index=..., pass=...) -- use --global-id 1611 instead.
 ```
 
-两条错误都会附上"该列就是行号，优先用 draw_index"的提示。命中错行时无法检测，所以规则很
-简单：**跨队列截帧上一律用 `draw_index` 或 pass 名**，`--queue-id` 只用于工具自己输出过的 id。
+如果传 `--queue-id` 但该整数恰好是合法的 `Global ID`，错误消息会提示改用 `--global-id`。
+命中错行时无法检测，所以仍需遵守上面的规则。
 
 `find-pass` 返回里同时给出 `global_id`、`queue_id`、`marker_queue_id`（pass 标记自身的
 Queue ID）和 `draw_index`，可用于和 GUI 交叉核对。
+
+### DispatchRays 在 C++ 导出里的表示
+
+PIX 的 C++ 导出里**没有 `->DispatchRays(...)` 调用**。DispatchRays 被写成
+`ExecuteIndirect(GetCommandSignature(N))`，其中 command signature 的 `command_type`
+是 `DISPATCH_RAYS`。工具通过派生字段 `effective_kind` 暴露这一点：`kind` 仍如实描述
+API 调用（`execute_indirect`），但 `effective_kind` 报告 GPU 实际执行的工作（`dispatch_rays`）。
+
+```powershell
+pix-tool-set find-draw-calls --effective-kind dispatch_rays
+#   -> 列出帧里所有 DispatchRays（本帧 2 个）
+```
+
+DispatchRays 的管线由 `SetPipelineState1(StateObject N)` 绑定，而非普通 `SetPipelineState`。
+状态对象（state object）目前未建模，所以 `shader-bindings` 对 DispatchRays 返回 `partial`
+并在诊断里说明，而不是返回错误的 compute shader。
+
+### 想知道哪些队列被用到了：`queue-attribution`
+
+`queue-attribution` 直接回答"这个帧跑在哪几条命令队列上、每条队列多少 draw、导出的事件
+列表覆盖了哪几条"：
+
+```powershell
+pix-tool-set queue-attribution
+#   -> 3D Queue (GPU 0)       2696 draws（全部有 queue_id）
+#      Compute Queue (GPU 0)    90 draws（event list 未覆盖，无 queue_id）
+#      Copy Queue (GPU 0)        0 draws
+#      event_list_is_complete: false
+```
+
+队列归属是从 C++ 导出里的 `ExecuteCommandLists` 调用推导的，所以**对事件列表未覆盖的
+队列同样有效**——这正是那 90 个 draw 唯一能回答"我在哪条队列"的地方。带上
+`--queue-name` / `--queue-object-id` 还能列出该队列上的 draw（未导出队列的 draw 只能这样
+浏览）：
+
+```powershell
+pix-tool-set queue-attribution --queue-name Compute --limit 10
+```
+
+### 用队列限定参数拒绝跨队列 ID（合并后新增）
+
+`draw-state` / `pass-bindings` 等接受 `queue_id` 的工具，现在支持用
+`--queue-name` / `--queue-object-id` 限定。**限定后，不属于该队列的 ID 会被直接拒绝**，
+而不是命中别的队列上的错行：
+
+```powershell
+pix-tool-set draw-state --queue-id 1049 --queue-name Compute
+#   -> error: The id resolved to a draw on a different queue, or to nothing at all.
+```
+
+不加限定时的 1049 会命中 3D 队列的某一行（行号即 id，详见上文警告）——这正是限定参数
+存在的意义。从 PIX GUI 抄 ID 回来查时，**先跑一次 `queue-attribution` 确认目标事件所在
+队列，再带上 `--queue-name`**，就能把"静默命中错行"变成"明确报错"。
 
 ### CSV 是否需要改？
 
@@ -268,7 +332,9 @@ C++ 导出把多个 command list 交错写在一起，靠流式跟踪 `PIXBeginE
 这曾导致 pass 路径出现重复段（`Frame N / … / Frame N / …`），419 个 pass 里 416 个受影响。
 
 事件列表 CSV 的 `Parent` 列是显式父链，天然正确。现在 draw 的 marker 路径以事件列表为准
-（2,696 / 2,786 个 draw 可对齐），仅剩 90 个 bundle 内部调用未被 CSV 收录、继续沿用解析值。
+（2,696 / 2,786 个 draw 可对齐），仅剩 90 个 draw 未被 CSV 收录、继续沿用解析值——这与
+第八章说的 90 个无 `queue_id` 的 action 是同一批（提交到未导出事件列表的队列上，典型是
+Lumen 的 async compute）。
 
 ## 十、查看某个 pass 的 shader 源码（可取到真实 HLSL）
 
@@ -1079,11 +1145,13 @@ src/pix_tool_set/
   engine/
     capture.py      引擎门面：惰性分层解析 + 查询 + 统计
     model.py        类型化模型（Event / DrawCall / Shader / Resource / View）
-    cppparse.py     解析导出 C++：资源、描述符、PSO、root signature、命令列表状态机
+    cppparse.py     解析导出 C++：资源、描述符、PSO、root signature、命令列表状态机、
+                    command signature（判定 ExecuteIndirect 走图形还是计算管线）、
+                    command queue 提交记录（队列归属推导）
     eventlist.py    事件 CSV 解析、事件分类、树重建
     dxbc.py         DXBC 容器、签名、反射、DXIL 反汇编
     xpress.py       resources.bin 的 XPRESS 解压与偏移索引
-  tools/            12 个模块，每类需求一个
+  tools/            25 个模块，每类需求一个（events / pipeline / textures / shaders …）
 tests/verify_live.py 端到端验证：逐一调用全部工具
 Doc/requirement.md   原始需求
 ```
@@ -1093,6 +1161,13 @@ Doc/requirement.md   原始需求
 root signature、描述符堆、渲染目标、顶点/索引缓冲与 root 参数，在每次
 draw/dispatch 处快照——这份快照正是 PIX 选中某次 draw 时展示的内容。
 描述符表的展开跨度取自**真实 root signature 声明的范围**，而非固定猜测。
+
+`ExecuteIndirect` 按 **command signature 的 argument type** 判定走图形还是计算
+root 参数集（间接只覆盖计数，绑定仍由紧邻的 `Set*Root*` 调用建立；直接当图形调用
+读会把 134/187 个间接调用的绑定读成空）。队列归属（每个 action 跑在哪条命令队列）
+从 `RenderFrameWorker_*.cpp` 的 `ExecuteCommandLists` 提交记录推导——它跨全部队列，
+比只覆盖一条队列的事件列表 CSV 更完备，且实测归属无歧义（无 command list 提交到
+多个队列）。
 
 `resources.bin` 用 XPRESS 顺序流压缩（无索引表），本工具通过 `Cabinet.dll`
 解压并重建偏移索引以支持随机访问；shader 反汇编调用 PIX 自带的
@@ -1114,7 +1189,7 @@ python tests\verify_value_reads.py           # buffer / 2D 纹理 / 3D 纹理 z 
 
 | 项 | 结果 |
 |---|---|
-| 工具总数 | 71 |
+| 工具总数 | 74 |
 | 成功 | 51 |
 | partial | 6（均为已声明的数据边界）|
 | 异常 | **0** |

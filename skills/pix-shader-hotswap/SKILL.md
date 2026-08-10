@@ -12,17 +12,18 @@ description: >-
 
 # PIX Shader 热替换与 UAV 验证
 
-`pix-tool-set` 有 73 个工具。本 skill 只覆盖"改 shader → 看 GPU 结果"这条链，
+`pix-tool-set` 有 74 个工具。本 skill 只覆盖"改 shader → 看 GPU 结果"这条链，
 目的是让你**一次选对工具**，而不是靠试错逼近。
 
 ## 0. 铁律
 
 **先 `describe`，再调用。** 参数名不能猜：是 `--pdb-dirs` 不是 `--dirs`，
-是 `--queue-id` 不是 `--global-id`（Global ID 只在返回值里出现，不能作为输入）。
+是 `--global-id`、`--draw-index` 或 `--queue-id`（三者都可作为输入；从 PIX GUI 抄 id
+推荐用 `--global-id`，跨队列唯一；`--queue-id` 只对已导出队列有效，多队列截帧上误用会命中错行）。
 
 ```bash
 pix-tool-set describe <tool-name>   # 返回完整 JSON Schema
-pix-tool-set list-tools --brief     # 73 个工具的全量目录
+pix-tool-set list-tools --brief     # 74 个工具的全量目录
 ```
 
 **Session 会自动复用。** `session-open` 之后，后续命令都不必再传 `--session`；

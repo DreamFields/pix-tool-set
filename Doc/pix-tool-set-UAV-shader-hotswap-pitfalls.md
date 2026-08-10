@@ -80,7 +80,7 @@ read-uav (注入 probe -> 构建 -> 运行 -> GPU readback)
 | 工具 | 错误写法 | 正确写法 | 说明 |
 |------|---------|---------|------|
 | session-set-pdb-dirs | --dirs "F:\..." | --pdb-dirs "F:\..." | 参数名带 pdb- 前缀 |
-| find-pass | --global-id 18704 | --queue-id 18704 | pix-tool-set 只接受 Queue ID 作为输入，Global ID 仅在结果中返回 |
+| find-pass | --queue-id 18704（从多队列 GUI 抄来） | --global-id 18704 或 --draw-index 2606 | 从 PIX GUI 抄 id 推荐用 `--global-id`（跨队列唯一）；`--queue-id` 只用于工具自己输出过的 id（详见 README 第八章） |
 | export-uav-slice | --register u1 | --name RWNormalTexture 或 --resource-id 3032 | 无 --register 参数，用 UAV 声明名或 resource_id |
 
 ### 解决方案
