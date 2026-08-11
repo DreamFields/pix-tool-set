@@ -25,7 +25,7 @@ description: >-
 - `pixel-value-history`：像素值变化历史
 - `trace-downstream`：下游影响链追踪
 - `shader-edit-diff --checkpoint`：跨编辑检查点对比
-- `pixel-trace`：逐 draw 像素追踪
+- `pixel-history-replay`：GPU 回放实测单个纹素的 Previous/New Value（PIX Pixel History 面板对齐）
 
 ## 0. 铁律
 

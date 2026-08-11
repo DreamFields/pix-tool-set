@@ -269,6 +269,18 @@ def parse_resource_events(root: Path) -> list[ResourceEvent]:
                 continue
 
             if api == "DiscardResource":
+                # DiscardResource does not write pixels. It tells the driver the
+                # current contents are garbage and need not be preserved, which lets
+                # it skip a decompress or reset compression metadata. The texels may
+                # be left exactly as they were, so a pixel history will legitimately
+                # show no change across this event -- that is the API behaving as
+                # specified, not a missed sample. It is reported as its own access
+                # kind rather than as a write precisely so the two cannot be
+                # confused: calling it a write would imply values it never produced.
+                #
+                # UE5's RDG emits it right after an aliasing barrier, to initialise a
+                # render target that has just taken over memory another resource was
+                # using (resource 756 sits in heap 571, shared by 264 resources).
                 match = _RE_DISCARD.search(line)
                 if match:
                     events.append(
