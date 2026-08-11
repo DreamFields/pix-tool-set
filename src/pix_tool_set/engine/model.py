@@ -118,20 +118,23 @@ class Resource:
         return self.width * max(self.height, 1) * max(self.depth_or_array_size, 1)
 
     def describe(self) -> str:
+        label = f" \"{self.name}\"" if self.name else ""
         if self.is_buffer:
-            return f"Buffer#{self.api_id} {self.width} bytes"
+            return f"Buffer#{self.api_id}{label} {self.width} bytes"
         suffix = (
             f"x{self.depth_or_array_size}" if self.depth_or_array_size > 1 else ""
         )
         return (
-            f"{self.kind.value}#{self.api_id} {self.width}x{self.height}{suffix} "
+            f"{self.kind.value}#{self.api_id}{label} {self.width}x{self.height}{suffix} "
             f"{self.format} mips={self.mip_levels}"
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "resource_id": self.api_id,
+            "name": self.name,
             "kind": self.kind.value,
+
             "width": self.width,
             "height": self.height,
             "depth_or_array_size": self.depth_or_array_size,

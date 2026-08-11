@@ -10,7 +10,8 @@ from typing import Any, Callable, Iterable, Optional
 
 from ..errors import PixToolError, export_incomplete
 from ..pixtool import PixTool, validate_export
-from . import cppparse, eventlist
+from . import bindinglabel, cppparse, eventlist, resourceevents
+
 from .dxbc import (
     DxbcContainer,
     ShaderDisassembler,
@@ -112,6 +113,22 @@ class Capture:
         that in fact binds several.
         """
         return cppparse.parse_command_signatures(self.export_dir)
+
+    @cached_property
+    def resource_events(self) -> list["resourceevents.ResourceEvent"]:
+        """Barriers, clears, discards and copies -- the non-draw resource events.
+
+        The draw parser skips these on purpose; they carry no shader or geometry.
+        But they are half of what a resource history is: the transitions explain
+        why a texture was writable here and readable there, and a clear is often
+        the event a caller is actually hunting for.
+
+        This is a second full sweep of CommandLists_*.cpp, so it stays lazy and the
+        tools that expose it do so behind an explicit opt-in flag rather than
+        making every resource query pay for it.
+        """
+        return resourceevents.parse_resource_events(self.export_dir)
+
 
     @cached_property
     def command_queues(self) -> cppparse.QueueOwnership:

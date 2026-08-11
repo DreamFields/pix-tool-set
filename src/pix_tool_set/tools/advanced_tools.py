@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..context import ToolContext
+from ..engine import bindinglabel, resourceevents
 from ..engine.model import EventKind, ShaderStage, ViewKind
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
@@ -55,6 +56,14 @@ def _covers_pixel(draw, x: int, y: int) -> bool:
         y={"type": "integer", "description": "Pixel Y coordinate."},
         resource_id={"type": "integer", "description": "Render target resource id."},
         max_events={"type": "integer", "description": "Cap on returned candidates. Default 50."},
+        include_resource_events={
+            "type": "boolean",
+            "description": (
+                "Also list the clears and discards that affect the pixel. The PIX pixel "
+                "history shows these alongside the draws -- a clear is usually the row "
+                "that explains the value a draw started from. Requires --resource-id."
+            ),
+        },
         include_final_value={
             "type": "boolean",
             "description": "Also export the target and read the pixel's final value.",
@@ -62,7 +71,10 @@ def _covers_pixel(draw, x: int, y: int) -> bool:
         required=["x", "y"],
     ),
     returns="Ordered candidate writer list, blend state, and optionally the final pixel value.",
-    examples=["pix-tool-set pixel-history --resource-id 641 --x 960 --y 540"],
+    examples=[
+        "pix-tool-set pixel-history --resource-id 641 --x 960 --y 540",
+        "pix-tool-set pixel-history --resource-id 756 --x 810 --y 284 --include-resource-events",
+    ],
     notes=_REPLAY_NOTE,
 )
 def pixel_history(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -83,30 +95,46 @@ def pixel_history(args: dict[str, Any], context: ToolContext) -> ToolResult:
         if not _covers_pixel(draw, x, y):
             continue
         pso = draw.pipeline_state
-        candidates.append(
-            {
-                "draw_index": draw.index,
-                "global_id": draw.global_id,
-                "api": draw.api,
-                "pass_name": draw.pass_name,
-                "render_target_ids": targets,
-                "slot_of_target": (
-                    targets.index(int(resource_id)) if resource_id is not None else 0
-                ),
-                "pixel_shader": (
-                    draw.shader(ShaderStage.PS).to_dict()
-                    if draw.shader(ShaderStage.PS)
-                    else None
-                ),
-                "blend_enabled": pso.blend_enabled if pso else None,
-                "depth_enabled": pso.depth_enabled if pso else None,
-                "depth_write": pso.depth_write if pso else None,
-                "depth_func": pso.depth_func if pso else None,
-                "cull_mode": pso.cull_mode if pso else None,
-                "viewports": draw.viewports,
-                "scissor_rects": draw.scissor_rects,
-            }
-        )
+        entry = {
+            "draw_index": draw.index,
+            "global_id": draw.global_id,
+            "api": draw.api,
+            "event_type": "draw",
+            "pass_name": draw.pass_name,
+            "render_target_ids": targets,
+            "slot_of_target": (
+                targets.index(int(resource_id)) if resource_id is not None else 0
+            ),
+            "pixel_shader": (
+                draw.shader(ShaderStage.PS).to_dict()
+                if draw.shader(ShaderStage.PS)
+                else None
+            ),
+            "blend_enabled": pso.blend_enabled if pso else None,
+            "depth_enabled": pso.depth_enabled if pso else None,
+            "depth_write": pso.depth_write if pso else None,
+            "depth_func": pso.depth_func if pso else None,
+            "cull_mode": pso.cull_mode if pso else None,
+            "viewports": draw.viewports,
+            "scissor_rects": draw.scissor_rects,
+        }
+        # PIX shows an ExecuteIndirect's expanded child id, one higher than the
+        # ExecuteIndirect's own, so quote both rather than making the caller
+        # discover the offset when comparing against the PIX window.
+        if draw.global_id is not None:
+            entry["gui_global_id"] = (
+                draw.global_id + 1 if draw.api == "ExecuteIndirect" else draw.global_id
+            )
+        if resource_id is not None:
+            labels = bindinglabel.labels_for(capture, draw, int(resource_id))
+            if labels:
+                entry["binding"] = labels[0].text
+        # A draw that binds a depth buffer and tests against it may be rejected at
+        # this pixel. Whether it actually was cannot be decided statically -- that
+        # is a replay question -- so the state is reported and the verdict is not.
+        if pso is not None and pso.depth_enabled:
+            entry["may_fail_depth_stencil"] = True
+        candidates.append(entry)
 
     max_events = int(args.get("max_events") or 50)
     truncated = len(candidates) > max_events
@@ -124,6 +152,51 @@ def pixel_history(args: dict[str, Any], context: ToolContext) -> ToolResult:
         resource = capture.resource(int(resource_id))
         if resource is not None:
             data["render_target"] = resource.to_dict()
+
+    # -- clears and discards that hit this pixel ------------------------
+    if bool(args.get("include_resource_events")):
+        if resource_id is None:
+            raise invalid_argument(
+                "resource_id",
+                "required with --include-resource-events: a clear is only relevant to "
+                "the pixel of a specific resource",
+            )
+        events = resourceevents.events_for_resource(
+            capture.resource_events, int(resource_id)
+        )
+        rows: list[dict[str, Any]] = []
+        for event in events:
+            if event.event_type not in ("clear", "discard"):
+                continue
+            touch = event.touch_for(int(resource_id))
+            if touch is None:
+                continue
+            row: dict[str, Any] = {
+                "global_id": event.global_id,
+                "gui_global_id": event.global_id,
+                "api": event.api,
+                "event_type": event.event_type,
+                # A full-resource clear or discard covers every pixel, so it is
+                # unconditionally part of this pixel's history.
+                "covers_pixel": True,
+                "binding": "OM [None]" if event.event_type == "clear" else None,
+                "source": f"{event.source_file}:{event.source_line}",
+            }
+            if event.clear_value is not None:
+                row["clear_value"] = event.clear_value
+            rows.append(row)
+        data["resource_events"] = rows
+
+        merged = [dict(row) for row in candidates] + rows
+        merged.sort(
+            key=lambda row: (
+                row.get("gui_global_id")
+                if row.get("gui_global_id") is not None
+                else (row.get("global_id") if row.get("global_id") is not None else 1 << 62)
+            )
+        )
+        data["combined_history"] = merged[: max_events + len(rows)]
+        data["combined_history_count"] = len(merged)
 
     output_paths: list[str] = []
     if bool(args.get("include_final_value")) and resource_id is not None:

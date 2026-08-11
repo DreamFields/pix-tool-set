@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..context import ToolContext
+from ..engine import bindinglabel, resourceevents
 from ..errors import not_found
 from ..results import ToolResult
 from ._common import (
@@ -185,10 +186,23 @@ def list_buffers(args: dict[str, Any], context: ToolContext) -> ToolResult:
         resource_id={"type": "integer", "description": "Resource id to trace."},
         max_events={"type": "integer", "description": "Cap on timeline entries. Default 60."},
         include_views={"type": "boolean", "description": "Include descriptor/view list. Default true."},
+        include_resource_events={
+            "type": "boolean",
+            "description": (
+                "Also list the non-draw events that touch this resource -- barriers, "
+                "clears, discards and copies -- and reconstruct its state timeline. "
+                "This is what the PIX resource-history view shows alongside the draws, "
+                "including the 'API Parameters [n]' rows and the States column. Costs a "
+                "second pass over the exported command lists, so it is off by default."
+            ),
+        },
         required=["resource_id"],
     ),
     returns="Read/write timeline, pass list, descriptors and hazard hints.",
-    examples=["pix-tool-set resource-usage --resource-id 641"],
+    examples=[
+        "pix-tool-set resource-usage --resource-id 641",
+        "pix-tool-set resource-usage --resource-id 756 --include-resource-events",
+    ],
     aliases=["resource-history"],
 )
 def resource_usage(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -221,15 +235,28 @@ def resource_usage(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
         for index in sorted(marks)[:max_events]:
             draw = capture.draw_calls[index]
-            timeline.append(
-                {
-                    "draw_index": draw.index,
-                    "global_id": draw.global_id,
-                    "api": draw.api,
-                    "pass_name": draw.pass_name,
-                    "access": sorted(marks[index]),
-                }
-            )
+            labels = bindinglabel.labels_for(capture, draw, resource_id)
+            row: dict[str, Any] = {
+                "draw_index": draw.index,
+                "global_id": draw.global_id,
+                "queue_id": draw.queue_id,
+                "api": draw.api,
+                "pass_name": draw.pass_name,
+                "access": sorted(marks[index]),
+                "event_type": "action",
+            }
+            # PIX numbers an ExecuteIndirect's expanded child, not the
+            # ExecuteIndirect itself, so the id shown in the UI is one higher.
+            # Both are reported: global_id addresses the export, gui_global_id is
+            # what a user reads off the PIX window.
+            if draw.global_id is not None:
+                row["gui_global_id"] = (
+                    draw.global_id + 1 if draw.api == "ExecuteIndirect" else draw.global_id
+                )
+            if labels:
+                row["binding"] = labels[0].text
+                row["binding_detail"] = [label.to_dict() for label in labels]
+            timeline.append(row)
 
     views: list[dict[str, Any]] = []
     include_views = args.get("include_views")
@@ -277,7 +304,79 @@ def resource_usage(args: dict[str, Any], context: ToolContext) -> ToolResult:
         "views": views[:40],
         "hazards": hazards[:20],
     }
+
+    if bool(args.get("include_resource_events")):
+        events = resourceevents.events_for_resource(
+            capture.resource_events, resource_id
+        )
+        rows: list[dict[str, Any]] = []
+        for event in events:
+            touch = event.touch_for(resource_id)
+            if touch is None:
+                continue
+            row: dict[str, Any] = {
+                "global_id": event.global_id,
+                "gui_global_id": event.global_id,
+                "api": event.api,
+                "event_type": event.event_type,
+                "access": [touch.access],
+                "source": f"{event.source_file}:{event.source_line}",
+            }
+            if touch.access == "state_transition":
+                row["states"] = {
+                    "before": touch.state_before,
+                    "after": touch.state_after,
+                }
+                row["binding"] = bindinglabel.api_parameter_label(
+                    touch.parameter_index, touch.parameter_count
+                ).text
+            elif event.event_type == "barrier":
+                row["binding"] = bindinglabel.api_parameter_label(
+                    touch.parameter_index, touch.parameter_count
+                ).text
+            elif event.event_type == "clear":
+                # A clear reaches the resource through the output merger, but via a
+                # descriptor built inline for the call, so there is no RTV slot to
+                # name -- which is exactly what PIX renders as "OM [None]".
+                row["binding"] = "OM [None]"
+                if event.clear_value is not None:
+                    row["clear_value"] = event.clear_value
+            else:
+                row["binding"] = bindinglabel.api_parameter_label(
+                    touch.parameter_index, touch.parameter_count
+                ).text
+            rows.append(row)
+
+        data["resource_events"] = rows
+        data["resource_event_count"] = len(rows)
+        data["state_timeline"] = resourceevents.state_timeline(events, resource_id)
+
+        # The merged view is what lines up with the PIX resource-history window:
+        # actions and non-draw events interleaved in Global ID order.
+        merged = [dict(row) for row in timeline] + rows
+        merged.sort(
+            key=lambda row: (
+                row.get("gui_global_id")
+                if row.get("gui_global_id") is not None
+                else (row.get("global_id") if row.get("global_id") is not None else 1 << 62)
+            )
+        )
+        data["combined_history"] = merged
+        data["combined_history_count"] = len(merged)
+
     result = ToolResult.success(data)
     if entry is None:
         result.degrade("This resource is never referenced by a draw in the captured frame.")
+    if bool(args.get("include_resource_events")):
+        inconsistent = [
+            row for row in data.get("state_timeline", []) if row.get("inconsistent")
+        ]
+        if inconsistent:
+            result.add_diagnostic(
+                "warning",
+                f"{len(inconsistent)} state transition(s) do not start from the state the "
+                "previous transition left the resource in. That means the state changed "
+                "outside these barriers -- a split barrier, or another queue -- so the "
+                "timeline is not a closed chain.",
+            )
     return result

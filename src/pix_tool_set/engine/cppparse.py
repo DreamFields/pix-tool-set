@@ -153,7 +153,35 @@ def parse_resources(root: Path) -> dict[int, Resource]:
                 # Read() across the whole export has been numbered in program
                 # order (see collect_resource_reads).
                 current.data_blob_index = -1
+    _apply_resource_names(root, resources)
     return resources
+
+
+def _apply_resource_names(root: Path, resources: dict[int, Resource]) -> None:
+    """Attach the engine's debug name to each resource.
+
+    PIX names objects through a generic ``GetObject(n)->SetName(...)`` that sits in
+    FrameResources_*.cpp, thousands of lines away from the CreateAndInitResource_*
+    block that declares the resource, which is why this is a second sweep keyed by
+    object id rather than something the main loop can pick up.
+
+    Without this, a resource can only be referred to by its numeric id, so a
+    payload cannot say "GBufferA" where the PIX UI does -- the caller is left to
+    map ids to names by hand. The same SetName statements also name queues and
+    fences; ids that are not resources simply have no entry here and are skipped,
+    so a name landing on a non-resource object cannot invent a resource.
+    """
+    for path in sorted_group(root, "FrameResources"):
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in _RE_OBJECT_NAME.finditer(text):
+            resource = resources.get(int(match.group(1)))
+            # First name wins: re-naming an object mid-frame is legal in D3D12 but
+            # the capture's own UI shows the name it was created with.
+            if resource is not None and not resource.name:
+                resource.name = match.group(2)
+
 
 
 # resources.bin is one sequential XPRESS stream with no index table, so a blob can
@@ -1631,16 +1659,36 @@ class CommandListParser:
             state["pending_ibv"] = {}
         elif api == "IASetPrimitiveTopology":
             state["topology"] = argtext.strip(") ;\n")
+        elif api in ("ClearRenderTargetView", "ClearDepthStencilView"):
+            # A clear builds its own descriptor into the scratch heap on the line
+            # above and consumes it immediately. If it is left in the pending list
+            # it leaks into the next OMSetRenderTargets fallback, which then
+            # reports the cleared resource as a target of an unrelated draw. On
+            # Tiled.wpix six consecutive clears did exactly that, and the following
+            # single-target draw came out bound to all six.
+            state["inline_rtv_res"] = []
+            state["inline_dsv_res"] = None
+
         elif api == "OMSetRenderTargets":
             numbers = _ints(argtext)
             count = numbers[0] if numbers else 0
             rtvs = state["pending_rtv"][-count:] if count else []
             state["rtv_heap"] = list(rtvs)
             state["dsv"] = state["pending_dsv"]
-            state["rt_res"] = self._resolve_render_targets(rtvs, state)
+            state["rt_res"] = self._resolve_render_targets(rtvs, state, count)
             state["ds_res"] = self._resolve_depth(state["dsv"], state)
             state["pending_rtv"] = []
             state["pending_dsv"] = None
+            # The inline RTV/DSV descriptors are consumed by this call and must not
+            # survive it. They used to accumulate for the whole command list, and
+            # because the fallback below deduplicated the entire list, a draw that
+            # bound a single render target was reported as binding every target the
+            # command list had ever created -- a false positive that is
+            # indistinguishable from a real multi-target bind. See
+            # _resolve_render_targets for why the fallback exists at all.
+            state["inline_rtv_res"] = []
+            state["inline_dsv_res"] = None
+
         elif api == "RSSetViewports":
             state["viewports"] = [
                 {
@@ -1664,15 +1712,32 @@ class CommandListParser:
                 for m in _RE_SCISSOR.finditer(argtext)
             ]
 
-    def _resolve_render_targets(self, rtvs, state) -> list[int]:
+    def _resolve_render_targets(self, rtvs, state, count: int | None = None) -> list[int]:
+        """Resolve the bound render targets to resource ids.
+
+        Two sources, in priority order. Descriptor-heap handles are authoritative
+        when present. But PIX also emits an inline form, where the RTV is created
+        straight into a scratch heap and bound via
+        GetCPUDescriptorHandleForHeapStart(), which carries no heap index and so
+        yields no ``pending_rtv`` entry at all -- hence the fallback.
+
+        The fallback is bounded by ``count``: OMSetRenderTargets states how many
+        targets it binds, and only the last ``count`` inline descriptors belong to
+        this call. Without that bound the fallback reported every inline RTV the
+        command list had created, turning a one-target bind into a six-target one.
+        """
         out: list[int] = []
         for heap_id, index in rtvs:
             view = self.views.get((heap_id, index))
             if view is not None and view.resource_id is not None:
                 out.append(view.resource_id)
         if not out and state["inline_rtv_res"]:
-            out = list(dict.fromkeys(state["inline_rtv_res"]))
+            inline = list(dict.fromkeys(state["inline_rtv_res"]))
+            if count:
+                inline = inline[-count:]
+            out = inline
         return out
+
 
     def _resolve_depth(self, dsv, state):
         if dsv is not None:
