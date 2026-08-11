@@ -37,5 +37,6 @@ def load_builtin_tools() -> None:
     from . import replay_render_tools  # noqa: F401
     from . import replay_session_tools  # noqa: F401
     from . import pixel_debug_tools  # noqa: F401
+    from . import snapshot_tools  # noqa: F401
 
     _LOADED = True

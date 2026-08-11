@@ -20,12 +20,19 @@ description: >-
 - `shader-info` → `sibling_psos`：同一 shader 被多少 PSO 引用
 - `replay-baseline-check`：null-patch 基线检查（D5 信任门）
 - `replay-edits`：查看当前补丁列表
-- `replay-reset`：一键回退所有补丁
-- `frame-replay-dump`：全帧资源 dump
+- `replay-reset`：一键回退所有补丁；`clean` 按三个注入器分报（shader-edit / read-uav 探针 / pixel-history 探针），默认顺带还原探针
+- `frame-replay-dump`：全帧资源 dump；加 `--snapshot` 则每次落在独立编号目录并记录当时的编辑状态
 - `pixel-value-history`：像素值变化历史
 - `trace-downstream`：下游影响链追踪
 - `shader-edit-diff --checkpoint`：跨编辑检查点对比
 - `pixel-history-replay`：GPU 回放实测单个纹素的 Previous/New Value（PIX Pixel History 面板对齐）
+- `snapshot-list` / `snapshot-compare` / `snapshot-remove`：浏览与逐资源比对每次编辑的整帧快照
+
+### 多次编辑的推荐流程
+先 `frame-replay-dump --snapshot` 存基线（0000-baseline），之后每改一次 shader 就再存一次，
+快照目录位于 `<capture>.pixcache/snapshots/NNNN-label/`（与 `cpp/` 平级，不受 patch/rebuild/reset 影响）。
+用 `snapshot-compare --a 0 --b 1` 看这次编辑到底改了整帧里的哪些资源——
+字节相同即证明该资源未被触碰，比统计量相等更强。序号只增不复用，删掉一个不会让其余重新编号。
 
 ## 0. 铁律
 

@@ -33,7 +33,9 @@ from typing import Any
 
 from ..context import ToolContext
 from ..engine.editledger import EditLedger
-from ..engine import activity, screencap, uavprobe
+from ..engine import activity, exportstate, framesnapshot, screencap, uavprobe
+
+
 from ..errors import PixToolError, not_found
 from ..results import ToolResult
 from ._common import tool, with_session
@@ -403,7 +405,13 @@ _RESET_NOTE = (
     "Revert all shader-edit-apply patches in the export: restore CreatePSOs.cpp from "
     "its .orig backup, delete every edited_*.dxil override file, and clear the edit "
     "ledger. The export returns to its post-session-open state so a new edit cycle "
-    "can begin. The baseline cache is also invalidated, because the export has changed."
+    "can begin. The baseline cache is also invalidated, because the export has changed.\n\n"
+    "Three separate mechanisms inject into an export -- shader-edit-apply, the read-uav "
+    "readback probe, and the pixel-history-replay sampler -- so 'clean' is reported per "
+    "injector rather than as one flag. Leftover probes are restored too unless "
+    "--keep-probes is given: a probe left installed would be compiled into the next "
+    "replay, and reporting the export clean while one is present is the failure this "
+    "tool used to have."
 )
 
 
@@ -416,16 +424,28 @@ _RESET_NOTE = (
             "type": "boolean",
             "description": "Do not invalidate the baseline cache. Default false.",
         },
+        keep_probes={
+            "type": "boolean",
+            "description": (
+                "Leave the read-uav and pixel-history-replay probes installed. Default "
+                "false: probes are restored, because one left behind is compiled into "
+                "the next replay. The export is still reported as not clean when they "
+                "are kept, so the state is never misrepresented."
+            ),
+        },
     ),
     returns="List of reverted patches and cleaned files.",
     examples=[
         "pix-tool-set replay-reset",
+        "pix-tool-set replay-reset --keep-probes",
     ],
     notes=_RESET_NOTE,
 )
 def replay_reset(args: dict[str, Any], context: ToolContext) -> ToolResult:
     root = _export_root(context, args)
     ledger = EditLedger(root)
+
+    state_before = exportstate.inspect(root)
 
     # 1. Revert patches recorded in the ledger.
     ledger_reverted = ledger.reset()
@@ -447,7 +467,14 @@ def replay_reset(args: dict[str, Any], context: ToolContext) -> ToolResult:
     # 4. Clear the ledger.
     ledger.clear()
 
-    # 5. Invalidate the baseline cache (the export has changed).
+    # 5. Restore the readback/sampling probes. They are a different injector from
+    #    shader-edit-apply and were previously invisible here, which is how a reset
+    #    could report the export clean while a probe was still installed.
+    probes_restored: dict[str, Any] = {}
+    if not args.get("keep_probes"):
+        probes_restored = exportstate.restore_all(root)
+
+    # 6. Invalidate the baseline cache (the export has changed).
     baseline_invalidated = False
     if not args.get("keep_baseline"):
         cache_file = root / "baseline.json"
@@ -455,28 +482,51 @@ def replay_reset(args: dict[str, Any], context: ToolContext) -> ToolResult:
             cache_file.unlink()
             baseline_invalidated = True
 
+    state_after = exportstate.inspect(root)
+
     data = {
         "orig_restored": orig_restored,
         "deleted_dxils": deleted_dxils,
         "deleted_dxil_count": len(deleted_dxils),
         "ledger_reverted": ledger_reverted,
         "baseline_invalidated": baseline_invalidated,
-        "clean": not detect_patches(root),
+        "probes_restored": probes_restored,
+        # Reported per injector: a single boolean cannot say "the shader patches are
+        # gone but a probe is still installed", and that is exactly the state that
+        # used to be mislabelled as clean.
+        "shader_edits_clean": not state_after["shader_edit"]["injected"],
+        "uav_probe_clean": not state_after["uav_probe"]["injected"],
+        "pixel_probe_clean": not state_after["pixel_probe"]["injected"],
+        "clean": state_after["clean"],
+        "injectors_present": state_after["injectors_present"],
+        "state_before": state_before,
+        "state_after": state_after,
     }
     result = ToolResult.success(data)
     if not data["clean"]:
-        result.degrade(
-            "After reset, patches are still detectable in the filesystem. The export "
-            "may need to be re-exported with session-open.",
-            reason="detect_patches found remaining patches after reset",
-        )
+        remaining = ", ".join(state_after["injectors_present"])
+        if args.get("keep_probes"):
+            result.add_diagnostic(
+                "warning",
+                f"Injections remain by request (--keep-probes): {remaining}. The export "
+                "is not clean; replay-baseline-check will not be meaningful until they "
+                "are restored.",
+            )
+        else:
+            result.degrade(
+                f"Injections are still present after reset: {remaining}. Each injector "
+                "has its own restore path; see state_after for the files involved.",
+                reason="post-reset inspection still finds injected markers",
+            )
     else:
         result.add_diagnostic(
             "info",
-            "All patches reverted and ledger cleared. The export is clean — safe to run "
-            "replay-baseline-check or start a new edit cycle.",
+            "Export is clean across all three injectors (shader edits, read-uav probe, "
+            "pixel-history probe) — safe to run replay-baseline-check or start a new "
+            "edit cycle.",
         )
     return result
+
 
 
 # ======================================================================
@@ -506,9 +556,34 @@ _DUMP_NOTE = (
         output={
             "type": "string",
             "description": (
-                "Directory for all dump files. Defaults to the activity log directory."
+                "Directory for all dump files. Defaults to the activity log directory. "
+                "Ignored when --snapshot is used, which allocates its own directory."
             ),
         },
+        snapshot={
+            "type": "boolean",
+            "description": (
+                "Write this dump into a new numbered snapshot directory beside the "
+                "export (<capture>.pixcache/snapshots/NNNN-label/), together with a "
+                "manifest recording which shader edits were applied when it was taken. "
+                "One directory per edit, so 'the frame before this change' and 'after' "
+                "both remain on disk and cannot be mixed up. Use snapshot-list to see "
+                "them."
+            ),
+        },
+        snapshot_label={
+            "type": "string",
+            "description": (
+                "Name for the snapshot directory. Defaults to a label derived from the "
+                "current edit state ('baseline', 'edit-PS-a1b2c3'). The sequence number "
+                "is always prefixed and is never reused."
+            ),
+        },
+        snapshot_note={
+            "type": "string",
+            "description": "Free-text note stored in the snapshot manifest.",
+        },
+
         resource_types={
             "type": "array",
             "items": {"type": "string", "enum": ["uav", "rt", "depth", "all"]},
@@ -701,10 +776,33 @@ def frame_replay_dump(args: dict[str, Any], context: ToolContext) -> ToolResult:
             exe = Path(steps["executable"])
 
         # --- Run the probe with all resource IDs as comma-separated targets.
-        output_dir = Path(str(args["output"])) if args.get("output") else activity.renders_dir()
+        # A snapshot allocates its own directory and records the edit state that
+        # produced this dump, which is what makes two dumps comparable later. Its
+        # manifest is written before the run, so an interrupted replay still leaves
+        # a record of what was being attempted.
+        snapshot_record: dict[str, Any] | None = None
+        if bool(args.get("snapshot")):
+            snapshot_record = framesnapshot.create(
+                root,
+                label=args.get("snapshot_label"),
+                note=str(args.get("snapshot_note") or ""),
+            )
+            output_dir = Path(snapshot_record["path"])
+            data["snapshot"] = snapshot_record
+            if args.get("output"):
+                diagnostics.append((
+                    "info",
+                    "--output was ignored because --snapshot allocates its own "
+                    f"directory: {output_dir}",
+                ))
+        elif args.get("output"):
+            output_dir = Path(str(args["output"]))
+        else:
+            output_dir = activity.renders_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         prefix = output_dir / f"framedump_{stamp}"
+
 
         environment = dict(os.environ)
         environment[uavprobe.ENV_TARGETS] = ",".join(str(rid) for rid in resource_ids)
@@ -794,6 +892,24 @@ def frame_replay_dump(args: dict[str, Any], context: ToolContext) -> ToolResult:
         data["dumps"] = dumps
         data["dumped_count"] = sum(1 for d in dumps if d.get("dumped"))
 
+        if snapshot_record is not None:
+            # A snapshot whose replay did not finish cleanly is kept, not discarded:
+            # deleting it would destroy the evidence of the failure. It is flagged
+            # instead, so a later comparison can refuse it rather than silently
+            # diffing partial data.
+            data["snapshot"] = framesnapshot.finalise(
+                root,
+                snapshot_record,
+                dump_summary={
+                    "resource_count": len(targets),
+                    "dumped_count": data["dumped_count"],
+                    "resource_types": resource_types,
+                    "at": data["at"],
+                    "capped": capped,
+                },
+                reliable=not frame_end_unreliable,
+            )
+
     finally:
         if keep_probe:
             data["probe_cleanup"] = {"action": "left installed (--keep-probe)"}
@@ -817,5 +933,15 @@ def frame_replay_dump(args: dict[str, Any], context: ToolContext) -> ToolResult:
         "Each dump records the resource's last-read and last-write draw index for "
         "correlation with the command stream.",
     )
+    if isinstance(data.get("snapshot"), dict):
+        snap = data["snapshot"]
+        edits = (snap.get("edit_state") or {}).get("edit_count", 0)
+        result.add_diagnostic(
+            "info",
+            f"Snapshot {snap.get('sequence')} written to {snap.get('path')} "
+            f"({edits} shader edit(s) applied when it was taken). Run snapshot-list to "
+            "see every snapshot, or snapshot-compare to diff two of them.",
+        )
     return result
+
 
