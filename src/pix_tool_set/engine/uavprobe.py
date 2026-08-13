@@ -65,6 +65,11 @@ MARKER = "// pix-tool-set: UAV readback probe injected by read-uav"
 ENV_TARGETS = "PIXTS_PROBE_TARGETS"
 ENV_OUT = "PIXTS_PROBE_OUT"
 ENV_STATE = "PIXTS_PROBE_STATE"
+#: Which mip the probe copies. A mip-chain pass such as UE5's ReduceHZB binds the
+#: same texture at several mips at once (mips 4..7 in one dispatch), and the readback
+#: previously hard-coded subresource 0, so every requested mip returned the top
+#: level's bytes -- identical output that silently looked like a successful export.
+ENV_MIP = "PIXTS_PROBE_MIP"
 
 #: D3D12_RESOURCE_STATE_UNORDERED_ACCESS. The state a compute UAV is left in at the
 #: end of the recorded frame, and so the default StateBefore for the copy barrier.
@@ -90,6 +95,10 @@ PROBE_SOURCE = r'''// pix-tool-set: UAV readback probe injected by read-uav. Do 
 //                        plus <prefix>_<id>.bin.txt, and <prefix>.done when finished
 //   PIXTS_PROBE_STATE    optional D3D12_RESOURCE_STATES value the resource is in
 //                        (default 8 = UNORDERED_ACCESS)
+//   PIXTS_PROBE_MIP      optional mip level to copy (default 0). A mip-chain pass
+//                        binds one texture at several mips in a single dispatch, so
+//                        the subresource must be selectable; hard-coding 0 returned
+//                        the top level for every request.
 //
 // With no targets set it does nothing at all, so a leftover binary is harmless.
 //
@@ -161,6 +170,17 @@ namespace
         return static_cast<D3D12_RESOURCE_STATES>(strtoul(buffer, nullptr, 10));
     }
 
+    UINT ProbeMipLevel()
+    {
+        char buffer[64]{};
+        DWORD length = GetEnvironmentVariableA("PIXTS_PROBE_MIP", buffer, 64);
+        if (length == 0 || length >= 64)
+        {
+            return 0;
+        }
+        return static_cast<UINT>(strtoul(buffer, nullptr, 10));
+    }
+
     ID3D12CommandQueue* FindDirectQueue()
     {
         // g_cmdQueue in Helpers.h is a function-local, so the tracked map is the only
@@ -186,7 +206,8 @@ namespace
     }
 
     bool DumpOne(ApiObjectId resourceId, const std::wstring& prefix,
-                 D3D12_RESOURCE_STATES sourceState, ID3D12CommandQueue* queue)
+                 D3D12_RESOURCE_STATES sourceState, ID3D12CommandQueue* queue,
+                 UINT mipLevel)
     {
         auto found = g_resources.find(resourceId);
         if (found == g_resources.end() || !found->second)
@@ -200,12 +221,32 @@ namespace
         ComPtr<ID3D12Resource> source = found->second;
         const D3D12_RESOURCE_DESC desc = source->GetDesc();
 
+        // Refuse a mip the resource does not have rather than clamping to 0. Clamping
+        // would hand back the top level's bytes under the requested mip's filename,
+        // which is indistinguishable from a correct export.
+        if (mipLevel >= desc.MipLevels)
+        {
+            char message[256]{};
+            sprintf_s(message,
+                      "[pix-tool-set] probe: resource %u has %u mip(s), mip %u requested\n",
+                      static_cast<unsigned>(resourceId),
+                      static_cast<unsigned>(desc.MipLevels),
+                      static_cast<unsigned>(mipLevel));
+            Report(message);
+            return false;
+        }
+
+        // For a 2D non-array texture the subresource index equals the mip level.
+        // Arrays would need mip + arraySlice * mipLevels; this probe copies plane 0
+        // of slice 0, which is what the HZB-style cases need.
+        const UINT subresource = mipLevel;
+
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
         UINT numRows = 0;
         UINT64 rowSizeBytes = 0;
         UINT64 totalBytes = 0;
         g_device->GetCopyableFootprints(
-            &desc, 0, 1, 0, &footprint, &numRows, &rowSizeBytes, &totalBytes);
+            &desc, subresource, 1, 0, &footprint, &numRows, &rowSizeBytes, &totalBytes);
         if (totalBytes == 0)
         {
             Report("[pix-tool-set] probe: footprint is empty\n");
@@ -262,7 +303,10 @@ namespace
         toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         toCopy.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
         toCopy.Transition.pResource = source.Get();
-        toCopy.Transition.Subresource = 0;
+        // Must match the subresource being copied. Transitioning subresource 0 while
+        // copying mip N leaves mip N in UNORDERED_ACCESS during a COPY_SOURCE read,
+        // which is a silent barrier mismatch the debug layer would flag.
+        toCopy.Transition.Subresource = subresource;
         toCopy.Transition.StateBefore = sourceState;
         toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         if (needsBarrier)
@@ -278,7 +322,7 @@ namespace
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = source.Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = 0;
+        src.SubresourceIndex = subresource;
 
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
@@ -316,7 +360,17 @@ namespace
         }
 
         wchar_t suffix[64]{};
-        swprintf_s(suffix, L"_%u.bin", static_cast<unsigned>(resourceId));
+        // The mip is part of the name: two mips of one resource are two different
+        // images, and a shared filename made the second overwrite the first.
+        if (mipLevel == 0)
+        {
+            swprintf_s(suffix, L"_%u.bin", static_cast<unsigned>(resourceId));
+        }
+        else
+        {
+            swprintf_s(suffix, L"_%u_mip%u.bin", static_cast<unsigned>(resourceId),
+                       static_cast<unsigned>(mipLevel));
+        }
         const std::wstring binPath = prefix + suffix;
 
         std::ofstream out(binPath.c_str(), std::ios::binary);
@@ -325,14 +379,19 @@ namespace
         readback->Unmap(0, nullptr);
 
         // The sidecar exists so the reader never has to guess the layout: row pitch is
-        // aligned and is not width * bytes-per-pixel.
+        // aligned and is not width * bytes-per-pixel. width/height are the *mip's*
+        // dimensions from the footprint, not the mip-0 dimensions in desc, or the
+        // reader would slice a 64x32 mip as if it were 1024x512.
         std::ofstream meta((binPath + L".txt").c_str());
         meta << "resource_id=" << static_cast<unsigned>(resourceId) << "\n"
-             << "width=" << desc.Width << "\n"
-             << "height=" << desc.Height << "\n"
+             << "width=" << footprint.Footprint.Width << "\n"
+             << "height=" << footprint.Footprint.Height << "\n"
+             << "resource_width=" << desc.Width << "\n"
+             << "resource_height=" << desc.Height << "\n"
              << "depth_or_array_size=" << desc.DepthOrArraySize << "\n"
              << "mip_levels=" << desc.MipLevels << "\n"
-             << "subresource=0\n"
+             << "mip=" << mipLevel << "\n"
+             << "subresource=" << subresource << "\n"
              << "format=" << static_cast<int>(desc.Format) << "\n"
              << "footprint_format=" << static_cast<int>(footprint.Footprint.Format) << "\n"
              << "row_pitch=" << footprint.Footprint.RowPitch << "\n"
@@ -386,10 +445,11 @@ void PixToolSetProbeReadback()
     }
 
     const D3D12_RESOURCE_STATES sourceState = ProbeSourceState();
+    const UINT mipLevel = ProbeMipLevel();
     unsigned succeeded = 0;
     for (ApiObjectId resourceId : targets)
     {
-        if (DumpOne(resourceId, prefix, sourceState, queue))
+        if (DumpOne(resourceId, prefix, sourceState, queue, mipLevel))
         {
             ++succeeded;
         }
@@ -399,7 +459,8 @@ void PixToolSetProbeReadback()
     // and produced nothing" without polling on a timeout alone.
     std::ofstream sentinel((prefix + L".done").c_str());
     sentinel << "dumped=" << succeeded << "\n"
-             << "requested=" << targets.size() << "\n";
+             << "requested=" << targets.size() << "\n"
+             << "mip=" << mipLevel << "\n";
     sentinel.close();
 }
 '''
@@ -585,12 +646,14 @@ class ProbeDump:
     state_before: int
     bin_path: Path
     sidecar_path: Path
+    mip: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "resource_id": self.resource_id,
             "width": self.width,
             "height": self.height,
+            "mip": self.mip,
             "dxgi_format": self.dxgi_format,
             "format": format_name(self.dxgi_format),
             "row_pitch": self.row_pitch,
@@ -642,6 +705,7 @@ def read_sidecar(bin_path: Path) -> ProbeDump:
         total_bytes=fields.get("total_bytes", 0),
         subresource=fields.get("subresource", 0),
         state_before=fields.get("state_before", STATE_UNORDERED_ACCESS),
+        mip=fields.get("mip", 0),
         bin_path=Path(bin_path),
         sidecar_path=sidecar,
     )

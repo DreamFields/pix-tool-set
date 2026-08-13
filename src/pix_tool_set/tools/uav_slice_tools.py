@@ -177,6 +177,14 @@ def _read_uint_field(capture, draw, cbuffer: dict, field: dict) -> int | None:
             "type": "integer",
             "description": "Array slice to export. Default 0.",
         },
+        mip={
+            "type": "integer",
+            "description": (
+                "Mip level to export. Default 0. A texture's mips are separate "
+                "subresources, so a mip-chain pass needs this to reach anything but "
+                "the top level."
+            ),
+        },
         output={"type": "string", "description": "Directory for the .bin and .png."},
         png={
             "type": "boolean",
@@ -246,6 +254,20 @@ def export_uav_slice(args: dict[str, Any], context: ToolContext) -> ToolResult:
             f"0..{slices - 1}; {index} is out of range.",
         )
 
+    mip_levels = max(resource.mip_levels, 1)
+    mip = int(args.get("mip") or 0)
+    if mip < 0 or mip >= mip_levels:
+        raise invalid_argument(
+            "mip",
+            f"resource {resource_id} has {mip_levels} mip level(s), so valid values are "
+            f"0..{mip_levels - 1}; {mip} is out of range.",
+        )
+
+    # D3D12 subresource ordering: mip varies fastest, then array slice. Using the
+    # slice index alone (as this tool used to) reaches mip 0 of slice N only, so a
+    # mip-chain texture had 9 of its 10 levels unreachable.
+    subresource_index = mip + index * mip_levels
+
     try:
         blob = capture.read_resource_bytes(resource_id)
     except PixToolError as exc:
@@ -273,6 +295,9 @@ def export_uav_slice(args: dict[str, Any], context: ToolContext) -> ToolResult:
         "resolved_by": resolved_by,
         "slice": index,
         "slice_count": slices,
+        "mip": mip,
+        "mip_levels": mip_levels,
+        "subresource_index": subresource_index,
         "blob_bytes": len(blob),
         "footprint_count": len(footprints),
         "contents_are": (
@@ -282,16 +307,17 @@ def export_uav_slice(args: dict[str, Any], context: ToolContext) -> ToolResult:
     }
 
     entry = next(
-        (f for f in footprints if f.subresource_index == index),
-        footprints[index] if index < len(footprints) else None,
+        (f for f in footprints if f.subresource_index == subresource_index),
+        footprints[subresource_index] if subresource_index < len(footprints) else None,
     )
     if entry is None:
         result = ToolResult.partial(data)
         result.degrade(
-            f"No subresource footprint was recorded for slice {index}.",
+            f"No subresource footprint was recorded for mip {mip} slice {index} "
+            f"(subresource {subresource_index}).",
             reason=(
                 f"{len(footprints)} footprint(s) exist for this resource, so the row "
-                "pitch for that slice is unknown."
+                "pitch for that subresource is unknown."
             ),
         )
         return result
@@ -353,7 +379,7 @@ def export_uav_slice(args: dict[str, Any], context: ToolContext) -> ToolResult:
         directory = Path(str(output))
         directory.mkdir(parents=True, exist_ok=True)
         stem = (
-            f"resource{resource_id}_slice{index}_"
+            f"resource{resource_id}_slice{index}_mip{mip}_"
             f"{entry.width}x{entry.height}_"
             f"{entry.format.replace('DXGI_FORMAT_', '')}"
         )

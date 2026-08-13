@@ -501,9 +501,23 @@ def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
         stage={"type": "string", "enum": _STAGES, "description": "Shader stage to inspect."},
         slot={"type": "integer", "description": "cbuffer register index (b#) to focus on."},
         max_bytes={"type": "integer", "description": "Cap on dumped bytes per buffer. Default 512."},
+        output={
+            "type": "string",
+            "description": (
+                "Directory to write the cbuffer contents to: a .bin of the raw bytes at "
+                "the bound offset plus a .json of the decoded fields. Without it the "
+                "values are printed only, which is impractical to diff or archive."
+            ),
+        },
     ),
-    returns="cbuffer layouts, the root parameter that supplies them, and decoded values when the bytes were captured.",
-    examples=["pix-tool-set constant-buffer --draw-index 2461 --stage PS"],
+    returns=(
+        "cbuffer layouts, the root parameter that supplies them, decoded values when the "
+        "bytes were captured, and the written file paths when --output is given."
+    ),
+    examples=[
+        "pix-tool-set constant-buffer --draw-index 2461 --stage PS",
+        "pix-tool-set constant-buffer --global-id 3163 --stage CS --output G:\\out",
+    ],
     notes=(
         "Values come from the captured contents of the buffer the root CBV points at, "
         "read out of resources.bin at the recorded byte offset and decoded against the "
@@ -590,6 +604,8 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
             else:
                 entry["bytes_read"] = len(blob)
                 entry["hexdump"] = values_mod.hexdump(blob, limit=min(max_bytes, 256))
+                # Kept out of the JSON payload; only used to write the .bin below.
+                entry["_blob"] = blob
                 decoded_blocks = []
                 for layout in matched:
                     fields = layout.get("fields") or []
@@ -627,16 +643,83 @@ def constant_buffer(args: dict[str, Any], context: ToolContext) -> ToolResult:
                     decoded_any = decoded_any or bool(decoded_blocks)
         suppliers.append(entry)
 
+    # Write the contents out when asked. Done after the loop so one directory holds
+    # every supplier of this draw, named by root index so two CBVs cannot collide.
+    written: list[dict[str, Any]] = []
+    output = args.get("output")
+    if output:
+        from pathlib import Path
+        import json as _json
+
+        directory = Path(str(output))
+        directory.mkdir(parents=True, exist_ok=True)
+        for entry in suppliers:
+            blob = entry.get("_blob")
+            if not blob:
+                continue
+            # Trim to the size the shader declares rather than dumping the whole
+            # 4096-byte page that was read. A 64-byte cbuffer padded out to a page
+            # buries the real values in unrelated bytes that belong to other
+            # allocations in the same suballocated buffer.
+            declared_size = 0
+            for block in entry.get("decoded") or []:
+                if block.get("declared_size"):
+                    declared_size = max(declared_size, int(block["declared_size"]))
+            payload_bytes = blob[:declared_size] if declared_size else blob
+            stem = (
+                f"cbv_gid{draw.global_id}_root{entry['root_index']}"
+                f"_res{entry.get('resource_id')}"
+            )
+            bin_path = directory / f"{stem}.bin"
+            bin_path.write_bytes(payload_bytes)
+            files: dict[str, Any] = {
+                "root_index": entry["root_index"],
+                "resource_id": entry.get("resource_id"),
+                "bin_path": str(bin_path),
+                "bytes": len(payload_bytes),
+                "byte_offset": entry.get("byte_offset"),
+                "trimmed_to_declared_size": bool(declared_size),
+            }
+            if entry.get("decoded"):
+                json_path = directory / f"{stem}.json"
+                json_path.write_text(
+                    _json.dumps(
+                        {
+                            "global_id": draw.global_id,
+                            "draw_index": draw.index,
+                            "root_index": entry["root_index"],
+                            "resource_id": entry.get("resource_id"),
+                            "byte_offset": entry.get("byte_offset"),
+                            "values_available": entry.get("values_available"),
+                            "cbuffers": entry["decoded"],
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                files["json_path"] = str(json_path)
+            written.append(files)
+
+    # The raw bytes are not JSON-serialisable and would bloat the payload anyway.
+    for entry in suppliers:
+        entry.pop("_blob", None)
+
+    data: dict[str, Any] = {
+        "draw_index": draw.index,
+        "global_id": draw.global_id,
+        "stages": [shader.stage.value for shader in shaders],
+        "declared_cbuffers": declared,
+        "layouts": layouts,
+        "root_cbv_suppliers": suppliers,
+        "values_available": decoded_any,
+    }
+    if output:
+        data["files"] = written
+
     result = ToolResult.success(
-        {
-            "draw_index": draw.index,
-            "global_id": draw.global_id,
-            "stages": [shader.stage.value for shader in shaders],
-            "declared_cbuffers": declared,
-            "layouts": layouts,
-            "root_cbv_suppliers": suppliers,
-            "values_available": decoded_any,
-        }
+        data,
+        output_paths=[item["bin_path"] for item in written],
     )
     stale = [s for s in suppliers if s.get("values_are_stale")]
     if not layouts:

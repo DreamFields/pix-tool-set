@@ -225,14 +225,18 @@ def _resolve_target(capture, args: dict[str, Any]) -> dict[str, Any]:
 # ======================================================================
 # running the probe
 # ======================================================================
-def _await_dump(prefix: Path, resource_id: int, deadline: float) -> Path | None:
+def _await_dump(prefix: Path, resource_id: int, deadline: float, mip: int = 0) -> Path | None:
     """Wait for the probe's sentinel, then hand back the dump it announced.
 
     The sentinel is written after the dumps, so its presence means "the probe ran to
     completion" rather than "a file appeared". Polling on the .bin alone would risk
     reading a partially written file, and a fixed sleep would either be wrong or slow.
+
+    ``mip`` must match the suffix the probe chose, or a mip-N run would wait for a
+    mip-0 filename that is never written and time out as "no dump produced".
     """
-    target = prefix.parent / f"{prefix.name}_{resource_id}.bin"
+    suffix = f"_{resource_id}.bin" if mip == 0 else f"_{resource_id}_mip{mip}.bin"
+    target = prefix.parent / f"{prefix.name}{suffix}"
     while time.time() < deadline:
         if uavprobe.summarise_probe_log(prefix).get("finished"):
             # The sidecar is written after the .bin, so wait for it too.
@@ -250,12 +254,14 @@ def _run_probe(
     resource_id: int,
     state: int,
     settle: int,
+    mip: int = 0,
 ) -> dict[str, Any]:
     """Replay the frame once with the probe armed, and wait for its dump."""
     environment = dict(os.environ)
     environment[uavprobe.ENV_TARGETS] = str(resource_id)
     environment[uavprobe.ENV_OUT] = str(prefix)
     environment[uavprobe.ENV_STATE] = str(state)
+    environment[uavprobe.ENV_MIP] = str(mip)
 
     # The working directory must be the export root: resources.bin and any
     # edited_*.dxil are resolved relative to it.
@@ -267,11 +273,12 @@ def _run_probe(
             uavprobe.ENV_TARGETS: str(resource_id),
             uavprobe.ENV_OUT: str(prefix),
             uavprobe.ENV_STATE: str(state),
+            uavprobe.ENV_MIP: str(mip),
         },
     }
     started = time.time()
     try:
-        dump = _await_dump(prefix, resource_id, started + settle)
+        dump = _await_dump(prefix, resource_id, started + settle, mip)
         info["seconds"] = round(time.time() - started, 1)
         info["probe"] = uavprobe.summarise_probe_log(prefix)
         info["dump"] = str(dump) if dump else None
@@ -368,6 +375,14 @@ def _run_probe(
                 "Default 8 (UNORDERED_ACCESS), which is where a compute UAV is left."
             ),
         },
+        mip={
+            "type": "integer",
+            "description": (
+                "Mip level to read back. Default 0. A mip-chain pass binds one texture "
+                "at several mips in a single dispatch (UE5's ReduceHZB writes mips 4..7 "
+                "at once), so the mip must be named to get that UAV's own output."
+            ),
+        },
     ),
     returns=(
         "The resolved resource id and the descriptor facts behind it, the readback "
@@ -377,6 +392,7 @@ def _run_probe(
     examples=[
         "pix-tool-set read-uav --queue-id 18704 --name RWNormalTexture --output G:\\out",
         "pix-tool-set read-uav --resource-id 3032 --pixels 8",
+        "pix-tool-set read-uav --resource-id 791 --mip 4 --output G:\\out",
         "pix-tool-set read-uav --queue-id 18704 --name RWNormalTexture --keep-probe",
     ],
     notes=_NOTE,
@@ -401,10 +417,23 @@ def read_uav(args: dict[str, Any], context: ToolContext) -> ToolResult:
     state = int(args.get("source_state") or uavprobe.STATE_UNORDERED_ACCESS)
     keep_probe = bool(args.get("keep_probe"))
 
+    # Rejected here rather than inside the probe: a bad mip would otherwise cost a
+    # full rebuild and replay before failing, and the resource's mip count is already
+    # known from the export.
+    mip = int(args.get("mip") or 0)
+    mip_levels = max(resource.mip_levels, 1)
+    if mip < 0 or mip >= mip_levels:
+        raise invalid_argument(
+            "mip",
+            f"resource {resource_id} has {mip_levels} mip level(s), so valid values are "
+            f"0..{mip_levels - 1}; {mip} is out of range.",
+        )
+
     data: dict[str, Any] = {
         "export_dir": str(root),
         "target": target,
         "resource": resource.to_dict(),
+        "mip": mip,
         "contents_are": _SEMANTICS,
     }
     diagnostics: list[tuple[str, str]] = []
@@ -464,7 +493,7 @@ def read_uav(args: dict[str, Any], context: ToolContext) -> ToolResult:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         prefix = output / f"uav_{stamp}"
 
-        run = _run_probe(root, exe, prefix, resource_id, state, settle)
+        run = _run_probe(root, exe, prefix, resource_id, state, settle, mip)
         data["run"] = run
 
         if not run.get("dump"):
