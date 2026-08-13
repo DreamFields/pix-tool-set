@@ -92,6 +92,22 @@ def _resolve_state_object(capture, args: dict[str, Any]) -> StateObject:
     return state_object
 
 
+def _resolve_local_root_signature(capture, state_object: StateObject) -> dict[str, Any]:
+    """Expand a state object's local root signatures into their parameter tables.
+
+    The ids on ``local_root_signature_ids`` are shared across the object's exports
+    and hit groups; the table behind each is what a PIX record panel shows (a CBV
+    per space/register plus any static samplers). This returns one entry per id so
+    the caller can key an export to it.
+    """
+    resolved = state_object.local_root_signatures()
+    missing = state_object.missing_local_root_signatures
+    return {
+        "local_root_signatures": resolved,
+        "missing_local_root_signature_ids": missing,
+    }
+
+
 @tool(
     name="describe-state-object",
     summary=(
@@ -129,7 +145,8 @@ def _resolve_state_object(capture, args: dict[str, Any]) -> StateObject:
     ),
     returns=(
         "State object configuration, its export and hit group lists, the collection "
-        "graph it resolves through, and any dispatches that use it."
+        "graph it resolves through, the local root signature parameter tables each "
+        "set of shaders shares, and any dispatches that use it."
     ),
     examples=[
         "pix-tool-set describe-state-object --state-object-id 3930",
@@ -172,11 +189,30 @@ def describe_state_object(args: dict[str, Any], context: ToolContext) -> ToolRes
         if draw.state_object_id == state_object.api_id
     ]
 
+    local_rs = _resolve_local_root_signature(capture, state_object)
+    resolved_by_id = local_rs["local_root_signatures"]
+
+    def with_local_rs(entry: dict[str, Any], rs_id: Any) -> dict[str, Any]:
+        if rs_id is not None and rs_id in resolved_by_id:
+            entry["local_root_signature"] = resolved_by_id[rs_id]
+        return entry
+
+    export_rows = [
+        with_local_rs(export.to_dict(), export.local_root_signature_id)
+        for export in window
+    ]
+    hit_group_rows = [
+        with_local_rs(group.to_dict(), group.local_root_signature_id)
+        for group in hit_groups
+    ]
+
     data: dict[str, Any] = {
         "state_object": state_object.to_dict(expand=expand),
-        "exports": [export.to_dict() for export in window],
-        "hit_groups": [group.to_dict() for group in hit_groups],
+        "exports": export_rows,
+        "hit_groups": hit_group_rows,
         "resolved_state_object_ids": state_object.resolved_state_object_ids,
+        "local_root_signatures": resolved_by_id,
+        "missing_local_root_signature_ids": local_rs["missing_local_root_signature_ids"],
         "consumers": consumers,
         "consumer_count": len(consumers),
         "stage_source_note": STAGE_SOURCE_NOTE,
@@ -214,6 +250,14 @@ def describe_state_object(args: dict[str, Any], context: ToolContext) -> ToolRes
             "expand=false, so this lists only what the object itself declares. A "
             "raytracing pipeline assembled from collections declares no exports of its "
             "own; use expand=true for the shaders it can launch.",
+        )
+    if local_rs["missing_local_root_signature_ids"]:
+        result.degrade(
+            f"Local root signature id(s) {local_rs['missing_local_root_signature_ids']} "
+            "are referenced by this object but absent from the root signature export, "
+            "so their parameter tables could not be expanded.",
+            reason="local_root_signature_missing",
+            missing_local_root_signature_ids=local_rs["missing_local_root_signature_ids"],
         )
     return result
 
@@ -552,6 +596,17 @@ def analyze_acceleration_structures(
     data: dict[str, Any] = {
         "builds": rows,
         "acceleration_structure_resources": as_resources,
+        "postbuild_info": {
+            "available": bool(capture.postbuild_info),
+            "count": len(capture.postbuild_info),
+            "queries": [info.to_dict() for info in capture.postbuild_info],
+            "note": (
+                "Post-build info (actual / compacted / serialized size) is opt-in on "
+                "the application's side: it only exists when the frame called "
+                "EmitRaytracingAccelerationStructurePostbuildInfo. An empty list means "
+                "this capture never asked the driver for it, not that parsing failed."
+            ),
+        },
         "serialized_blobs": {
             "total": len(serialized),
             "serialized_bytes": sum(blob.serialized_size for blob in serialized),

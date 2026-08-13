@@ -957,6 +957,7 @@ class RootSignature:
     api_id: int
     parameters: list[RootParameter] = field(default_factory=list)
     static_sampler_count: int = 0
+    is_local: bool = False
     source_file: str = ""
     source_line: int = 0
 
@@ -976,13 +977,15 @@ class RootSignature:
         return total
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "root_signature_id": self.api_id,
             "parameter_count": len(self.parameters),
             "static_sampler_count": self.static_sampler_count,
+            "is_local": self.is_local,
             "parameters": [p.to_dict() for p in self.parameters],
             "source": f"{self.source_file}:{self.source_line}",
         }
+        return payload
 
 
 def parse_root_signatures(root: Path) -> dict[int, RootSignature]:
@@ -1080,6 +1083,8 @@ def parse_root_signatures(root: Path) -> dict[int, RootSignature]:
                 )
                 if sampler:
                     signature.static_sampler_count = int(sampler.group(1))
+                if "LOCAL_ROOT_SIGNATURE" in window:
+                    signature.is_local = True
                 signatures[signature.api_id] = signature
                 parameters = {}
                 pending_ranges = []

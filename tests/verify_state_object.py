@@ -267,6 +267,42 @@ def main() -> int:
         str(stray_stage[:3]),
     )
 
+    # Local root signature id is expanded into its parameter table, not left as an
+    # opaque integer. Collection 3892's two shaders share local RS 3893, which is a
+    # single 32-bit-constants parameter (register 0, space 2, 8 dwords) and no
+    # static samplers. The table must be reachable from the object itself.
+    expanded_3893 = objects[3892].local_root_signatures().get(3893)
+    check(
+        "local root signature 3893 expands to a parameter table",
+        expanded_3893 is not None,
+        str(expanded_3893),
+    )
+    if expanded_3893 is not None:
+        check(
+            "3893 is marked as a local root signature",
+            bool(expanded_3893.get("is_local")),
+            str(expanded_3893.get("is_local")),
+        )
+        params = expanded_3893.get("parameters", [])
+        check(
+            "3893 is a single root_constants parameter",
+            len(params) == 1 and params[0].get("kind") == "root_constants",
+            str(params),
+        )
+        if params:
+            check(
+                "3893 constants register/space/count are 0 / 2 / 8",
+                params[0].get("shader_register") == 0
+                and params[0].get("register_space") == 2
+                and params[0].get("num_descriptors") == 8,
+                str(params[0]),
+            )
+    check(
+        "3892 reports no missing local root signatures",
+        not objects[3892].missing_local_root_signatures,
+        str(objects[3892].missing_local_root_signatures),
+    )
+
     print("\n6. draw-side linkage")
     ray_draws = [draw for draw in capture.draw_calls if draw.state_object_id is not None]
     check("two actions bind a state object", len(ray_draws) == 2, str(len(ray_draws)))

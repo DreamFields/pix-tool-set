@@ -36,6 +36,7 @@ from .dxbc import (
 from .model import (
     DRAW_KINDS,
     AccelerationStructureBuild,
+    AccelerationStructurePostbuildInfo,
     DrawCall,
     Event,
     EventKind,
@@ -172,6 +173,15 @@ class Capture:
         contain nothing this toolkit can interpret.
         """
         return accelstructure.parse_serialized_structures(self.export_dir)
+
+    @cached_property
+    def postbuild_info(self) -> list[AccelerationStructurePostbuildInfo]:
+        """EmitRaytracingAccelerationStructurePostbuildInfo queries, if any.
+
+        Empty when the frame never asked the driver for post-build sizes. That is
+        a fact about the capture, not a parse gap: post-build info is opt-in.
+        """
+        return accelstructure.parse_postbuild_info(self.export_dir)
 
 
 

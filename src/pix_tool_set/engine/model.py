@@ -717,6 +717,40 @@ class StateObject:
             return "export"
         return None
 
+    def local_root_signatures(self) -> dict[int, Any]:
+        """Expand each distinct local root signature id into its parameter table.
+
+        A local root signature is named on an export / hit group by id only
+        (e.g. ``3897``). That id is meaningless to a caller without the parameter
+        list behind it: the whole point of a local root signature is that each
+        shader record contributes its own CBVs / samplers, and those are what a
+        PIX RayGen record panel lists. The table lives in ``capture.root_signatures``
+        (the same ``CreateAndTrackRootSignature`` stream that holds the global
+        ones), so this resolves the id through the capture back-reference.
+
+        Returns a dict keyed by root signature id so an export can look its own
+        up without a second pass. Missing ids are simply absent -- a dangling
+        reference is surfaced by ``missing_local_root_signatures``, not papered
+        over with an empty table.
+        """
+        table = getattr(self._capture, "root_signatures", None) if self._capture else None
+        if not table:
+            return {}
+        resolved: dict[int, Any] = {}
+        for rs_id in self.local_root_signature_ids:
+            signature = table.get(rs_id)
+            if signature is None:
+                continue
+            resolved[rs_id] = signature.to_dict()
+        return resolved
+
+    @property
+    def missing_local_root_signatures(self) -> list[int]:
+        table = getattr(self._capture, "root_signatures", None) if self._capture else None
+        if not table:
+            return list(self.local_root_signature_ids)
+        return [rs_id for rs_id in self.local_root_signature_ids if rs_id not in table]
+
     def to_dict(self, *, detail: bool = False, expand: bool = True) -> dict[str, Any]:
         exports = self.resolved_exports if expand else self.exports
         hit_groups = self.resolved_hit_groups if expand else self.hit_groups
@@ -740,6 +774,7 @@ class StateObject:
             "existing_collection_ids": list(self.existing_collection_ids),
             "grown_from_state_object_id": self.grown_from_state_object_id,
             "local_root_signature_ids": list(self.local_root_signature_ids),
+            "local_root_signatures": self.local_root_signatures(),
             "source": f"{self.source_file}:{self.source_line}",
         }
         if detail:
@@ -1057,6 +1092,34 @@ class SerializedAccelerationStructure:
             "serialized_size": self.serialized_size,
             "deserialized_size": self.deserialized_size,
             "function": self.function,
+        }
+
+
+@dataclass(slots=True)
+class AccelerationStructurePostbuildInfo:
+    """One query emitted by EmitRaytracingAccelerationStructurePostbuildInfo.
+
+    The postbuild info are the only place a driver reports the *actual* (current
+    or compacted or serialized) size of an acceleration structure, distinct from
+    the requested destination size on a BuildRaytracingAccelerationStructure. They
+    only exist when the application asked for them, so a capture that never calls
+    this API has none -- a fact, not a parse failure.
+    """
+
+    global_id: Optional[int]
+    acceleration_structure_resource_id: Optional[int]
+    info_types: list[str] = field(default_factory=list)
+    command_list_id: Optional[int] = None
+    source_file: str = ""
+    source_line: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "global_id": self.global_id,
+            "command_list_id": self.command_list_id,
+            "acceleration_structure_resource_id": self.acceleration_structure_resource_id,
+            "info_types": list(self.info_types),
+            "source": f"{self.source_file}:{self.source_line}",
         }
 
 

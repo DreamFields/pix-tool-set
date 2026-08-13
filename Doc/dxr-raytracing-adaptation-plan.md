@@ -11,7 +11,7 @@
 
 ## 0.5 实施结果与规格修正（v1.1，2026-08-13）
 
-阶段一至阶段四 + 阶段六已实现，阶段五（DXR shader 热替换）按计划留待后续。实施中发现 v1.0 三处规格错误，均已在代码中按实测修正：
+阶段一至阶段四 + 阶段六已实现，阶段五（DXR shader 热替换）核心闭环已实现（静态验收，GPU 回放实测未做）。实施中发现 v1.0 三处规格错误，均已在代码中按实测修正：
 
 | # | v1.0 文档写法 | 实测事实 | 影响 |
 |---|--------------|---------|------|
@@ -23,9 +23,9 @@
 
 顺带修复一个既有缺陷：`cppparse.parse_pipeline_states` 以 `CreatePipelineState_` 为锚但无结束边界，扫到同文件后半段 81 个 `CreateStateObject_*` 时不换锚，79 个 DXIL `Read()` 会反复覆盖最后一个 PSO（4119）的 `blob_index`，使其 shader 字节码指向光追库 blob。已加 `_RE_ANY_TOP_FUNC` 终止边界，同时保持 `read_sizes` 仍覆盖全部 376 次 Read（它是 blob 流的 fallback 索引，漏项会整体错位）。
 
-**新增文件**：`engine/stateobject.py`、`engine/shadertable.py`、`engine/accelstructure.py`、`tools/raytracing_tools.py`；`tests/verify_state_object.py`（38 检查）、`verify_shader_table.py`（37）、`verify_acceleration_structures.py`（34）、`verify_raytracing_tools.py`（48）。
+**新增文件**：`engine/stateobject.py`、`engine/shadertable.py`、`engine/accelstructure.py`、`tools/raytracing_tools.py`；`tests/verify_state_object.py`（38 检查）、`verify_shader_table.py`（37）、`verify_acceleration_structures.py`（34）、`verify_raytracing_tools.py`（48）。阶段五新增 `tests/verify_dxr_shader_edit.py`（静态 18 检查）。
 
-**新增工具 4 个**：`describe-state-object`、`describe-shader-table`、`list-raytracing-work`、`analyze-acceleration-structures`；升级 `shader-bindings`（光追从 `partial`+空 stages 变为 `success`+17 shader，global/local 绑定分列）、`pipeline-state`（返回 state object 而非报错）、`list-pipeline-states`（并列 81 个 state object）、`frame-stats`（新增 raytracing 段）。
+**新增工具 4 个**：`describe-state-object`、`describe-shader-table`、`list-raytracing-work`、`analyze-acceleration-structures`；升级 `shader-bindings`（光追从 `partial`+空 stages 变为 `success`+17 shader，global/local 绑定分列）、`pipeline-state`（返回 state object 而非报错）、`list-pipeline-states`（并列 81 个 state object）、`frame-stats`（新增 raytracing 段）。阶段五升级 `shader-edit-begin`/`shader-edit-apply`（新增 `--state-object-id`/`--export-name` DXR 分支）。
 
 **回归**：GBufferA 资源历史 25/25 行、像素 (810,284) 历史、ExecuteIndirect 绑定、选择器语义、`check_coverage`（51/51 需求项 + 88 工具 schema 完整）全部通过。`verify_global_id_uniqueness.py` 失败与本次改动无关，已用 `git stash` 在 HEAD 上复现（缺 `NoTiled.pixcache\cpp` 导出目录）。
 
@@ -298,22 +298,30 @@ AS SRV 形态（`Descriptors_037/038.cpp`）：
 
 ## 2. 缺口清单（修订版）
 
-原八大缺口 + 本次新增，共 11 项，按依赖排序：
+原八大缺口 + 本次新增，共 11 项，按依赖排序。**实现状态列**为 v1.1（2026-08-13）与代码对齐后的结果；「🟡 部分」指核心能力已落地但仍有残留子项（见下方「实现状态对齐」）。
 
-| # | 缺口 | 现状 | 优先级 |
-|---|------|------|--------|
-| 1 | `StateObject` 无数据模型 | `DrawCall.state_object_id` 只是 int | P0 |
-| 2 | `EXISTING_COLLECTION` / `AddToStateObject` 链未展开 | 完全无概念，RTPSO 会被看成空壳 | P0 |
-| 3 | `ShaderStage` 缺 DXR 阶段 | 只有 `LIB` 一个占位（全项目零使用） | P0 |
-| 4 | local root signature 无支持 | 只跟踪 gfx / compute 两套 root arguments | P1 |
-| 4a | local root signature 参数表展开 + 语义名回填 | 已能关联 export → `local_root_signature_id`（如 3897），但：(1) 未按 record 把 local RS 逐条展开为 CBV / 静态采样器的 `space`/`register` 参数表（PIX GUI 的 RayGen record 面板会列出 7 个 CBV + 2 个 static sampler）；(2) 未回填 `<namespace>_<struct>` 语义名（`_RootShaderParameters`、`_SceneTexturesStruct` 等）。`describe-state-object --state-object-id 3897` 返回 `not_found`，因为该 id 是 local RS id 而非 state object id | P1 |
-| 5 | SBT 未解析 | `D3D12_DISPATCH_RAYS_DESC` 与 shader table 均未读 | P1 |
-| 6 | action → SBT 关联链未打通 | `ExecuteIndirect` 的 indirect buffer 名未与 `CreateIndirectArgumentBuffer_*` 关联 | P1 |
-| 7 | DXR shader 字节码不可提取 | `Shader` 只挂在 `PipelineState` 上 | P1 |
-| 8 | `describe-pipeline` / `shader-bindings` 对光追降级 | 返回 `pipeline_note` 但无实际内容 | P1 |
-| 9 | AS build 未分析 | 已识别为 `EventKind.RAYTRACING`，但零解析 | P2 |
-| 10 | TLAS instance 未解析 | `RaytracingInstanceDescs_*.cpp` 未被读取 | P2 |
-| 11 | DXR shader 热替换不支持 | `shader-edit-*` 只认 PSO + stage | P3 |
+| # | 缺口 | 实现前现状 | 实现状态 | 优先级 |
+|---|------|------|------|--------|
+| 1 | `StateObject` 无数据模型 | `DrawCall.state_object_id` 只是 int | ✅ 已实现（`model.StateObject`/`DxilExport`/`HitGroup` + `stateobject.py`） | P0 |
+| 2 | `EXISTING_COLLECTION` / `AddToStateObject` 链未展开 | 完全无概念，RTPSO 会被看成空壳 | ✅ 已实现（`resolved_exports` 递归展开 + `AddToStateObject` 三段合并） | P0 |
+| 3 | `ShaderStage` 缺 DXR 阶段 | 只有 `LIB` 一个占位（全项目零使用） | ✅ 已实现（`RAYGEN`/`CLOSESTHIT`/`ANYHIT`/`INTERSECTION`/`MISS`/`CALLABLE`） | P0 |
+| 4 | local root signature 无支持 | 只跟踪 gfx / compute 两套 root arguments | 🟡 部分（已关联 `local_root_signature_id`，但未展开为参数表，见 4a） | P1 |
+| 4a | local root signature 参数表展开 + 语义名回填 | 已能关联 export → `local_root_signature_id`（如 3897），但：(1) 未按 record 把 local RS 逐条展开为 CBV / 静态采样器的 `space`/`register` 参数表（PIX GUI 的 RayGen record 面板会列出 7 个 CBV + 2 个 static sampler）；(2) 未回填 `<namespace>_<struct>` 语义名（`_RootShaderParameters`、`_SceneTexturesStruct` 等）。`describe-state-object --state-object-id 3897` 返回 `not_found`，因为该 id 是 local RS id 而非 state object id | ✅ 已实现参数表展开（`RootSignature.is_local` + `StateObject.local_root_signatures()`，`describe-state-object` 输出 `local_root_signatures` + 每个 export/hit group 的 `local_root_signature`）；语义名回填写不进本帧样本（local RS 3893 仅 1 个 `root_constants`、3897 为空，无 CBV 可回填语义名） | P1 |
+| 5 | SBT 未解析 | `D3D12_DISPATCH_RAYS_DESC` 与 shader table 均未读 | ✅ 已实现（`shadertable.py`） | P1 |
+| 6 | action → SBT 关联链未打通 | `ExecuteIndirect` 的 indirect buffer 名未与 `CreateIndirectArgumentBuffer_*` 关联 | ✅ 已实现（`DrawCall.shader_binding_table` 按 indirect buffer 键关联） | P1 |
+| 7 | DXR shader 字节码不可提取 | `Shader` 只挂在 `PipelineState` 上 | 🟡 部分（`DxilExport.dxil_blob_index` + `capture._load_blob` 可读库 blob；`pass-shader-source` 仍只认 PSO） | P1 |
+| 8 | `describe-pipeline` / `shader-bindings` 对光追降级 | 返回 `pipeline_note` 但无实际内容 | ✅ 已实现（`shader-bindings` 光追转 `success`，global/local 绑定分列） | P1 |
+| 9 | AS build 未分析 | 已识别为 `EventKind.RAYTRACING`，但零解析 | ✅ 已实现（`accelstructure.py`） | P2 |
+| 10 | TLAS instance 未解析 | `RaytracingInstanceDescs_*.cpp` 未被读取 | ✅ 已实现（instance 变换/mask/flags/BLAS VA） | P2 |
+| 11 | DXR shader 热替换不支持 | `shader-edit-*` 只认 PSO + stage | 🟡 部分（核心闭环已实现：`--state-object-id`/`--export-name` + export 名校验；GPU 回放实测未做） | P3 |
+
+### 实现状态对齐（v1.1，2026-08-13）
+
+前六阶段中**阶段一至四、六已全部落地，阶段五核心闭环已实现**。与代码现状对齐后，剩下的未实现项有三块，其中前两块（4a、postbuild）已在 v1.2 落地：
+
+1. **缺口 4a（P1，唯一落空的 P1，已于 v1.2 落地）**：local root signature 参数表展开已完成。`RootSignature` 增加 `is_local` 标志（识别 `D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE`），`StateObject.local_root_signatures()` 通过 capture 回引把每个 `local_root_signature_id` 展开为 `RootSignature.to_dict()`（CBV/const 的 `shader_register`/`register_space`、`static_sampler_count`、`is_local`）。`describe-state-object` 现输出顶层 `local_root_signatures` 与每个 export/hit group 的 `local_root_signature` 字段，并在 local RS id 缺失时按 `local_root_signature_missing` 降级而非静默留空。**语义名回填未落地**：本帧样本的 local RS 无 CBV 参数（3893 仅 1 个 `root_constants`、3897 为空 0 参数），"7 个 CBV + 2 个 static sampler" 的复杂 local RS 在本捕获中不存在，因而语义名（`_RootShaderParameters` 等，属 global RS 3889 的 CBV）不属 local RS 缺口。若未来出现带 CBV 数组的 local RS 截帧，再补语义名回填。
+2. **`EmitRaytracingAccelerationStructurePostbuildInfo`（已于 v1.2 落地）**：新增 `AccelerationStructurePostbuildInfo` 模型 + `accelstructure.parse_postbuild_info` 解析 + `capture.postbuild_info` 暴露，`analyze-acceleration-structures` 输出 `postbuild_info` 段（`available`/`count`/`queries`/`note`）。`check_coverage.py` 已把该 API 映射到 `analyze-acceleration-structures`，7/7 光追入口全有工具。本帧无该 API 调用（导出中零出现），故 `available=false` 是事实而非解析失败，postbuild 的实际尺寸字段（序列号/紧凑尺寸/实际尺寸）属 GPU 回读，非导出静态文件可答。
+3. **阶段五 GPU 回放实测（文档标记为可选）**：`shader-edit` DXR 分支只完成静态验收（18 项），"编译 `lib_6_*` → 回放 → 比对 UAV 输出"的端到端验证需 GPU 回放环境。
 
 ---
 
@@ -715,6 +723,10 @@ class ShaderBindingTable:
 ## 7. 阶段五：DXR shader 热替换（P3）
 
 放在最后，因为它是唯一需要改动 replay 编译链的部分，且收益依赖前四阶段。
+
+> **实现状态（v1.1，2026-08-13）**：本节 7.2 的五项约束的核心闭环已实现——`shader-edit-begin`/`apply` 新增 `--state-object-id` + `--export-name`；`dxbc.parse_export_names` 比入口点符号集合；注入点落到声明 export 的 collection；`editledger`（`state_object` scope）+ `exportstate.inspect` + `replay-reset` 同步清理。静态验收 `verify_dxr_shader_edit.py` 18 项全过。**仍待办**：`lib_6_*` 编译产物经 GPU 回放比对 UAV 输出的端到端实测（文档 8.1 标记为可选）。
+>
+> 实现中发现的关键事实：`CHS_<hash>` 这类 DXR export 名是 PIX 在 `D3D12_EXPORT_DESC` 里的**重命名**，不出现在 DXIL 反汇编中——反汇编 `define` 行只有 HLSL 入口点的 MSVC mangled 符号，故「校验 export 名集合」实际是比对**入口点符号集合**；且同一入口点被编译进多个 collection 各自重命名，`original_name` 查询必须做歧义检测。
 
 ### 7.1 与 compute 热替换的本质差异
 

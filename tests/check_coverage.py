@@ -28,7 +28,7 @@ RAYTRACING_API_COVERAGE: dict[str, str] = {
     "DispatchRays": "describe-shader-table",
     "BuildRaytracingAccelerationStructure": "analyze-acceleration-structures",
     "CopyRaytracingAccelerationStructure": "analyze-acceleration-structures",
-    "EmitRaytracingAccelerationStructurePostbuildInfo": "",
+    "EmitRaytracingAccelerationStructurePostbuildInfo": "analyze-acceleration-structures",
 }
 
 # requirement heading -> tool that implements it

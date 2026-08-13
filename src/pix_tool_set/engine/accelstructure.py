@@ -29,6 +29,7 @@ from .cppparse import iter_lines, sorted_group
 from .model import (
     AccelerationStructureBuild,
     AccelerationStructureInstance,
+    AccelerationStructurePostbuildInfo,
     SerializedAccelerationStructure,
 )
 
@@ -240,4 +241,62 @@ def parse_serialized_structures(root: Path) -> list[SerializedAccelerationStruct
                 current.serialized_size = int(match.group(1))
                 current.deserialized_size = int(match.group(2))
                 current = None
+    return out
+
+
+_RE_POSTBUILD_CALL = re.compile(
+    r"GetCommandList\((\d+)\)->EmitRaytracingAccelerationStructurePostbuildInfo"
+)
+_RE_POSTBUILD_INFO_TYPE = re.compile(
+    r"D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_(\w+)"
+)
+
+
+def parse_postbuild_info(root: Path) -> list[AccelerationStructurePostbuildInfo]:
+    """EmitRaytracingAccelerationStructurePostbuildInfo calls, when the frame made any.
+
+    These are the only place a driver reports the actual (current / compacted /
+    serialized) size of an acceleration structure. They exist conditionally: an
+    application that sizes its scratch conservatively and never compacts never
+    emits one, so an empty result is a fact about the capture, not a parse gap.
+    The D3D12 API speaks in ``D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE``
+    tokens (COMPACTED_SIZE / CURRENT_SIZE / SERIALIZATION / TOOLS_VISUALIZATION); the
+    concrete byte values land in a GPU-visible buffer the application reads back,
+    so only the requested info types -- not the resulting numbers -- are reported.
+    """
+    out: list[AccelerationStructurePostbuildInfo] = []
+    for path in sorted_group(root, "CommandLists"):
+        if not path.exists():
+            continue
+        pending_gid: Optional[int] = None
+        current: Optional[AccelerationStructurePostbuildInfo] = None
+        for lineno, line in iter_lines(path):
+            match = _RE_GLOBAL_ID.search(line)
+            if match:
+                pending_gid = int(match.group(1))
+                continue
+            if current is None:
+                # The acceleration-structure argument and the info-type array both
+                # precede the call itself, so start a record on the first info-type
+                # token seen.
+                if _RE_POSTBUILD_INFO_TYPE.search(line):
+                    current = AccelerationStructurePostbuildInfo(
+                        global_id=pending_gid,
+                        acceleration_structure_resource_id=None,
+                        command_list_id=None,
+                        source_file=path.name,
+                        source_line=lineno,
+                    )
+                continue
+            match = _RE_POSTBUILD_INFO_TYPE.search(line)
+            if match:
+                info_type = match.group(1).lower()
+                if info_type not in current.info_types:
+                    current.info_types.append(info_type)
+            match = _RE_POSTBUILD_CALL.search(line)
+            if match:
+                current.command_list_id = int(match.group(1))
+                out.append(current)
+                current = None
+                pending_gid = None
     return out
