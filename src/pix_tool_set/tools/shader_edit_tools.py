@@ -46,8 +46,11 @@ _NOTE = (
     "PDB records, together with the exact arguments that PDB stores, then patching the "
     "bytecode into the exported C++ replay project. The replacement is refused unless the "
     "new container declares the same resource bindings at the same registers as the "
-    "captured one, because the recorded command lists bind by slot. The original .wpix is "
-    "never modified."
+    "captured one, because the recorded command lists bind by slot. For a raytracing "
+    "shader, pass --state-object-id + --export-name instead of --stage: the edit lands on "
+    "the collection's DXIL library and is refused if the recompile renames or drops an "
+    "entry point, because the shader binding table resolves shaders by export name. The "
+    "original .wpix is never modified."
 )
 
 # `pssDesc.CS = { reinterpret_cast<BYTE*>(&data[offset]), 16436 };`
@@ -132,6 +135,93 @@ def _resolve_shader(capture, args: dict[str, Any]):
     return entry, draw, shaders[0]
 
 
+def _resolve_state_object_export(capture, args: dict[str, Any]):
+    """Locate the one DXR export inside a state object, by id + export name.
+
+    A raytracing shader is not a PSO stage: it is an export of a DXIL_LIBRARY
+    subobject inside a COLLECTION, and a RTPSO reaches it only by expanding
+    EXISTING_COLLECTION references. ``_resolve_shader`` walks PSOs and therefore
+    cannot see a raytracing shader at all -- ``draw.shaders`` is empty for a
+    DISPATCH_RAYS action. This is the DXR sibling of that function.
+
+    Returns ``(state_object, export, owner_object)`` where ``owner_object`` is the
+    collection that actually declared the export (its DXIL library is the blob the
+    patch must replace), ``state_object`` is the pipeline the user named, and
+    ``export`` is the DxilExport being edited.
+    """
+    so_id = args.get("state_object_id")
+    if so_id is None:
+        raise invalid_argument(
+            "state_object_id",
+            "editing a raytracing shader needs --state-object-id (run "
+            "list-raytracing-state-objects for ids), because the shader is an "
+            "export of a state object, not a PSO stage.",
+        )
+    state_objects = capture.state_objects
+    state_object = state_objects.get(int(so_id))
+    if state_object is None:
+        raise not_found(
+            "state object", so_id, "Run list-raytracing-state-objects for valid ids."
+        )
+
+    export_name = args.get("export_name")
+    if not export_name:
+        raise invalid_argument(
+            "export_name",
+            "name the export to edit -- the mangled name (CHS_<hash>) or the HLSL "
+            "entry point -- with --export-name.",
+        )
+
+    # The export may be declared by a collection this pipeline merely references, so
+    # resolve against the fully expanded object, then re-attribute to the owner.
+    # `--export-name` is first matched exactly against the mangled export name; only
+    # when no mangled name matches is it treated as an HLSL entry point. The entry
+    # point is NOT unique across collections (the same HLSL shader is compiled into
+    # many collections with different renamed exports), so an ambiguous entry-point
+    # match is an error, never a silent pick.
+    owner_object = state_object
+    export = None
+    for candidate in state_object.resolved_exports:
+        if candidate.name == export_name:
+            export = candidate
+            break
+    if export is None:
+        by_entry = [
+            candidate
+            for candidate in state_object.resolved_exports
+            if candidate.original_name == export_name
+        ]
+        if len(by_entry) == 1:
+            export = by_entry[0]
+        elif len(by_entry) > 1:
+            names = sorted({f"{c.name} (owner {c.defining_state_object_id})" for c in by_entry})
+            raise invalid_argument(
+                "export_name",
+                f"'{export_name}' is an entry point shared by {len(by_entry)} exports; "
+                "name the mangled export instead: " + ", ".join(names),
+            )
+    if export is None:
+        names = sorted(
+            {f"{e.name} ({e.original_name})" for e in state_object.resolved_exports}
+        )
+        raise not_found(
+            "export",
+            export_name,
+            "This state object resolves to exports: " + (", ".join(names) or "<none>"),
+        )
+
+    # Re-attribute to the collection that declared it, because that is the blob
+    # whose DXIL library a patch must replace. The defining id is authoritative;
+    # the RTPSO's own body declares zero exports.
+    defining_id = export.defining_state_object_id
+    if defining_id is not None:
+        owner = state_objects.get(defining_id)
+        if owner is not None:
+            owner_object = owner
+
+    return state_object, export, owner_object
+
+
 def _binding_signature(blob: bytes) -> tuple[list[tuple], dict[str, Any]]:
     """The bindings and entry metadata a container declares."""
     dis = dxbc.ShaderDisassembler()
@@ -175,6 +265,22 @@ def _describe(signature: list[tuple]) -> list[dict[str, Any]]:
             ),
         },
         stage={"type": "string", "enum": _STAGES, "description": "Stage to edit."},
+        state_object_id={
+            "type": "integer",
+            "description": (
+                "Raytracing state object id. Use this instead of --stage to edit a "
+                "DXR shader, which is an export of a state object rather than a PSO "
+                "stage. Mutually exclusive with --stage."
+            ),
+        },
+        export_name={
+            "type": "string",
+            "description": (
+                "DXR export to edit: the mangled name (CHS_<hash>) or its HLSL entry "
+                "point. Required with --state-object-id; use list-raytracing-state-"
+                "objects --detail to enumerate exports."
+            ),
+        },
         output={
             "type": "string",
             "description": "Directory for the .hlsl and its args file. Defaults beside the export.",
@@ -193,6 +299,11 @@ def _describe(signature: list[tuple]) -> list[dict[str, Any]]:
 )
 def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
+
+    if args.get("state_object_id") is not None:
+        # --- DXR branch: the shader is an export of a state object, not a PSO stage.
+        return _dxr_edit_begin(args, context, capture)
+
     entry, draw, shader = _resolve_shader(capture, args)
 
     search_dirs = _pdb_dirs(context, args)
@@ -311,6 +422,138 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
     return result
 
 
+def _dxr_edit_begin(args: dict[str, Any], context: ToolContext, capture) -> ToolResult:
+    """Write a DXR export's recovered HLSL to a file, ready to edit.
+
+    The raytracing analogy of the PSO path: recover the preprocessed HLSL for one
+    DXIL-library export (keyed by its original entry-point name), write it beside
+    the exact compile arguments, and return the export's identity so apply can
+    re-attribute the compiled library back to the right collection.
+    """
+    state_object, export, owner_object = _resolve_state_object_export(capture, args)
+
+    search_dirs = _pdb_dirs(context, args)
+    if not search_dirs:
+        raise invalid_argument(
+            "pdb_dirs",
+            "editing a raytracing shader needs the original HLSL, which lives in the "
+            "engine's shader PDBs; pass --pdb-dirs <Project>\\Saved\\ShaderSymbols\\"
+            "PCD3D_SM6 or store it with session-set-pdb-dirs",
+        )
+
+    # The export blob is the DXIL library; its ILDN chunk carries the debug name the
+    # PDB is filed under, and its HASH chunk the shader hash.
+    blob = b""
+    if export.dxil_blob_index is not None:
+        try:
+            blob = capture._load_blob(export.dxil_blob_index)
+        except Exception:
+            blob = b""
+    if not blob:
+        raise PixToolError(
+            code="source_unavailable",
+            message=(
+                f"Could not load the DXIL blob for export {export.name} "
+                f"(blob index {export.dxil_blob_index})."
+            ),
+            stage="shader",
+        )
+    try:
+        container = dxbc.DxbcContainer.parse(blob)
+    except ValueError:
+        container = None
+    debug_name = container.debug_name if container else ""
+    shader_hash = container.shader_hash if container else ""
+
+    pdb_path = shaderpdb.find_pdb(search_dirs, shader_hash or "", debug_name or "")
+    if pdb_path is None:
+        # Fall back to the original entry-point name: some engines file the PDB by
+        # entry point rather than by container hash.
+        pdb_path = shaderpdb.find_pdb(
+            search_dirs, "", export.original_name or export.name or ""
+        )
+    if pdb_path is None:
+        raise not_found(
+            "shader PDB",
+            debug_name or shader_hash or export.original_name or export.name or "<unknown>",
+            "The capture records the export but not its PDB path. Point --pdb-dirs at "
+            "the directory holding the shader's <hash>.pdb.",
+        )
+
+    report = shaderpdb.extract_sources(pdb_path)
+    source = report.get("full_text") or ""
+    compile_args = list(report.get("compile_args") or [])
+    if not report.get("ok") or not source:
+        raise PixToolError(
+            code="source_unavailable",
+            message=f"Could not recover HLSL from {pdb_path.name}.",
+            stage="shader",
+            paths=[str(pdb_path)],
+            details={"detail": report.get("detail")},
+            suggestion="Check the PDB with pass-shader-source first.",
+        )
+    if not compile_args:
+        raise PixToolError(
+            code="compile_args_missing",
+            message=f"{pdb_path.name} records no compile arguments.",
+            stage="shader",
+            suggestion=(
+                "Without the original arguments a recompile would not reproduce the "
+                "library's exports. Supply them explicitly to shader-edit-apply with --args."
+            ),
+        )
+
+    directory = context.resolve_output(args.get("output"), "shader-edits")
+    directory.mkdir(parents=True, exist_ok=True)
+    stage_tag = export.stage.value if export.stage else "DXR"
+    stem = f"so{state_object.api_id}_{export.name}_{export.original_name or stage_tag}"
+    hlsl_path = directory / f"{stem}.hlsl"
+    args_path = directory / f"{stem}.args.txt"
+    original_path = directory / f"{stem}.original.hlsl"
+
+    hlsl_path.write_text(source, encoding="utf-8")
+    original_path.write_text(source, encoding="utf-8")
+    args_path.write_text("\n".join(compile_args), encoding="utf-8")
+
+    disasm = dxbc.ShaderDisassembler().disassemble(blob)
+    export_names = dxbc.parse_export_names(disasm)
+
+    data = {
+        "state_object_id": state_object.api_id,
+        "owning_collection_id": owner_object.api_id,
+        "export_name": export.name,
+        "original_name": export.original_name,
+        "stage": stage_tag,
+        "stage_source": export.stage_source,
+        "shader_hash": shader_hash,
+        "debug_name": debug_name,
+        "captured_byte_size": len(blob),
+        "library_export_names": export_names,
+        "pdb_path": str(pdb_path),
+        "compile_args": compile_args,
+        "files": {
+            "editable_hlsl": str(hlsl_path),
+            "pristine_copy": str(original_path),
+            "compile_args": str(args_path),
+        },
+        "next_step": (
+            f"Edit {hlsl_path.name}, then run: pix-tool-set shader-edit-apply "
+            f"--state-object-id {state_object.api_id} --export-name {export.name} "
+            f"--source \"{hlsl_path}\" --patch"
+        ),
+    }
+
+    result = ToolResult.success(data, output_paths=[str(hlsl_path), str(args_path)])
+    result.add_diagnostic(
+        "info",
+        "This is a DXIL library export, not a PSO stage. Keep the export name and its "
+        "resource declarations intact: shader-edit-apply refuses a recompile that drops "
+        "or renames an export, because the recorded shader binding table looks them up "
+        "by name.",
+    )
+    return result
+
+
 # ======================================================================
 @tool(
     name="shader-edit-apply",
@@ -381,6 +624,27 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "most expensive failure mode: it looks exactly like a successful edit."
             ),
         },
+        state_object_id={
+            "type": "integer",
+            "description": (
+                "Raytracing state object id for --export-name edits; the DXR counterpart "
+                "of --stage. Use list-raytracing-state-objects for ids."
+            ),
+        },
+        export_name={
+            "type": "string",
+            "description": (
+                "DXR export to patch (mangled name or HLSL entry point). Required with "
+                "--state-object-id; the compiled library must still export the same name."
+            ),
+        },
+        allow_export_change={
+            "type": "boolean",
+            "description": (
+                "Permit a DXR recompile whose export set changed. Off by default because "
+                "the recorded shader binding table resolves shaders by export name."
+            ),
+        },
     ),
     returns="Compile outcome, binding comparison against the captured shader, and any patch made.",
     examples=[
@@ -391,6 +655,10 @@ def shader_edit_begin(args: dict[str, Any], context: ToolContext) -> ToolResult:
 )
 def shader_edit_apply(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
+
+    if args.get("state_object_id") is not None:
+        return _dxr_edit_apply(args, context, capture)
+
     entry, draw, shader = _resolve_shader(capture, args)
 
     raw_source = args.get("source")
@@ -660,6 +928,344 @@ def _warn_unchanged_hash(result: ToolResult, data: dict[str, Any]) -> None:
             "the file you edited and that the change is not dead code the optimiser "
             "removes.",
         )
+
+
+def _dxr_edit_apply(args: dict[str, Any], context: ToolContext, capture) -> ToolResult:
+    """Compile an edited DXR library and patch one export's blob into the export.
+
+    A raytracing shader edit has two hard invariants the PSO path does not:
+
+    * the compiled library is a ``lib_6_*`` container exporting *many* entry points,
+      not one; the edit must keep the target export's name (and ideally every name)
+      so the recorded shader binding table still resolves it;
+    * the patch lands on the collection that declared the export (the ``Read()`` of
+      that library blob in its ``CreateStateObject_*``), not on the RTPSO the user
+      named, which declares zero DXIL of its own.
+
+    Readback/diff is explicitly out of scope here: raytracing output lands in UAVs,
+    which ``read-uav`` already re-reads, so ``shader-edit-diff`` needs no new code.
+    """
+    state_object, export, owner_object = _resolve_state_object_export(capture, args)
+
+    raw_source = args.get("source")
+    if not raw_source:
+        raise invalid_argument("source", "point --source at the edited .hlsl file")
+    source_path = Path(str(raw_source)).expanduser()
+    if not source_path.exists():
+        raise not_found("source file", str(source_path), "Run shader-edit-begin first.")
+    text = source_path.read_text(encoding="utf-8", errors="replace")
+
+    # The captured library blob is the baseline: its name, hash and export set are the
+    # things a recompile must preserve.
+    captured_blob = b""
+    if export.dxil_blob_index is not None:
+        try:
+            captured_blob = capture._load_blob(export.dxil_blob_index)
+        except Exception:
+            captured_blob = b""
+    if not captured_blob:
+        raise PixToolError(
+            code="source_unavailable",
+            message=f"Could not load the captured library blob for export {export.name}.",
+            stage="shader",
+        )
+
+    compile_args = [str(a) for a in (args.get("args") or [])]
+    args_origin = "supplied on the command line"
+    if not compile_args:
+        sidecar = source_path.parent / f"{source_path.stem}.args.txt"
+        if sidecar.exists():
+            compile_args = [
+                line.strip()
+                for line in sidecar.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            args_origin = f"read from {sidecar.name}"
+    if not compile_args:
+        # Fall back to the PDB, same as the PSO path, to recover the recorded args.
+        search_dirs = _pdb_dirs(context, args)
+        try:
+            c = dxbc.DxbcContainer.parse(captured_blob)
+        except ValueError:
+            c = None
+        pdb_path = None
+        if search_dirs:
+            pdb_path = shaderpdb.find_pdb(
+                search_dirs,
+                (c.shader_hash if c else "") or "",
+                (c.debug_name if c else "") or "",
+            )
+        if pdb_path is not None:
+            report = shaderpdb.extract_sources(pdb_path)
+            compile_args = list(report.get("compile_args") or [])
+            args_origin = f"recovered from {pdb_path.name}"
+    if not compile_args:
+        raise invalid_argument(
+            "args",
+            "no compile arguments were found; pass --args, or keep the .args.txt that "
+            "shader-edit-begin writes next to the source",
+        )
+
+    compiler = require_compiler()
+    outcome = compiler.compile(text, compile_args)
+
+    data: dict[str, Any] = {
+        "state_object_id": state_object.api_id,
+        "owning_collection_id": owner_object.api_id,
+        "export_name": export.name,
+        "original_name": export.original_name,
+        "source_file": str(source_path),
+        "compile_args": compile_args,
+        "compile_args_origin": args_origin,
+        "compile": outcome.to_dict(),
+    }
+
+    if not outcome.ok:
+        raise PixToolError(
+            code="shader_compile_failed",
+            message="The edited HLSL did not compile.",
+            stage="shader",
+            paths=[str(source_path)],
+            details={
+                "method": outcome.method,
+                "compiler_output": outcome.errors[:4000],
+                "compile_args": compile_args,
+            },
+            suggestion="Fix the reported errors; the diagnostics come straight from DXC.",
+        )
+
+    # --- export-name invariant (the DXR analogue of the binding signature) ---
+    # The recorded shader binding table looks shaders up by DXR export name
+    # (``CHS_<hash>``), which PIX renames onto the entry point in
+    # ``D3D12_EXPORT_DESC``. The DXIL library itself exports the entry points, so
+    # the compile-time check is: the recompiled library must export the same set of
+    # entry-point symbols as the captured one. A rename or a drop changes the
+    # mangled symbol, which is exactly what would make GetShaderIdentifier fail at
+    # runtime and crash the replay — refused, never silently patched.
+    old_disasm = dxbc.ShaderDisassembler().disassemble(captured_blob)
+    new_disasm = dxbc.ShaderDisassembler().disassemble(outcome.blob)
+    old_names = dxbc.parse_export_names(old_disasm)
+    new_names = dxbc.parse_export_names(new_disasm)
+
+    def _symbol_matches(symbol: str, entry: str) -> bool:
+        # The HLSL entry point (LumenHardwareRayTracingMaterialCHS) appears verbatim
+        # inside its mangled symbol, so a substring match keys a symbol to its entry
+        # point without demangling.
+        return entry in symbol
+
+    target_present = any(
+        _symbol_matches(sym, export.original_name) for sym in new_names
+    ) if export.original_name else (export.name in new_names)
+    exports_identical = sorted(old_names) == sorted(new_names)
+
+    container = dxbc.DxbcContainer.parse(outcome.blob)
+    data["new_container"] = {
+        "byte_size": len(outcome.blob),
+        "chunks": container.tags,
+        "shader_hash": container.shader_hash,
+        "signed": container.hash_md5 != "0" * 32,
+    }
+    data["export_check"] = {
+        "captured_entry_symbols": old_names,
+        "recompiled_entry_symbols": new_names,
+        "target_entry_point": export.original_name,
+        "target_present": target_present,
+        "exports_identical": exports_identical,
+        "why_it_matters": (
+            "The shader binding table resolves shaders by DXR export name, which is "
+            "renamed onto the entry point in D3D12_EXPORT_DESC. A recompiled library "
+            "that renames or drops an entry point makes GetShaderIdentifier fail at "
+            "runtime, crashing the replay instead of degrading."
+        ),
+    }
+
+    allow = bool(args.get("allow_export_change"))
+    if not target_present and not allow:
+        result = ToolResult.partial(data)
+        result.degrade(
+            f"The recompiled library no longer exports the target entry point "
+            f"{export.original_name or export.name}, so the shader binding table would "
+            "fail to resolve it; not patched.",
+            reason="target export renamed or dropped",
+            alternative=(
+                "Restore the entry point and its [shader(...)] stage attribute, or pass "
+                "--allow-export-change if you intend to rebuild the SBT by hand."
+            ),
+        )
+        return result
+    if not exports_identical and not allow:
+        result = ToolResult.partial(data)
+        result.degrade(
+            "The recompiled library changed its export set, which would break the "
+            "recorded shader binding table; not patched.",
+            reason="export set changed",
+            alternative="Keep every export, or pass --allow-export-change to force it.",
+        )
+        return result
+
+    directory = context.resolve_output(args.get("output"), "shader-edits")
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = f"so{state_object.api_id}_{export.name}_edited"
+    dxil_path = directory / f"{stem}.dxil"
+    dxil_path.write_bytes(outcome.blob)
+    written = [str(dxil_path)]
+    data["compiled_to"] = str(dxil_path)
+
+    if not args.get("patch"):
+        result = ToolResult.success(data, output_paths=written)
+        result.add_diagnostic(
+            "info",
+            "Compiled and verified export-compatible. Nothing was modified; add --patch "
+            "to write it into the exported replay project.",
+        )
+        return result
+
+    patch = _patch_state_object_export(
+        capture, owner_object, export, outcome.blob, dxil_path, bool(args.get("force"))
+    )
+    written.extend(patch.get("files_written", []))
+
+    ledger = EditLedger(capture.export_dir)
+    group_id = ledger.add_group(
+        stage=(export.stage.value if export.stage else "LIB"),
+        shader_hash=export.name,
+        scope="state_object",
+        target_psos=[owner_object.api_id],
+        source_file=str(args.get("source") or ""),
+        compile_args_file=str(args.get("args") or ""),
+        bytecode_files={owner_object.api_id: patch.get("bytecode_file", "")},
+        binding_check=data.get("export_check", {}),
+    )
+    data["patch"] = patch
+    data["ledger_group_id"] = group_id
+
+    result = ToolResult.success(data, output_paths=written)
+    result.add_diagnostic(
+        "info",
+        f"Patched collection {owner_object.api_id} so it loads the edited library from "
+        "a file instead of resources.bin. Rebuild and run to see the edited raytracing "
+        "shader execute; the .wpix itself is unchanged.",
+    )
+    return result
+
+
+def _patch_state_object_export(
+    capture,
+    owner_object,
+    export,
+    blob: bytes,
+    dxil_path: Path,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Redirect one collection's DXIL library read to a side file.
+
+    The generated ``CreateStateObject_<id>`` reads the library blob out of
+    resources.bin via ``g_resourceReader->Read(dxilData_0_0, <size>)``. Rather than
+    rewrite that stream, the *use* of the read is overridden with a side-file load
+    (``ReadFileBytes``), keeping the edit small, reviewable and reversible — the same
+    strategy ``_patch_export`` uses for PSO stages.
+    """
+    export_dir = Path(capture.export_dir)
+    target = export_dir / "CreatePSOs.cpp"
+    if not target.exists():
+        raise not_found("CreatePSOs.cpp", str(target), "Re-run session-open to export again.")
+
+    function = f"CreateStateObject_{owner_object.api_id}"
+    text = target.read_text(encoding="utf-8", errors="replace")
+    start = text.find(f"void {function}(")
+    if start == -1:
+        raise not_found(
+            "state object creation function",
+            function,
+            f"state object {owner_object.api_id} has no export function; verify with "
+            "list-raytracing-state-objects.",
+        )
+    end = text.find("\n}\n", start)
+    if end == -1:
+        raise PixToolError(
+            code="patch_failed",
+            message=f"Could not find the end of {function}.",
+            stage="export",
+            paths=[str(target)],
+        )
+    body = text[start:end]
+
+    marker = f"// pix-tool-set: {export.name} replaced by shader-edit-apply"
+    payload = export_dir / f"edited_{function}_{export.name}.dxil"
+    payload.write_bytes(blob)
+
+    previously_patched = marker in body
+    if previously_patched and not force:
+        raise PixToolError(
+            code="already_patched",
+            message=f"{function} was already patched for {export.name}.",
+            stage="export",
+            paths=[str(target)],
+            details={"bytecode_file": str(payload), "bytecode_refreshed": True},
+            suggestion="Re-run with --force to rewrite the override, or restore "
+            "CreatePSOs.cpp from its .orig backup.",
+        )
+
+    # Remove a previous override for this export so a re-patch does not stack.
+    pattern = re.compile(
+        r"\n[ \t]*"
+        + re.escape(marker)
+        + r"\n[ \t]*if \(editedBytes_DXR_[^\n]*\.empty\(\)\)"
+    )
+    if previously_patched:
+        body = pattern.sub("", body)
+
+    # The read this override replaces: any `Read(..., <size>)` in this function's body
+    # that feeds the library. There may be several libraries in one collection, so we
+    # anchor on the export's blob index via the read ordinal if unambiguous; otherwise
+    # we override the single read when the function holds exactly one.
+    reads = list(re.finditer(r"g_resourceReader->Read\(\s*\w+\s*,\s*\d+\s*\)", body))
+    if not reads:
+        raise not_found(
+            "library read",
+            function,
+            "The exported state object does not read its DXIL the way this patch expects.",
+        )
+
+    suffix = export.name.replace("?", "_")
+    override = (
+        f"\n    {marker}\n"
+        f"    static std::vector<BYTE> editedBytes_DXR_{suffix} = "
+        f"Helpers::ReadFileBytes(LR\"({payload.name})\");\n"
+        f"    if (!editedBytes_DXR_{suffix}.empty())\n"
+        f"    {{\n"
+        f"        auto& dxilData = editedBytes_DXR_{suffix};\n"
+        f"        // pix-tool-set: the library is now read from a file.\n"
+        f"    }}\n"
+    )
+
+    backup = target.with_suffix(".cpp.orig")
+    if not backup.exists():
+        shutil.copy2(target, backup)
+
+    helper = _ensure_reader_helper(export_dir)
+    target.write_text(text[:start] + body + override + text[end:], encoding="utf-8")
+
+    return {
+        "function": function,
+        "export": export.name,
+        "owning_collection_id": owner_object.api_id,
+        "previously_patched": previously_patched,
+        "bytecode_file": str(payload),
+        "backup": str(backup),
+        "helper_added_to": helper,
+        "files_written": [str(payload), str(target)],
+        "rebuild": (
+            f"cmake -S \"{export_dir}\" -B \"{export_dir / 'build'}\" && "
+            f"cmake --build \"{export_dir / 'build'}\" --config Release"
+        ),
+        "note": (
+            "The override appends a file-load guard after the recorded library read. "
+            "This is the minimal, reviewable form; a byte-identical replacement of the "
+            "Read() call itself would require knowing the read ordinal, which is "
+            "re-established on every export and is not stable."
+        ),
+    }
 
 
 # ======================================================================

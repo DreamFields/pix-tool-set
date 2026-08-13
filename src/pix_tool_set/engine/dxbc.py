@@ -530,6 +530,57 @@ def parse_shader_metadata(disassembly: str) -> dict[str, Any]:
     return meta
 
 
+def parse_export_names(disassembly: str) -> list[str]:
+    """The entry-point symbols a DXIL library export set contains, in order.
+
+    A raytracing DXIL library (``lib_6_*``) exports one entry point per HLSL
+    function carrying a ``[shader(...)]`` attribute.  DXC prints each as a
+    ``define`` line whose ``@`` symbol is the *MSVC-mangled* entry point (e.g.
+    ``@"\\01?LumenHardwareRayTracingMaterialCHS@@YAX..."``).  The mangled name is
+    deterministic — the same function signature always decorates identically — so
+    comparing the symbol sets of the captured and recompiled libraries is exactly
+    the check that catches a rename (which changes the decoration) or a dropped
+    entry point (which removes a symbol).
+
+    The human-readable DXR export name (``CHS_b5acc26ab7153489``) is *not* in the
+    disassembly at all: it is a PIX-side ``D3D12_EXPORT_DESC`` rename that lives in
+    ``CreatePSOs.cpp``, keyed to the entry point via ``original_name``.  That is
+    why this returns the entry-point symbols and the export-name invariant is
+    enforced against ``DxilExport.original_name`` on the capture side (see
+    ``_dxr_edit_apply``), not against the disassembly text.
+
+    ``parse_shader_metadata`` only reads the single ``EntryFunctionName``, which is
+    wrong for a library container holding several shaders.
+    """
+    if not disassembly:
+        return []
+    names: list[str] = []
+    for line in disassembly.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("define "):
+            continue
+        # The symbol sits between '@' and '('; it may be quoted (a decorated C++
+        # name) or a bare identifier. Skip intrinsics (dx.*), which are not exports.
+        at = stripped.find("@")
+        if at < 0:
+            continue
+        rest = stripped[at + 1 :]
+        # Strip a leading quote that wraps a decorated symbol.
+        if rest.startswith('"'):
+            rest = rest.lstrip('"').lstrip("\\")
+            # The quote ends right before the '(' after the symbol.
+            name = rest.split('"', 1)[0]
+        else:
+            name = rest.split("(", 1)[0].strip()
+        # Reject empty / intrinsic symbols and the call to the shader's own
+        # attributes block, keeping only real entry points.
+        if not name or name.startswith("dx.") or name.startswith("llvm."):
+            continue
+        if name not in names:
+            names.append(name)
+    return names
+
+
 def parse_constant_buffers(disassembly: str) -> list[dict[str, Any]]:
     """Read the ``; Buffer Definitions:`` block (cbuffer layouts).
 

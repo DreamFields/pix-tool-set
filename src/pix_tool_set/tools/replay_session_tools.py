@@ -463,6 +463,9 @@ def replay_reset(args: dict[str, Any], context: ToolContext) -> ToolResult:
     for dxil in root.glob("edited_CreatePipelineState_*_*.dxil"):
         dxil.unlink()
         deleted_dxils.append(str(dxil))
+    for dxil in root.glob("edited_CreateStateObject_*_*.dxil"):
+        dxil.unlink()
+        deleted_dxils.append(str(dxil))
 
     # 4. Clear the ledger.
     ledger.clear()

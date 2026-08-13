@@ -306,6 +306,7 @@ AS SRV 形态（`Descriptors_037/038.cpp`）：
 | 2 | `EXISTING_COLLECTION` / `AddToStateObject` 链未展开 | 完全无概念，RTPSO 会被看成空壳 | P0 |
 | 3 | `ShaderStage` 缺 DXR 阶段 | 只有 `LIB` 一个占位（全项目零使用） | P0 |
 | 4 | local root signature 无支持 | 只跟踪 gfx / compute 两套 root arguments | P1 |
+| 4a | local root signature 参数表展开 + 语义名回填 | 已能关联 export → `local_root_signature_id`（如 3897），但：(1) 未按 record 把 local RS 逐条展开为 CBV / 静态采样器的 `space`/`register` 参数表（PIX GUI 的 RayGen record 面板会列出 7 个 CBV + 2 个 static sampler）；(2) 未回填 `<namespace>_<struct>` 语义名（`_RootShaderParameters`、`_SceneTexturesStruct` 等）。`describe-state-object --state-object-id 3897` 返回 `not_found`，因为该 id 是 local RS id 而非 state object id | P1 |
 | 5 | SBT 未解析 | `D3D12_DISPATCH_RAYS_DESC` 与 shader table 均未读 | P1 |
 | 6 | action → SBT 关联链未打通 | `ExecuteIndirect` 的 indirect buffer 名未与 `CreateIndirectArgumentBuffer_*` 关联 | P1 |
 | 7 | DXR shader 字节码不可提取 | `Shader` 只挂在 `PipelineState` 上 | P1 |

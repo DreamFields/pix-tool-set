@@ -77,6 +77,7 @@ def inspect(export_dir: Path | str) -> dict[str, Any]:
 
     # -- shader-edit-apply ----------------------------------------------
     dxils = sorted(root.glob("edited_CreatePipelineState_*_*.dxil"))
+    dxils += sorted(root.glob("edited_CreateStateObject_*_*.dxil"))
     shader_marker_hits = [
         hit
         for hit in _scan_marker(root, SHADER_EDIT_MARKER)
