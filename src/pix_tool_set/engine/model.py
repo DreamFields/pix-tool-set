@@ -41,6 +41,31 @@ class ShaderStage(enum.StrEnum):
     AS = "AS"
     MS = "MS"
     LIB = "LIB"
+    # DXR stages. A DXIL library does not declare stages the way a PSO does --
+    # every raytracing shader arrives as an export of one library blob -- so
+    # these are always *inferred*, and whatever carries one must also carry the
+    # ``stage_source`` that says how (see DxilExport.stage_source). Keeping them
+    # in the same enum as VS/PS means a stage filter, a CLI --stage flag and a
+    # by_stage histogram all keep working without a second parallel vocabulary.
+    RAYGEN = "RAYGEN"
+    CLOSESTHIT = "CLOSESTHIT"
+    ANYHIT = "ANYHIT"
+    INTERSECTION = "INTERSECTION"
+    MISS = "MISS"
+    CALLABLE = "CALLABLE"
+
+
+class StateObjectType(enum.StrEnum):
+    COLLECTION = "collection"
+    RAYTRACING_PIPELINE = "raytracing_pipeline"
+
+
+# How a DXR export's stage was decided, in descending order of trust. Reported
+# next to every inferred stage because three of the four are guesses, and a
+# guess presented as a fact is the failure mode this toolkit works hardest to
+# avoid.
+STAGE_SOURCES = ("hit_group", "shader_table", "name_prefix", "dxil")
+
 
 
 class ResourceKind(enum.StrEnum):
@@ -511,7 +536,534 @@ class Shader:
 
 
 @dataclass(slots=True)
+class DxilExport:
+    """One export of one DXIL_LIBRARY subobject inside a state object.
+
+    Both names matter and neither substitutes for the other. ``name`` is the
+    mangled export (``CHS_b5acc26ab7153489``) and is the *only* name the shader
+    binding table, the hit groups and ``GetShaderIdentifier`` ever speak, so any
+    cross-reference must key on it. ``original_name`` is the HLSL entry point
+    (``LumenHardwareRayTracingMaterialCHS``) and is the only handle that locates
+    the shader in the engine tree or in a PDB -- the mangled name appears nowhere
+    outside this capture.
+    """
+
+    name: str
+    original_name: str = ""
+    flags: str = ""
+    stage: Optional[ShaderStage] = None
+    # Never omit this when reporting ``stage``: three of the four sources are
+    # inferences (see STAGE_SOURCES) and only ``hit_group`` is stated by the export.
+    stage_source: str = ""
+    dxil_blob_index: Optional[int] = None
+    dxil_compressed_size: int = 0
+    local_root_signature_id: Optional[int] = None
+    # Which state object actually declared this export. After a RTPSO is expanded
+    # its exports mostly come from collections, and losing that attribution makes
+    # a DXIL patch land on the wrong object.
+    defining_state_object_id: Optional[int] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "name": self.name,
+            "original_name": self.original_name,
+            "stage": self.stage.value if self.stage else None,
+            "stage_source": self.stage_source or None,
+            "local_root_signature_id": self.local_root_signature_id,
+            "defining_state_object_id": self.defining_state_object_id,
+        }
+        if self.flags:
+            payload["flags"] = self.flags
+        if self.dxil_blob_index is not None:
+            payload["dxil_blob_index"] = self.dxil_blob_index
+            payload["dxil_compressed_size"] = self.dxil_compressed_size
+        return payload
+
+
+@dataclass(slots=True)
+class HitGroup:
+    """A D3D12_HIT_GROUP_DESC: the triple of shaders one ray hit can run."""
+
+    name: str
+    type: str = "triangles"
+    any_hit: str = ""
+    closest_hit: str = ""
+    intersection: str = ""
+    local_root_signature_id: Optional[int] = None
+    defining_state_object_id: Optional[int] = None
+
+    @property
+    def member_exports(self) -> tuple[str, ...]:
+        return tuple(
+            name for name in (self.closest_hit, self.any_hit, self.intersection) if name
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "type": self.type,
+            "closest_hit": self.closest_hit or None,
+            "any_hit": self.any_hit or None,
+            "intersection": self.intersection or None,
+            "local_root_signature_id": self.local_root_signature_id,
+            "defining_state_object_id": self.defining_state_object_id,
+        }
+
+
+@dataclass(slots=True)
+class StateObject:
+    """One ID3D12StateObject, as created by CreateStateObject/AddToStateObject.
+
+    A raytracing pipeline is not a flat object like a PSO. In this export 79 of
+    the 83 state objects are COLLECTIONs holding the actual DXIL, and the 4
+    RAYTRACING_PIPELINEs reference them through EXISTING_COLLECTION subobjects,
+    two of them growing across several AddToStateObject segments. RTPSO 3930 has
+    7 direct subobjects and zero exports of its own; every shader it can launch
+    lives in a collection. Reporting the direct lists as the answer to "what
+    shaders does this pipeline have" yields an empty pipeline -- worse than an
+    error, because it looks like a valid answer. Use ``resolved_exports`` /
+    ``resolved_hit_groups`` for that question and the direct lists only when the
+    question really is "what did this object itself declare".
+    """
+
+    api_id: int
+    type: StateObjectType = StateObjectType.COLLECTION
+    global_root_signature_id: Optional[int] = None
+    max_payload_size: int = 0
+    max_attribute_size: int = 0
+    max_recursion_depth: int = 0
+    flags: list[str] = field(default_factory=list)
+    exports: list[DxilExport] = field(default_factory=list)
+    hit_groups: list[HitGroup] = field(default_factory=list)
+    local_root_signature_ids: list[int] = field(default_factory=list)
+    existing_collection_ids: list[int] = field(default_factory=list)
+    grown_from_state_object_id: Optional[int] = None
+    desc_segment_count: int = 1
+    dxil_blob_indices: list[int] = field(default_factory=list)
+    source_file: str = ""
+    source_line: int = 0
+    _capture: Any = field(default=None, repr=False)
+    _resolved: Any = field(default=None, repr=False)
+
+    # -- expansion -----------------------------------------------------
+    def _resolve(self) -> tuple[list[DxilExport], list[HitGroup], list[int]]:
+        if self._resolved is not None:
+            return self._resolved
+        exports: list[DxilExport] = list(self.exports)
+        hit_groups: list[HitGroup] = list(self.hit_groups)
+        visited: list[int] = [self.api_id]
+        table = getattr(self._capture, "state_objects", None) if self._capture else None
+        if table:
+            seen = {self.api_id}
+            queue = list(self.existing_collection_ids)
+            while queue:
+                api_id = queue.pop(0)
+                if api_id in seen:
+                    continue
+                seen.add(api_id)
+                child = table.get(api_id)
+                if child is None:
+                    # A dangling reference is data loss, not something to paper
+                    # over: it is surfaced through missing_collection_ids so a
+                    # tool can degrade instead of silently reporting fewer shaders.
+                    continue
+                visited.append(api_id)
+                exports.extend(child.exports)
+                hit_groups.extend(child.hit_groups)
+                queue.extend(child.existing_collection_ids)
+        self._resolved = (exports, hit_groups, visited)
+        return self._resolved
+
+    @property
+    def resolved_exports(self) -> list[DxilExport]:
+        return self._resolve()[0]
+
+    @property
+    def resolved_hit_groups(self) -> list[HitGroup]:
+        return self._resolve()[1]
+
+    @property
+    def resolved_state_object_ids(self) -> list[int]:
+        """This object plus every collection reachable from it, in walk order."""
+        return self._resolve()[2]
+
+    @property
+    def missing_collection_ids(self) -> list[int]:
+        table = getattr(self._capture, "state_objects", None) if self._capture else None
+        if not table:
+            return list(self.existing_collection_ids)
+        return [
+            api_id for api_id in self.existing_collection_ids if api_id not in table
+        ]
+
+    @property
+    def export_by_name(self) -> dict[str, DxilExport]:
+        return {export.name: export for export in self.resolved_exports}
+
+    @property
+    def hit_group_by_name(self) -> dict[str, HitGroup]:
+        return {group.name: group for group in self.resolved_hit_groups}
+
+    def identifier_owner(self, identifier: str) -> Optional[str]:
+        """Classify a name from a shader binding table record.
+
+        Returns ``"hit_group"`` / ``"export"`` / None. A record naming something
+        this object cannot reach means the expansion missed a collection, which
+        is exactly the failure that would otherwise pass as a valid empty answer.
+        """
+        if identifier in self.hit_group_by_name:
+            return "hit_group"
+        if identifier in self.export_by_name:
+            return "export"
+        return None
+
+    def to_dict(self, *, detail: bool = False, expand: bool = True) -> dict[str, Any]:
+        exports = self.resolved_exports if expand else self.exports
+        hit_groups = self.resolved_hit_groups if expand else self.hit_groups
+        payload: dict[str, Any] = {
+            "state_object_id": self.api_id,
+            "type": self.type.value,
+            "global_root_signature_id": self.global_root_signature_id,
+            "max_payload_size": self.max_payload_size,
+            "max_attribute_size": self.max_attribute_size,
+            "max_recursion_depth": self.max_recursion_depth,
+            "flags": list(self.flags),
+            "expanded": bool(expand),
+            "counts": {
+                "exports": len(exports),
+                "hit_groups": len(hit_groups),
+                "own_exports": len(self.exports),
+                "own_hit_groups": len(self.hit_groups),
+                "existing_collections": len(self.existing_collection_ids),
+                "desc_segments": self.desc_segment_count,
+            },
+            "existing_collection_ids": list(self.existing_collection_ids),
+            "grown_from_state_object_id": self.grown_from_state_object_id,
+            "local_root_signature_ids": list(self.local_root_signature_ids),
+            "source": f"{self.source_file}:{self.source_line}",
+        }
+        if detail:
+            payload["exports"] = [export.to_dict() for export in exports]
+            payload["hit_groups"] = [group.to_dict() for group in hit_groups]
+        return payload
+
+
+@dataclass(slots=True)
+class ShaderRecord:
+    """One record written into a shader table by CreateShaderTable_*.
+
+    ``table`` is decided by where ``offset`` falls inside the four regions of the
+    D3D12_DISPATCH_RAYS_DESC, never by which function wrote it.
+
+    ``in_declared_region`` exists because a reconstructed buffer can be larger
+    than the region the dispatch reads from it: in this frame the hit-group buffer
+    is 147,456 bytes while the desc declares a 131,072-byte hit-group region, and
+    PIX faithfully reproduces the application's original combined layout by
+    writing miss records into that tail. Those records are real data but are not
+    read by this dispatch, and calling them hit groups -- or silently dropping
+    them -- would both be wrong.
+    """
+
+    offset: int
+    shader_identifier: str
+    root_constants: list[int] = field(default_factory=list)
+    root_gpuvas: list[tuple[int, int]] = field(default_factory=list)
+    table: str = ""
+    in_declared_region: bool = True
+    reconstruction_function: str = ""
+    source_line: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "offset": self.offset,
+            "shader_identifier": self.shader_identifier,
+            "table": self.table or None,
+            "in_declared_region": self.in_declared_region,
+            "root_constants": list(self.root_constants),
+            "root_gpuvas": [
+                {"resource_id": resource_id, "byte_offset": byte_offset}
+                for resource_id, byte_offset in self.root_gpuvas
+            ],
+            "reconstruction_function": self.reconstruction_function,
+        }
+        if not self.in_declared_region:
+            payload["note"] = (
+                "Written past the end of the region this dispatch declares for that "
+                "buffer, so it is not read by this dispatch. It reproduces the "
+                "application's original combined table layout; the same identifier is "
+                "served from the separately reconstructed region."
+            )
+        return payload
+
+
+
+@dataclass(slots=True)
+class ShaderTableRegion:
+    """One of the four regions a D3D12_DISPATCH_RAYS_DESC names.
+
+    ``size_in_bytes`` is the region size the dispatch reads, which is *not* the
+    size of the buffer holding it: this frame's raygen region is 64 bytes inside
+    a 2,715,136-byte allocation. Reporting the allocation as the table size makes
+    a one-record table look like tens of thousands of records.
+    """
+
+    start_offset: int = 0
+    size_in_bytes: int = 0
+    stride_in_bytes: int = 0
+    buffer_size_in_bytes: int = 0
+
+    @property
+    def record_capacity(self) -> int:
+        return self.size_in_bytes // self.stride_in_bytes if self.stride_in_bytes else 0
+
+    def contains(self, offset: int) -> bool:
+        return self.start_offset <= offset < self.start_offset + self.size_in_bytes
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start_offset": self.start_offset,
+            "size_in_bytes": self.size_in_bytes,
+            "stride_in_bytes": self.stride_in_bytes,
+            "record_capacity": self.record_capacity,
+            "buffer_size_in_bytes": self.buffer_size_in_bytes or None,
+        }
+
+
+@dataclass(slots=True)
+class ShaderBindingTable:
+    """The D3D12_DISPATCH_RAYS_DESC one raytracing action launches with.
+
+    Keyed by the indirect argument buffer name because that is the exact, not
+    inferred, link to an action: an ExecuteIndirect names its argument buffer
+    (``g_indirectArgumentBuffers["1415_1"]``) and exactly one
+    ``CreateIndirectArgumentBuffer_*`` writes a dispatch-rays desc into that key.
+    No literal ``DispatchRays`` call exists anywhere in this export, so this is
+    the only path from an action to its shader tables.
+    """
+
+    indirect_buffer_key: str = ""
+    state_object_id: Optional[int] = None
+    raygen: Optional[ShaderTableRegion] = None
+    miss: Optional[ShaderTableRegion] = None
+    hit_group: Optional[ShaderTableRegion] = None
+    callable_table: Optional[ShaderTableRegion] = None
+    width: int = 0
+    height: int = 0
+    depth: int = 0
+    raygen_identifier: str = ""
+    records: list[ShaderRecord] = field(default_factory=list)
+    reconstruction_functions: list[str] = field(default_factory=list)
+    source_file: str = ""
+    source_line: int = 0
+    _capture: Any = field(default=None, repr=False)
+
+    @property
+    def ray_count(self) -> int:
+        return self.width * max(self.height, 1) * max(self.depth, 1)
+
+    @property
+    def state_object(self) -> Optional[StateObject]:
+        if self._capture is None or self.state_object_id is None:
+            return None
+        return self._capture.state_objects.get(self.state_object_id)
+
+    def region(self, name: str) -> Optional[ShaderTableRegion]:
+        return {
+            "raygen": self.raygen,
+            "miss": self.miss,
+            "hit_group": self.hit_group,
+            "callable": self.callable_table,
+        }.get(name)
+
+    def records_in(self, table: str) -> list[ShaderRecord]:
+        return [record for record in self.records if record.table == table]
+
+    @property
+    def unresolved_identifiers(self) -> list[str]:
+        """Record identifiers the bound state object cannot account for.
+
+        Non-empty means either the state object expansion dropped a collection or
+        the SBT was matched to the wrong object. Both are silent-wrong-answer
+        bugs, so this is published rather than logged.
+        """
+        state_object = self.state_object
+        if state_object is None:
+            return []
+        return sorted(
+            {
+                record.shader_identifier
+                for record in self.records
+                if state_object.identifier_owner(record.shader_identifier) is None
+            }
+        )
+
+    def to_dict(self, *, detail: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "indirect_buffer_key": self.indirect_buffer_key,
+            "state_object_id": self.state_object_id,
+            "dispatch": {
+                "width": self.width,
+                "height": self.height,
+                "depth": self.depth,
+                "ray_count": self.ray_count,
+            },
+            "tables": {
+                "raygen": self.raygen.to_dict() if self.raygen else None,
+                "miss": self.miss.to_dict() if self.miss else None,
+                "hit_group": self.hit_group.to_dict() if self.hit_group else None,
+                # An absent callable table is reported as null, not as an empty
+                # region: "this pipeline has no callable shaders" and "it has a
+                # callable table with zero records" are different facts.
+                "callable": self.callable_table.to_dict() if self.callable_table else None,
+            },
+            "raygen_identifier": self.raygen_identifier,
+            "record_count": len(self.records),
+            "records_by_table": {
+                name: len(self.records_in(name))
+                for name in ("raygen", "miss", "hit_group", "callable")
+            },
+            "records_outside_declared_regions": sum(
+                1 for record in self.records if not record.in_declared_region
+            ),
+
+            "reconstruction_functions": list(self.reconstruction_functions),
+            "source": f"{self.source_file}:{self.source_line}",
+        }
+        if detail:
+            payload["records"] = [record.to_dict() for record in self.records]
+        return payload
+
+
+@dataclass(slots=True)
+class AccelerationStructureInstance:
+    """One D3D12_RAYTRACING_INSTANCE_DESC out of a TLAS build.
+
+    ``contribution_to_hit_group_index`` is what connects a scene object to the
+    hit-group region of a shader table, so it answers "which raytracing material
+    does this instance use" -- but only once multiplied by that table's stride,
+    which lives on the SBT, not here.
+    """
+
+    index: int
+    transform: list[float] = field(default_factory=list)
+    instance_id: int = 0
+    instance_mask: int = 0
+    contribution_to_hit_group_index: int = 0
+    flags: int = 0
+    blas_resource_id: Optional[int] = None
+    blas_byte_offset: int = 0
+    source_file: str = ""
+    source_line: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "transform": list(self.transform),
+            "instance_id": self.instance_id,
+            "instance_mask": self.instance_mask,
+            "contribution_to_hit_group_index": self.contribution_to_hit_group_index,
+            "flags": self.flags,
+            "blas_resource_id": self.blas_resource_id,
+            "blas_byte_offset": self.blas_byte_offset,
+        }
+
+
+@dataclass(slots=True)
+class AccelerationStructureBuild:
+    """One BuildRaytracingAccelerationStructure call.
+
+    Deliberately has no triangle or vertex count. For a BLAS this export carries
+    a driver-private serialized blob rather than D3D12_RAYTRACING_GEOMETRY_DESCs,
+    so geometry counts are not recoverable; deriving one from the blob size would
+    be fabrication. See ``geometry_available``.
+    """
+
+    global_id: Optional[int]
+    command_list_id: Optional[int]
+    type: str = "top_level"
+    flags: list[str] = field(default_factory=list)
+    num_descs: int = 0
+    descs_layout: str = ""
+    dest_resource_id: Optional[int] = None
+    dest_byte_offset: int = 0
+    scratch_resource_id: Optional[int] = None
+    scratch_byte_offset: int = 0
+    source_resource_id: Optional[int] = None
+    instances_function: str = ""
+    instances: list[AccelerationStructureInstance] = field(default_factory=list)
+    marker_path: tuple[str, ...] = ()
+    source_file: str = ""
+    source_line: int = 0
+
+    @property
+    def is_top_level(self) -> bool:
+        return self.type == "top_level"
+
+    @property
+    def geometry_available(self) -> bool:
+        """Always False for bottom-level builds in a pixtool export."""
+        return False
+
+    def to_dict(self, *, detail: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "global_id": self.global_id,
+            "command_list_id": self.command_list_id,
+            "type": self.type,
+            "flags": list(self.flags),
+            "num_descs": self.num_descs,
+            "descs_layout": self.descs_layout,
+            "dest_resource_id": self.dest_resource_id,
+            "dest_byte_offset": self.dest_byte_offset,
+            "scratch_resource_id": self.scratch_resource_id,
+            "instance_count": len(self.instances),
+            "pass_name": self.marker_path[-1] if self.marker_path else "",
+            "source": f"{self.source_file}:{self.source_line}",
+            # Stated on every build, not only when asked, because the absence of
+            # a triangle count is the single most likely thing to be mistaken for
+            # a parsing gap.
+            "triangle_count": None,
+            "vertex_count": None,
+            "geometry_note": (
+                "Geometry counts are not recoverable from a pixtool export: bottom-level "
+                "structures are replayed from a driver-private serialized blob "
+                "(CopyRaytracingAccelerationStructure DESERIALIZE), not from "
+                "D3D12_RAYTRACING_GEOMETRY_DESCs. Any triangle count here would be invented."
+            ),
+        }
+        if detail:
+            payload["instances"] = [instance.to_dict() for instance in self.instances]
+            payload["marker_path"] = list(self.marker_path)
+        return payload
+
+
+@dataclass(slots=True)
+class SerializedAccelerationStructure:
+    """One RecreateAccelStructure_* block: a BLAS/TLAS replayed from a blob."""
+
+    resource_id: int
+    byte_offset: int
+    sequence: int
+    serialized_size: int = 0
+    deserialized_size: int = 0
+    function: str = ""
+    source_file: str = ""
+    source_line: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "resource_id": self.resource_id,
+            "byte_offset": self.byte_offset,
+            "sequence": self.sequence,
+            "serialized_size": self.serialized_size,
+            "deserialized_size": self.deserialized_size,
+            "function": self.function,
+        }
+
+
+@dataclass(slots=True)
 class PipelineState:
+
+
     api_id: int
     kind: str = "graphics"
     root_signature_id: Optional[int] = None
@@ -701,9 +1253,10 @@ class DrawCall:
     pso_id: Optional[int] = None
     # Set when the action runs under a raytracing state object
     # (SetPipelineState1). Mutually exclusive with pso_id: when this is set,
-    # pso_id is None and the pipeline is a state object this toolkit does not yet
-    # model, so callers must not fall back to the last PSO they saw.
+    # pso_id is None, so callers must not fall back to the last PSO they saw.
+    # Resolve it through the ``state_object`` property for the expanded pipeline.
     state_object_id: Optional[int] = None
+
     root_signature_id: Optional[int] = None
     primitive_topology: str = ""
 
@@ -733,6 +1286,37 @@ class DrawCall:
         if self._capture is None or self.pso_id is None:
             return None
         return self._capture.pipeline_states.get(self.pso_id)
+
+    @property
+    def state_object(self) -> Optional[StateObject]:
+        """The raytracing state object bound at this action, if any.
+
+        Mutually exclusive with ``pipeline_state``: SetPipelineState1 clears the
+        PSO, so a caller must not read the last PSO it saw for a raytracing action.
+        """
+        if self._capture is None or self.state_object_id is None:
+            return None
+        return self._capture.state_objects.get(self.state_object_id)
+
+    @property
+    def shader_binding_table(self) -> Optional[ShaderBindingTable]:
+        """The shader tables this raytracing action dispatches with.
+
+        Resolved through the indirect argument buffer name, which is an exact
+        link rather than an inference. Returns None for a non-raytracing action,
+        for an ExecuteIndirect whose argument buffer is filled on the GPU, and for
+        a capture where the dispatch-rays desc was not exported -- a tool must
+        keep those apart from "this dispatch has no shader tables", which cannot
+        happen.
+        """
+        if self._capture is None or not self.indirect_argument_buffer:
+            return None
+        tables = getattr(self._capture, "shader_binding_tables", None)
+        if not tables:
+            return None
+        return tables.get(self.indirect_argument_buffer)
+
+
 
     @property
     def effective_kind(self) -> EventKind:
@@ -1033,10 +1617,21 @@ class DrawCall:
             "pso_id": self.pso_id,
             # Reported alongside pso_id so a raytracing action is never answered
             # with a stale compute PSO: when this is set, pso_id is None and the
-            # pipeline is a state object this toolkit does not yet model.
+            # pipeline is a raytracing state object (see state_object).
             "state_object_id": self.state_object_id,
             "root_signature_id": self.root_signature_id,
         }
+        if self.is_raytracing:
+            state_object = self.state_object
+            sbt = self.shader_binding_table
+            payload["raytracing"] = {
+                "state_object": (
+                    state_object.to_dict() if state_object is not None else None
+                ),
+                "shader_binding_table": sbt.to_dict() if sbt is not None else None,
+                "shader_binding_table_key": self.indirect_argument_buffer or None,
+            }
+
         if self.kind in (EventKind.DISPATCH, EventKind.DISPATCH_RAYS):
             payload["thread_groups"] = [
                 self.thread_group_x,

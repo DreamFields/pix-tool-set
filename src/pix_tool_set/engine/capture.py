@@ -10,7 +10,18 @@ from typing import Any, Callable, Iterable, Optional
 
 from ..errors import PixToolError, export_incomplete
 from ..pixtool import PixTool, validate_export
-from . import bindinglabel, cppparse, eventlist, resourceevents
+from . import (
+    accelstructure,
+    bindinglabel,
+    cppparse,
+    eventlist,
+    resourceevents,
+    shadertable,
+    stateobject,
+)
+
+
+
 
 from .dxbc import (
     DxbcContainer,
@@ -24,6 +35,7 @@ from .dxbc import (
 )
 from .model import (
     DRAW_KINDS,
+    AccelerationStructureBuild,
     DrawCall,
     Event,
     EventKind,
@@ -31,11 +43,17 @@ from .model import (
     Resource,
     ResourceKind,
     RootParameterKind,
+    SerializedAccelerationStructure,
     Shader,
+    ShaderBindingTable,
     ShaderStage,
+    StateObject,
+    StateObjectType,
     View,
     ViewKind,
 )
+
+
 
 
 class Capture:
@@ -102,6 +120,64 @@ class Capture:
     @cached_property
     def root_signatures(self) -> dict[int, cppparse.RootSignature]:
         return cppparse.parse_root_signatures(self.export_dir)
+
+    @cached_property
+    def state_objects(self) -> dict[int, StateObject]:
+        """Raytracing state objects, with their collection graph resolvable.
+
+        Separate from ``pipeline_states`` because a state object is not a PSO and
+        must never be substituted for one: SetPipelineState1 clears the PSO, so an
+        action carrying a state object has no graphics or compute pipeline at all.
+
+        Empty for a capture without raytracing -- a fact, not a failure.
+        """
+        objects = stateobject.parse_state_objects(self.export_dir)
+        for state_object in objects.values():
+            # The back-reference is what lets a RTPSO expand its EXISTING_COLLECTION
+            # references; without it every raytracing pipeline reports zero shaders.
+            state_object._capture = self
+        return objects
+
+    @cached_property
+    def shader_binding_tables(self) -> dict[str, ShaderBindingTable]:
+        """Shader binding tables, keyed by indirect argument buffer name.
+
+        The key is the string ``DrawCall.indirect_argument_buffer`` already holds,
+        so an action finds its tables by dict lookup with no heuristic. Keyed that
+        way rather than by state object id because two dispatches can share one
+        pipeline while using different tables.
+        """
+        tables = shadertable.parse_shader_binding_tables(self.export_dir)
+        for table in tables.values():
+            table._capture = self
+        return tables
+
+    @cached_property
+    def acceleration_structure_builds(self) -> list[AccelerationStructureBuild]:
+        """BuildRaytracingAccelerationStructure calls, with TLAS instances attached.
+
+        Never carries geometry counts: a bottom-level structure reaches the replay
+        as a driver-private serialized blob, so triangle and vertex counts are not
+        in the export at all. See ``AccelerationStructureBuild.to_dict``.
+        """
+        return accelstructure.parse_acceleration_structure_builds(self.export_dir)
+
+    @cached_property
+    def serialized_acceleration_structures(
+        self,
+    ) -> list[SerializedAccelerationStructure]:
+        """The replay's serialized AS blobs, by resource and offset.
+
+        Only headers are read. The blob bodies total hundreds of megabytes and
+        contain nothing this toolkit can interpret.
+        """
+        return accelstructure.parse_serialized_structures(self.export_dir)
+
+
+
+
+
+
 
     @cached_property
     def command_signatures(self) -> dict[int, cppparse.CommandSignature]:
@@ -1307,9 +1383,16 @@ class Capture:
         draws = [d for d in self.draw_calls if d.kind is EventKind.DRAW]
         dispatches = [d for d in self.draw_calls if d.kind is EventKind.DISPATCH]
         indirect = [d for d in self.draw_calls if d.kind is EventKind.EXECUTE_INDIRECT]
+        # Counted by effective_kind, not kind: no literal DispatchRays exists in a
+        # UE5 export, so counting by kind reports zero raytracing work for a frame
+        # that traces hundreds of thousands of rays.
+        ray_dispatches = [
+            d for d in self.draw_calls if d.effective_kind is EventKind.DISPATCH_RAYS
+        ]
         textures = [r for r in self.resources.values() if r.is_texture]
         buffers = [r for r in self.resources.values() if r.is_buffer]
         render_targets = [r for r in textures if r.is_render_target]
+
 
         return {
             "events": {
@@ -1335,6 +1418,34 @@ class Capture:
                     (d.thread_count for d in dispatches), default=0
                 ),
             },
+            "raytracing": {
+                # Zeroes here mean the frame does no raytracing. They do not mean
+                # the analysis is unavailable, which is why the counts are always
+                # present rather than omitted for a non-raytracing capture.
+                "dispatch_rays": len(ray_dispatches),
+                "rays_dispatched": sum(
+                    table.ray_count for table in self.shader_binding_tables.values()
+                ),
+                "state_objects": len(self.state_objects),
+                "raytracing_pipelines": sum(
+                    1
+                    for state_object in self.state_objects.values()
+                    if state_object.type is StateObjectType.RAYTRACING_PIPELINE
+                ),
+                "collections": sum(
+                    1
+                    for state_object in self.state_objects.values()
+                    if state_object.type is StateObjectType.COLLECTION
+                ),
+                "shader_binding_tables": len(self.shader_binding_tables),
+                "acceleration_structure_builds": len(
+                    self.acceleration_structure_builds
+                ),
+                "tlas_instances": sum(
+                    len(build.instances) for build in self.acceleration_structure_builds
+                ),
+            },
+
             "passes": {
                 "total": len(self.passes),
                 "max_depth": max((p["depth"] for p in self.passes), default=0),

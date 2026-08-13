@@ -729,6 +729,9 @@ def parse_descriptors(
 # 3. pipeline states
 # --------------------------------------------------------------------------
 _RE_PSO_FUNC = re.compile(r"^void\s+CreatePipelineState_(\d+)\s*\(")
+# Any top-level function definition, used purely as a body terminator.
+_RE_ANY_TOP_FUNC = re.compile(r"^void\s+\w+\s*\(")
+
 _RE_STAGE = re.compile(r"pssDesc\.(VS|PS|CS|GS|HS|DS|AS|MS)\s*=\s*\{[^}]*?,\s*(\d+)\s*\}")
 _RE_PSO_ROOTSIG = re.compile(r"pssDesc\.pRootSignature\s*=\s*GetRootSignature\((\d+)\)")
 _RE_RT_FORMAT = re.compile(r"rtFormatArray\.RTFormats\[(\d+)\]\s*=\s*(DXGI_FORMAT_\w+)")
@@ -778,8 +781,26 @@ def parse_pipeline_states(root: Path) -> PsoParseResult:
             pending_read = None
             stage_cursor = 0
             continue
-        if current is None:
+        if _RE_ANY_TOP_FUNC.match(line):
+            # Any other top-level function ends the current PSO. CreatePSOs.cpp also
+            # holds 81 CreateStateObject_* functions whose DXIL Read() calls would
+            # otherwise keep overwriting the last PSO's blob_index, pointing its
+            # shader bytecode at a raytracing library blob.
+            current = None
+            pending_read = None
             continue
+        if current is None:
+            # Reads outside a PSO body still belong to the resources.bin stream, so
+            # they must keep both the counter and read_sizes in step -- read_sizes is
+            # the fallback blob index, and dropping entries from it would shift every
+            # later blob offset. They just do not belong to any PipelineState.
+            match = _RE_READ.search(line)
+            if match:
+                result.read_sizes.append(int(match.group(1)))
+                read_counter += 1
+            continue
+
+
 
         match = _RE_READ.search(line)
         if match:

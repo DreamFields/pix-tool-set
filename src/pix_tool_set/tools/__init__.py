@@ -28,6 +28,7 @@ def load_builtin_tools() -> None:
     from . import value_tools  # noqa: F401
     from . import geometry_tools  # noqa: F401
     from . import pipeline_tools  # noqa: F401
+    from . import raytracing_tools  # noqa: F401
     from . import resource_tools  # noqa: F401
     from . import export_tools  # noqa: F401
     from . import advanced_tools  # noqa: F401

@@ -56,8 +56,12 @@ def _format_size(fmt: str) -> int:
         PAGE_PARAMS,
         kind={
             "type": "string",
-            "enum": ["graphics", "compute"],
-            "description": "Restrict to graphics or compute PSOs.",
+            "enum": ["graphics", "compute", "raytracing"],
+            "description": (
+                "Restrict to graphics, compute, or raytracing pipelines. Raytracing "
+                "entries are state objects, not PSOs, and are identified by "
+                "state_object_id rather than pso_id."
+            ),
         },
         used_only={"type": "boolean", "description": "Only PSOs actually bound by a draw."},
         detail={"type": "boolean", "description": "Include full state (blend, depth, layout)."},
@@ -70,9 +74,14 @@ def list_pipeline_states(args: dict[str, Any], context: ToolContext) -> ToolResu
     offset, limit = page_args(args)
 
     usage: dict[int, int] = {}
+    state_object_usage: dict[int, int] = {}
     for draw in capture.draw_calls:
         if draw.pso_id is not None:
             usage[draw.pso_id] = usage.get(draw.pso_id, 0) + 1
+        if draw.state_object_id is not None:
+            state_object_usage[draw.state_object_id] = (
+                state_object_usage.get(draw.state_object_id, 0) + 1
+            )
 
     kind = args.get("kind")
     used_only = bool(args.get("used_only"))
@@ -88,11 +97,33 @@ def list_pipeline_states(args: dict[str, Any], context: ToolContext) -> ToolResu
         rows.append(entry)
     rows.sort(key=lambda entry: (-entry["draw_count"], entry["pso_id"]))
 
+    # State objects are listed alongside, not merged into, the PSO rows: they have
+    # no pso_id and cannot be passed to a tool expecting one. Omitting them
+    # entirely would be worse -- a frame's raytracing pipelines would be invisible
+    # to the tool whose whole job is listing pipelines.
+    state_object_rows = []
+    if kind in (None, "raytracing"):
+        for state_object in capture.state_objects.values():
+            if used_only and state_object.api_id not in state_object_usage:
+                continue
+            entry = state_object.to_dict(detail=bool(args.get("detail")))
+            entry["draw_count"] = state_object_usage.get(state_object.api_id, 0)
+            state_object_rows.append(entry)
+        state_object_rows.sort(
+            key=lambda entry: (-entry["draw_count"], entry["state_object_id"])
+        )
+
     total = len(rows)
     window = rows[offset : offset + limit] if limit else rows[offset:]
     return ToolResult.success(
-        {"pipeline_states": window, **page_envelope(total, offset, limit, len(window))}
+        {
+            "pipeline_states": window,
+            "state_objects": state_object_rows,
+            "state_object_count": len(state_object_rows),
+            **page_envelope(total, offset, limit, len(window)),
+        }
     )
+
 
 
 @tool(
@@ -126,12 +157,19 @@ def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if pso_id is None:
         draw = resolve_draw(capture, args, what="pipeline state")
         if draw.pso_id is None:
+            if draw.state_object_id is not None:
+                # SetPipelineState1 replaced the PSO with a raytracing state object.
+                # Raising "binds no pipeline state" here would be true of the PSO
+                # slot and completely misleading about the action, which does have a
+                # pipeline -- a differently shaped one.
+                return _raytracing_pipeline(capture, draw)
             raise not_found(
                 "pipeline state",
                 f"draw_index={draw.index}",
                 "This action binds no pipeline state; check draw-state for what it does.",
             )
         pso_id = draw.pso_id
+
 
     pso = capture.pipeline_state(int(pso_id))
     if pso is None:
@@ -159,8 +197,59 @@ def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     )
 
 
+def _raytracing_pipeline(capture, draw) -> ToolResult:
+    """Answer a pipeline query for an action bound to a raytracing state object.
+
+    Kept deliberately brief and pointed at describe-state-object: this tool's
+    contract is a PSO-shaped answer, and a state object has a different shape
+    (a graph of collections, exports rather than stages). Returning a summary plus
+    the tool that gives the full picture is more useful than reshaping one into
+    the other and losing the parts that do not fit.
+    """
+    state_object = draw.state_object
+    if state_object is None:
+        result = ToolResult.success(
+            {
+                "pipeline_state": None,
+                "resolved_kind": "raytracing",
+                "state_object_id": draw.state_object_id,
+                "state_object": None,
+            }
+        )
+        result.degrade(
+            f"This action is bound to raytracing state object {draw.state_object_id}, which "
+            f"is not present in the exported CreatePSOs.cpp.",
+            reason="state_object_missing_from_export",
+        )
+        return result
+
+    signature = capture.root_signatures.get(state_object.global_root_signature_id or -1)
+    sbt = draw.shader_binding_table
+    return ToolResult.success(
+        {
+            "pipeline_state": None,
+            "resolved_kind": "raytracing",
+            "state_object_id": state_object.api_id,
+            "state_object": state_object.to_dict(),
+            "root_signature": signature.to_dict() if signature else None,
+            "shader_binding_table": sbt.to_dict() if sbt else None,
+            "shaders": [
+                export.to_dict() for export in state_object.resolved_exports[:50]
+            ],
+            "shader_count": len(state_object.resolved_exports),
+            "note": (
+                "A raytracing pipeline has exports and hit groups instead of the fixed "
+                "stage slots of a PSO, so it is not reported as one. Run "
+                "describe-state-object for the full pipeline, including hit groups, local "
+                "root signatures and the collection graph."
+            ),
+        }
+    )
+
+
 @tool(
     name="draw-state",
+
     summary=(
         "Everything bound at one draw: pipeline state, root signature, descriptor heaps, "
         "render targets, depth buffer, viewports, scissors and every root binding."

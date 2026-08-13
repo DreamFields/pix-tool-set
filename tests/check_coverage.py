@@ -17,6 +17,20 @@ from pix_tool_set.tools import load_builtin_tools  # noqa: E402
 
 REQUIREMENT = ROOT / "Doc" / "requirement.md"
 
+# Raytracing D3D12 entry points, and the tool that answers for each. A frame need
+# not exercise every one; "implemented but no sample in this capture" is a distinct
+# and legitimate state from "not covered", and conflating the two would either hide
+# a real gap or raise a false alarm on every non-raytracing capture.
+RAYTRACING_API_COVERAGE: dict[str, str] = {
+    "CreateStateObject": "describe-state-object",
+    "AddToStateObject": "describe-state-object",
+    "SetPipelineState1": "list-raytracing-work",
+    "DispatchRays": "describe-shader-table",
+    "BuildRaytracingAccelerationStructure": "analyze-acceleration-structures",
+    "CopyRaytracingAccelerationStructure": "analyze-acceleration-structures",
+    "EmitRaytracingAccelerationStructurePostbuildInfo": "",
+}
+
 # requirement heading -> tool that implements it
 MAPPING: dict[str, str] = {
     "打开捕获文件": "session-open",
@@ -112,8 +126,29 @@ def main() -> int:
     for name in extras:
         print(f"  {name}: {registry.get(name).summary[:70]}")
 
-    print("\n--- schema sanity ---")
+    print("\n--- raytracing API coverage ---")
     problems: list[str] = []
+    uncovered: list[str] = []
+    for api, tool_name in RAYTRACING_API_COVERAGE.items():
+        if not tool_name:
+            # Recorded deliberately rather than omitted: an API with no tool is a
+            # known gap, and leaving it out of the table would let it be forgotten.
+            print(f"  [--] {api:48s} -> no tool yet (known gap)")
+            uncovered.append(api)
+            continue
+        if not registry.has(tool_name):
+            print(f"  [X]  {api:48s} -> {tool_name} MISSING")
+            problems.append(f"raytracing api {api}: {tool_name} not registered")
+            continue
+        print(f"  [ok] {api:48s} -> {tool_name}")
+    covered = len(RAYTRACING_API_COVERAGE) - len(uncovered)
+    print(
+        f"  {covered}/{len(RAYTRACING_API_COVERAGE)} raytracing entry points have a tool"
+    )
+    if uncovered:
+        print(f"  known gaps: {', '.join(uncovered)}")
+
+    print("\n--- schema sanity ---")
     for definition in registry.list_tools():
         if not definition.summary:
             problems.append(f"{definition.name}: empty summary")

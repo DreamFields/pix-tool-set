@@ -373,8 +373,142 @@ def shader_reflection(args: dict[str, Any], context: ToolContext) -> ToolResult:
     return result
 
 
+def _raytracing_bindings(capture, draw, args: dict[str, Any]) -> ToolResult:
+    """What a ray dispatch has bound, at whatever precision the export supports.
+
+    Global and local root arguments are reported separately and never merged. They
+    come from different places and have different cardinality: the global set is
+    bound once on the command list for the whole dispatch, while each shader record
+    in the binding table carries its own local set. Concatenating them would
+    present one dispatch as having dozens of bindings, and would make it impossible
+    to tell which shader a given binding belongs to.
+    """
+    max_views = int(args.get("max_views") or 128)
+    state_object = draw.state_object
+    sbt = draw.shader_binding_table
+    signature = capture.root_signatures.get(draw.root_signature_id or -1)
+
+    global_bindings: list[dict[str, Any]] = []
+    for binding in draw.bindings:
+        row = binding.to_dict(max_views=max_views)
+        parameter = signature.parameter(binding.root_index) if signature else None
+        if parameter is not None:
+            row["root_parameter"] = parameter.to_dict()
+        resolved = []
+        for view in binding.resolved_views[:max_views]:
+            entry = view.to_dict()
+            resource = (
+                capture.resource(view.resource_id) if view.resource_id is not None else None
+            )
+            if resource is not None:
+                entry["resource"] = resource.to_dict()
+            resolved.append(entry)
+        row["resolved"] = resolved
+        global_bindings.append(row)
+
+    data: dict[str, Any] = {
+        "draw_index": draw.index,
+        "global_id": draw.global_id,
+        "queue_id": draw.queue_id,
+        "pass_name": draw.pass_name,
+        "pso_id": None,
+        "state_object_id": draw.state_object_id,
+        "effective_kind": draw.effective_kind.value,
+        "root_signature": signature.to_dict() if signature else None,
+        # Named global_* rather than root_bindings so no caller can mistake this
+        # for the whole binding set of the dispatch.
+        "global_root_bindings": global_bindings,
+        "descriptor_heap_ids": draw.descriptor_heap_ids,
+        "stages": [],
+    }
+
+    if state_object is None:
+        result = ToolResult.success(data)
+        result.degrade(
+            f"State object {draw.state_object_id} is referenced by this action but was not "
+            f"found in CreatePSOs.cpp, so no shaders can be listed. The global root "
+            f"bindings above are still valid.",
+            reason="state_object_missing_from_export",
+        )
+        return result
+
+    exports = state_object.resolved_exports
+    data["state_object"] = state_object.to_dict()
+    data["stages"] = sorted(
+        {export.stage.value for export in exports if export.stage is not None}
+    )
+    data["exports"] = [export.to_dict() for export in exports]
+    data["hit_groups"] = [group.to_dict() for group in state_object.resolved_hit_groups]
+    data["stage_source_note"] = (
+        "Stages on the exports above are derived, not declared; each carries a "
+        "stage_source saying how. Only 'hit_group' is stated by the export."
+    )
+
+    if sbt is None:
+        result = ToolResult.success(data)
+        result.degrade(
+            f"No shader binding table could be located for this dispatch, so the list "
+            f"above is every shader the pipeline could launch, not the ones this "
+            f"dispatch selected. Local root arguments are unavailable for the same "
+            f"reason.",
+            reason="shader_binding_table_unresolved",
+        )
+        return result
+
+    # Local root arguments, grouped per record. The grouping is the point: a
+    # binding only means something together with the shader whose record carries it.
+    local_by_record: list[dict[str, Any]] = []
+    for record in sbt.records:
+        if not record.root_constants and not record.root_gpuvas:
+            continue
+        if not record.in_declared_region:
+            continue
+        owner = state_object.identifier_owner(record.shader_identifier)
+        local_by_record.append(
+            {
+                "table": record.table,
+                "offset": record.offset,
+                "shader_identifier": record.shader_identifier,
+                "identifier_kind": owner,
+                "root_constants": list(record.root_constants),
+                "root_gpuvas": [
+                    {
+                        "resource_id": resource_id,
+                        "byte_offset": byte_offset,
+                        "resource": (
+                            capture.resource(resource_id).to_dict()
+                            if capture.resource(resource_id) is not None
+                            else None
+                        ),
+                    }
+                    for resource_id, byte_offset in record.root_gpuvas
+                ],
+            }
+        )
+
+    data["shader_binding_table"] = sbt.to_dict()
+    data["local_root_bindings_by_record"] = local_by_record
+    data["binding_model_note"] = (
+        "global_root_bindings are bound once on the command list and apply to the whole "
+        "dispatch. local_root_bindings_by_record come from individual shader records and "
+        "apply only to the shader that record names. The two sets are deliberately not "
+        "combined."
+    )
+
+    result = ToolResult.success(data)
+    unresolved = sbt.unresolved_identifiers
+    if unresolved:
+        result.degrade(
+            f"{len(unresolved)} shader record(s) name identifiers this state object does "
+            f"not export: {unresolved[:8]}. The shader list may be incomplete.",
+            reason="shader_record_identifier_unresolved",
+        )
+    return result
+
+
 @tool(
     name="shader-bindings",
+
     summary=(
         "What a shader actually has bound at a given draw: the declared HLSL registers "
         "matched against the concrete resources the root signature supplies."
@@ -402,45 +536,14 @@ def shader_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     shaders = [draw.shader(stage)] if stage else draw.shaders
     shaders = [shader for shader in shaders if shader is not None]
     if not shaders:
-        # A raytracing state object is not modelled as a PSO, so this is the path
-        # a DispatchRays takes. Reporting it as a generic "no shader" would hide
-        # the one fact the caller needs: the pipeline is a state object, not a
-        # gap. Degrade with that reason so the caller knows the root bindings are
-        # still valid and which object to look up in the PIX GUI.
+        # A raytracing state object is not a PSO, so this is the path a ray
+        # dispatch takes. Answering "no shader" would hide the one fact the caller
+        # needs. How much can be said depends on what resolved, and the three
+        # levels are kept apart because they call for different next steps.
         if draw.state_object_id is not None:
-            result = ToolResult.success(
-                {
-                    "draw_index": draw.index,
-                    "global_id": draw.global_id,
-                    "pass_name": draw.pass_name,
-                    "pso_id": None,
-                    "state_object_id": draw.state_object_id,
-                    "effective_kind": draw.effective_kind.value,
-                    "root_signature": (
-                        capture.root_signatures.get(draw.root_signature_id or -1).to_dict()
-                        if draw.root_signature_id
-                        and draw.root_signature_id in capture.root_signatures
-                        else None
-                    ),
-                    "stages": [],
-                    "root_bindings": [],
-                    "descriptor_heap_ids": draw.descriptor_heap_ids,
-                    "pipeline_note": (
-                        f"This action runs under raytracing state object "
-                        f"{draw.state_object_id} (SetPipelineState1). State objects are not "
-                        "yet modelled, so no shader stages are reported. The root bindings "
-                        "above are still the compute root arguments the dispatch reads; "
-                        "view the state object in the PIX GUI for the raytracing shaders."
-                    ),
-                }
-            )
-            result.degrade(
-                "Raytracing state object is not modelled; shader stages are unavailable. "
-                "Root bindings are still reported.",
-                reason="state_object_unmodelled",
-            )
-            return result
+            return _raytracing_bindings(capture, draw, args)
         raise not_found("shader", stage or "any", "This draw has no shader for that stage.")
+
 
     max_views = int(args.get("max_views") or 128)
     signature = capture.root_signatures.get(draw.root_signature_id or -1)
