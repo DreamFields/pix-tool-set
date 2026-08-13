@@ -16,3 +16,7 @@ outputs/
 *.log
 depth-out/
 lightgrid-out/
+
+# agent memory (managed by the memory system, not part of the repo)
+.codebuddy/memory/
+
