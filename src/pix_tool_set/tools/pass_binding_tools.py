@@ -61,10 +61,59 @@ def _classify_table(binding, declared_counts: dict[str, int]) -> dict[str, Any]:
     views = binding.resolved_views
     kinds = {view.kind.value for view in views}
     rids = {view.resource_id for view in views if view.resource_id is not None}
+    # Count what the descriptors *address*, not merely which resource they name.
+    #
+    # A single texture rightfully occupies several slots of one table, each at a
+    # different mip / array slice / plane. UE5's ReduceHZB dispatch is the
+    # reference case: mips 8 and 9 of Nanite.PreviousOccluderHZB are bound as two
+    # separate UAVs, which the PIX GUI lists as two rows. Counting distinct
+    # resource_ids alone yields 1 there and used to trip the filler heuristic
+    # below, reporting "the real descriptors were not recorded" for a table that
+    # was in fact recorded perfectly. Keying on the subresource tuple keeps that
+    # case honest while still catching true filler, where the same slot value is
+    # duplicated across the window at an identical mip and slice.
+    subresources = {
+        view.subresource_key() for view in views if view.resource_id is not None
+    }
 
     expected = 0
     for kind in kinds:
         expected = max(expected, declared_counts.get(kind, 0))
+
+    # Samplers carry no resource at all, so every resource-based check below is
+    # structurally inapplicable to them. Judging a sampler table by
+    # distinct_resource_ids always found zero and downgraded a correctly
+    # recovered table to `partial`, which is why this branch comes first.
+    if kinds == {"SAMPLER"}:
+        if not views:
+            return {
+                "trust": "unavailable",
+                "reason": (
+                    "PIX recorded no sampler descriptor writes for this table window; the "
+                    "shader's declared sampler registers are the only reliable answer."
+                ),
+                "distinct_resource_ids": [],
+            }
+        declared_samplers = declared_counts.get("SAMPLER", 0)
+        if declared_samplers and len(views) >= declared_samplers:
+            return {
+                "trust": "reliable",
+                "reason": (
+                    f"Sampler table resolved {len(views)} descriptor(s), covering the "
+                    f"shader's {declared_samplers} declared sampler register(s). Samplers "
+                    "reference no resource, so no resource ids are reported."
+                ),
+                "distinct_resource_ids": [],
+            }
+        return {
+            "trust": "partial",
+            "reason": (
+                f"Sampler table resolved {len(views)} descriptor(s) against "
+                f"{declared_samplers or 'an unknown number of'} declared register(s); "
+                "sampler state itself is not reconstructed."
+            ),
+            "distinct_resource_ids": [],
+        }
 
     if not views:
         trust = "unavailable"
@@ -72,10 +121,10 @@ def _classify_table(binding, declared_counts: dict[str, int]) -> dict[str, Any]:
             "PIX recorded no descriptor writes for this table window; the shader's declared "
             "registers are the only reliable answer."
         )
-    elif len(rids) == 1 and expected > 1:
+    elif len(subresources) == 1 and expected > 1:
         trust = "filler"
         reason = (
-            f"All {len(views)} slot(s) point at one resource while the shader declares "
+            f"All {len(views)} slot(s) address the same subresource while the shader declares "
             f"{expected}; this window holds PIX initialisation filler, not the real binding."
         )
     elif binding.table_confidence == "exact" and expected and len(views) >= expected:
@@ -85,19 +134,25 @@ def _classify_table(binding, declared_counts: dict[str, int]) -> dict[str, Any]:
         binding.table_confidence == "bounded"
         and expected
         and len(views) >= expected
-        and len(rids) >= expected
+        and len(subresources) >= expected
     ):
         # `bounded` only means the walk stopped before the root parameter's full span,
         # which is the normal case when a root signature declares more slots than the
         # shader uses: UE5 declares 16 UAVs here and the shader binds 8, so stopping at
         # the 9th is correct rather than uncertain. Once the walk yielded one distinct
-        # resource per declared register, the mapping is as confirmed as `exact` is, and
-        # grouping it with genuinely unconfirmed reconstructions told the caller to
+        # subresource per declared register, the mapping is as confirmed as `exact` is,
+        # and grouping it with genuinely unconfirmed reconstructions told the caller to
         # distrust an answer that is in fact sound.
         trust = "reliable"
+        distinct_note = (
+            "each resolving to a distinct resource"
+            if len(rids) >= expected
+            else f"resolving to {len(subresources)} distinct subresources of "
+            f"{len(rids)} resource(s)"
+        )
         reason = (
-            f"Table stopped at the shader's {expected} declared register(s), each resolving "
-            "to a distinct resource; the root signature simply reserves a wider span."
+            f"Table stopped at the shader's {expected} declared register(s), {distinct_note}; "
+            "the root signature simply reserves a wider span."
         )
     else:
         trust = "partial"
@@ -106,7 +161,25 @@ def _classify_table(binding, declared_counts: dict[str, int]) -> dict[str, Any]:
             f"(confidence={binding.table_confidence or 'unknown'}); treat register->resource "
             "mapping as unconfirmed."
         )
-    return {"trust": trust, "reason": reason, "distinct_resource_ids": sorted(rids)}
+    payload: dict[str, Any] = {
+        "trust": trust,
+        "reason": reason,
+        "distinct_resource_ids": sorted(rids),
+    }
+    # Surfaced only when it adds information, i.e. when one resource is bound at
+    # several subresources -- precisely the shape that used to be misreported.
+    if len(subresources) > len(rids):
+        payload["distinct_subresource_count"] = len(subresources)
+        payload["subresources"] = [
+            label
+            for label in (
+                view.subresource_label()
+                for view in views
+                if view.resource_id is not None
+            )
+            if label
+        ]
+    return payload
 
 
 def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[str, Any]:

@@ -227,9 +227,60 @@ class View:
     size_bytes: int = 0
     source_file: str = ""
     source_line: int = 0
+    # Subresource selectors, parsed from the export's Create*View_Tex* helpers.
+    #
+    # These exist because a resource_id alone does NOT identify a binding: one
+    # texture legitimately occupies several descriptor slots at once, each
+    # addressing a different mip / array slice / plane. UE5's HZB reduction is
+    # the canonical case -- a single dispatch reads mip 7 of
+    # Nanite.PreviousOccluderHZB and writes mips 8 and 9 of the very same
+    # texture through two separate UAVs.
+    #
+    # Without these fields the two UAVs decode to an identical dict, so any
+    # "distinct resource" heuristic collapses them into one and concludes the
+    # descriptors were never recorded. That is exactly the false `trust=filler`
+    # verdict that pass-bindings used to report for ReduceHZB while the PIX GUI
+    # showed both UAVs correctly. Treat None as "not applicable / not recorded"
+    # rather than as zero: a buffer view has no mip, and defaulting it to 0
+    # would make buffers collide with mip 0 of a texture.
+    mip_slice: Optional[int] = None
+    mip_levels: Optional[int] = None
+    array_slice: Optional[int] = None
+    array_size: Optional[int] = None
+    plane_slice: Optional[int] = None
+
+    def subresource_key(self) -> tuple:
+        """Identity of *what this descriptor addresses*, not just which resource.
+
+        Used to count genuinely distinct bindings. Two views of one texture at
+        different mips must compare unequal here, or a legitimate mip-chain
+        write gets misread as duplicated filler.
+        """
+        return (
+            self.resource_id,
+            self.mip_slice,
+            self.array_slice,
+            self.plane_slice,
+        )
+
+    def subresource_label(self) -> str:
+        """Short human-readable suffix, e.g. ``mip=8`` or ``mip=0 slice=2``."""
+        parts: list[str] = []
+        if self.mip_slice is not None:
+            parts.append(f"mip={self.mip_slice}")
+        if self.array_slice is not None and self.array_size not in (None, 0):
+            if self.array_size == 1:
+                parts.append(f"slice={self.array_slice}")
+            else:
+                parts.append(f"slices={self.array_slice}..{self.array_slice + self.array_size - 1}")
+        elif self.array_slice:
+            parts.append(f"slice={self.array_slice}")
+        if self.plane_slice:
+            parts.append(f"plane={self.plane_slice}")
+        return " ".join(parts)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "view_kind": self.kind.value,
             "heap_id": self.heap_id,
             "heap_index": self.heap_index,
@@ -238,6 +289,23 @@ class View:
             "dimension": self.dimension,
             "source": f"{self.source_file}:{self.source_line}" if self.source_file else "",
         }
+        # Emitted only when the export actually recorded them, so a buffer view
+        # does not grow four null fields that read as missing data.
+        if self.mip_slice is not None:
+            payload["mip_slice"] = self.mip_slice
+        if self.mip_levels is not None:
+            payload["mip_levels"] = self.mip_levels
+        if self.array_slice is not None:
+            payload["array_slice"] = self.array_slice
+        if self.array_size is not None:
+            payload["array_size"] = self.array_size
+        if self.plane_slice is not None:
+            payload["plane_slice"] = self.plane_slice
+        label = self.subresource_label()
+        if label:
+            payload["subresource"] = label
+        return payload
+
 
 
 @dataclass(slots=True)

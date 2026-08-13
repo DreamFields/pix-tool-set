@@ -435,6 +435,165 @@ _RE_GPUVA = re.compile(r"GetGpuva\(\s*(\d+)\s*,\s*(\d+)\s*\)")
 _RE_FORMAT = re.compile(r"(DXGI_FORMAT_[A-Z0-9_]+)")
 _RE_VIEW_DIM = re.compile(r"(D3D12_(?:SRV|UAV|RTV|DSV)_DIMENSION_[A-Z0-9_]+)")
 
+# Subresource selector positions, per Create*View_* helper in the export's Helpers.h.
+#
+# Read directly off those inline definitions rather than inferred from D3D12
+# struct layout, because the helpers do not all take the same prefix: every SRV
+# helper carries a shader4ComponentMapping argument that the UAV helpers lack,
+# and every UAV helper takes an extra pCounterResource pointer that the SRV
+# helpers lack. Guessing a shared offset would silently shift every field.
+#
+# Indices count the *comma-separated top-level arguments of the call as written
+# in the export*, zero-based. GetCpuDescriptor(...) and GetResource(...) each
+# occupy exactly one such argument.
+#
+#   CreateShaderResourceView_Tex2D(res, dest, format, dim, mapping,
+#                                  mostDetailedMip, mipLevels, planeSlice, clamp)
+#     ->  0     1     2       3    4        5              6         7          8
+#
+#   CreateUnorderedAccessView_Tex2D(res, counter, dest, format, dim,
+#                                   mipSlice, planeSlice)
+#     ->  0    1        2     3       4    5         6
+#
+# Only fields the helper genuinely exposes are listed; anything absent stays
+# None so it reads as "not applicable" instead of a fabricated zero. Buffer and
+# RaytracingAS variants are deliberately omitted -- they have no subresources.
+_SUBRESOURCE_ARGS: dict[str, dict[str, int]] = {
+    "CreateShaderResourceView_Tex2D": {
+        "mip_slice": 5,
+        "mip_levels": 6,
+        "plane_slice": 7,
+    },
+    "CreateShaderResourceView_Tex2DArray": {
+        "mip_slice": 5,
+        "mip_levels": 6,
+        "array_slice": 7,
+        "array_size": 8,
+        "plane_slice": 9,
+    },
+    "CreateShaderResourceView_Tex2DMSArray": {
+        "array_slice": 5,
+        "array_size": 6,
+    },
+    "CreateShaderResourceView_Tex3D": {
+        "mip_slice": 5,
+        "mip_levels": 6,
+    },
+    "CreateShaderResourceView_TexCube": {
+        "mip_slice": 5,
+        "mip_levels": 6,
+    },
+    "CreateShaderResourceView_TexCubeArray": {
+        "mip_slice": 5,
+        "mip_levels": 6,
+        "array_slice": 7,
+        "array_size": 8,
+    },
+    "CreateUnorderedAccessView_Tex2D": {
+        "mip_slice": 5,
+        "plane_slice": 6,
+    },
+    "CreateUnorderedAccessView_Tex2DArray": {
+        "mip_slice": 5,
+        "array_slice": 6,
+        "array_size": 7,
+        "plane_slice": 8,
+    },
+    "CreateUnorderedAccessView_Tex3D": {
+        "mip_slice": 5,
+        "array_slice": 6,  # firstWSlice -- the depth-slice analogue for a 3D UAV
+        "array_size": 7,  # wSize
+    },
+    "CreateRenderTargetView_Tex2D": {
+        "mip_slice": 4,
+        "plane_slice": 5,
+    },
+    "CreateRenderTargetView_Tex2DArray": {
+        "mip_slice": 4,
+        "array_slice": 5,
+        "array_size": 6,
+        "plane_slice": 7,
+    },
+    "CreateDepthStencilView_Tex2D": {
+        "mip_slice": 4,
+    },
+    "CreateDepthStencilView_Tex2DArray": {
+        "mip_slice": 4,
+        "array_slice": 5,
+        "array_size": 6,
+    },
+}
+
+
+def _split_call_args(line: str, call_start: int) -> list[str]:
+    """Split one Create*View call into top-level argument strings.
+
+    Nested calls such as ``GetCpuDescriptor(heap.Get(), 400404)`` contain commas
+    that must NOT split an argument, so this tracks parenthesis depth instead of
+    using ``str.split(',')``. Returns [] when the call is not closed on this
+    line, since a positional lookup into a truncated argument list would quietly
+    read the wrong field.
+    """
+    open_paren = line.find("(", call_start)
+    if open_paren < 0:
+        return []
+    depth = 0
+    args: list[str] = []
+    current: list[str] = []
+    for ch in line[open_paren:]:
+        if ch == "(":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(current).strip())
+                return args
+        if depth == 1 and ch == ",":
+            args.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    return []
+
+
+def _parse_uint(token: str) -> int | None:
+    """Read a UINT literal, tolerating casts and suffixes; None when not one.
+
+    Returning None for a non-literal (an identifier, an expression) is
+    deliberate: a fabricated 0 would make two different subresources compare
+    equal, which is the very confusion these fields exist to prevent.
+    """
+    token = token.strip()
+    match = re.fullmatch(r"(?:\(\s*UINT\s*\)\s*)?(\d+)[uUlL]*", token)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _subresource_fields(func_name: str, line: str, call_start: int) -> dict[str, int]:
+    """Extract whichever subresource selectors this helper exposes."""
+    spec = _SUBRESOURCE_ARGS.get(func_name)
+    if not spec:
+        return {}
+    args = _split_call_args(line, call_start)
+    if not args:
+        return {}
+    fields: dict[str, int] = {}
+    for field_name, position in spec.items():
+        if position >= len(args):
+            continue
+        value = _parse_uint(args[position])
+        if value is not None:
+            fields[field_name] = value
+    return fields
+
+
+
 _VIEW_KIND = {
     "CreateShaderResourceView": ViewKind.SRV,
     "CreateUnorderedAccessView": ViewKind.UAV,
@@ -535,6 +694,13 @@ def parse_descriptors(
             fmt = _RE_FORMAT.search(line)
             dim = _RE_VIEW_DIM.search(line)
 
+            # Which mip / slice / plane this descriptor addresses. Two UAVs on
+            # one texture at different mips are two distinct bindings, and
+            # without this the pair is indistinguishable downstream.
+            subresource = _subresource_fields(
+                match.group(1) + (match.group(2) or ""), line, match.start()
+            )
+
             view = View(
                 kind=kind,
                 heap_id=heap_id,
@@ -547,6 +713,7 @@ def parse_descriptors(
                 detail=line.strip()[:400],
                 source_file=path.name,
                 source_line=lineno,
+                **subresource,
             )
             if heap_id is not None and heap_index is not None:
                 # Last write wins. A heap slot is legitimately written many
