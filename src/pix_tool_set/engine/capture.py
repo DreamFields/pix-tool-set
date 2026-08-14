@@ -1361,6 +1361,34 @@ class Capture:
     def _shader_bindings(self, shader: Shader) -> list[dict[str, Any]]:
         return parse_resource_bindings(shader.disassembly)
 
+    def export_disassembly(self, export) -> str:
+        """Disassemble the DXIL blob behind one DxilExport.
+
+        A raytracing export is not a PSO shader, so ``draw.shader()`` never reaches
+        it; the only address its bytecode has is ``dxil_blob_index`` in the global
+        ``resources.bin`` Read() stream. This mirrors ``_disassemble`` for the
+        state-object case: a single DXIL library blob, not a packed PSO bundle.
+        """
+        if export is None or export.dxil_blob_index is None:
+            return ""
+        try:
+            blob = self._load_blob(export.dxil_blob_index)
+        except PixToolError:
+            return ""
+        if not blob:
+            return ""
+        try:
+            return self._disassembler.disassemble(blob)
+        except PixToolError:
+            return ""
+
+    def export_resource_bindings(self, export) -> list[dict[str, Any]]:
+        """Resource Bindings table of one DxilExport (the PIX record-panel rows)."""
+        return parse_resource_bindings(self.export_disassembly(export))
+
+    def export_constant_buffers(self, export) -> list[dict[str, Any]]:
+        return parse_constant_buffers(self.export_disassembly(export))
+
     def _shader_metadata(self, shader: Shader) -> dict[str, Any]:
         return parse_shader_metadata(shader.disassembly)
 

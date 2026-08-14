@@ -26,7 +26,7 @@ import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from ..errors import PixToolError
 
@@ -400,6 +400,22 @@ class ShaderDisassembler:
 # --------------------------------------------------------------------------
 _BIND_ID = re.compile(r"(?:CB|T|U|S)\d+")
 
+# ``cb0,space1`` / ``s1,space1000`` / ``t3,space2`` -> the register number and
+# register space a binding names. dxc prints the space only when it differs from
+# the default 0, but PIX's Root Signature panel always shows it, so an absent
+# space is reported as 0 to match that view.
+_HLSL_BIND_RE = re.compile(r"^(?:cb|t|u|s)(\d+)(?:,space(\d+))?$", re.IGNORECASE)
+
+
+def _parse_hlsl_bind(text: str) -> tuple[Optional[int], Optional[int]]:
+    """Split an HLSL bind cell (``cb0,space1``) into (register, space)."""
+    match = _HLSL_BIND_RE.match((text or "").strip())
+    if not match:
+        return None, None
+    register = int(match.group(1))
+    space = int(match.group(2)) if match.group(2) is not None else 0
+    return register, space
+
 # The Type column of dxc's binding table draws from a small fixed vocabulary. Listed
 # longest-first so prefix matching cannot stop early on a shorter word that happens to
 # be a prefix of a longer one.
@@ -486,6 +502,9 @@ def parse_resource_bindings(disassembly: str) -> list[dict[str, Any]]:
         if 2 <= len(head) < 4:
             head = [head[0]] + _split_glued_type(head[1]) + head[2:]
 
+        bind_cell = parts[position + 1] if len(parts) > position + 1 else ""
+        register, space = _parse_hlsl_bind(bind_cell)
+
         rows.append(
             {
                 "name": head[0],
@@ -493,7 +512,9 @@ def parse_resource_bindings(disassembly: str) -> list[dict[str, Any]]:
                 "format": head[2] if len(head) > 2 else "",
                 "dimension": head[3] if len(head) > 3 else "",
                 "id": bind_id,
-                "hlsl_bind": parts[position + 1] if len(parts) > position + 1 else "",
+                "hlsl_bind": bind_cell,
+                "register": register,
+                "register_space": space,
                 "count": parts[position + 2] if len(parts) > position + 2 else "",
             }
         )

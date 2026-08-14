@@ -87,6 +87,27 @@ find-draw-calls --pass-name <关键字> → draw-state --draw-index <n>
 → shader-bindings --draw-index <n> --stage PS
 ```
 
+**「这个光追 pass 绑了什么」**
+```
+pass-bindings --global-id <PIX GUI 的 Global ID>
+```
+光追 pass 与光栅 pass 用**同一个命令**，`pass-bindings` / `shader-bindings` 都会自动分流，
+响应里的 `binding_shape` 字段说明走的是哪条路（`raytracing` / `rasterisation`）。
+
+读光追结果时注意：DispatchRays **没有 PSO**，所以 `pso_id` 为 `null`、`stages` 为空、
+`descriptor_tables` 为空，这三者都是**管线形状使然，不是数据缺失**。真正的绑定在：
+
+- `global_root_bindings` — 命令列表上绑定一次、作用于整个 dispatch 的全局根参数
+- `exports` — state object 的 shader 导出；每个 `RAYGEN` 导出的 `bindings` 字段就是
+  PIX GUI「RayGen Record → Root Signature」面板（CBV 语义名 + 静态采样器，与面板同序）
+- `hit_groups` — 命中组
+- `local_root_bindings_by_record` — 按 SBT record 分组的局部根参数
+
+全局与局部两组**刻意不合并**：前者一次绑定作用于整个 dispatch，后者随 record 走，
+合并后就无法判断某个绑定属于哪个 shader。
+需要 SBT 本身用 `describe-shader-table`，需要完整管线展开用 `describe-state-object`。
+`--stage` 在光追下接受 DXR 阶段（`RAYGEN` / `CLOSESTHIT` / `ANYHIT` / `MISS` 等），过滤 `exports`。
+
 **「这个 shader 做了什么」**
 ```
 list-shaders --stage CS --unique → shader-reflection --pso-id <id> --stage CS

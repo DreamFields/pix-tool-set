@@ -24,12 +24,23 @@ from ._common import (
     tool,
     with_session,
 )
+from ._raytracing_bindings import RAYTRACING_STAGE_NOTE, raytracing_binding_payload
 
 _TRUST_NOTE = (
     "Declared registers come from the shader bytecode reflection and are authoritative. "
     "Runtime descriptor-table contents are reconstructed from the C++ export; when PIX did "
     "not record the real descriptor writes for a draw the table reads as filler, so every "
     "table reports a `trust` level rather than pretending the mapping is exact."
+)
+
+_RAYTRACING_NOTE = (
+    "Ray dispatches are answered with a different binding shape, flagged by "
+    "`binding_shape: raytracing`: they have no PSO, so `stages` and `descriptor_tables` "
+    "are empty by construction and the answer is under `global_root_bindings`, `exports` "
+    "(each RAYGEN export carrying the PIX record panel in `bindings`), `hit_groups` and "
+    "`local_root_bindings_by_record`. An empty `descriptor_tables` on such an action is "
+    "not missing data. `--stage` accepts DXR stages (RAYGEN, CLOSESTHIT, ANYHIT, MISS, "
+    "INTERSECTION, CALLABLE) and filters `exports`."
 )
 
 _STAGES = [stage.value for stage in ShaderStage]
@@ -39,18 +50,19 @@ def _pipeline_note(draw) -> str:
     """State, in words, what the pipeline field means for this action.
 
     A raytracing state object is not modelled as a PSO, so ``pso_id`` is None
-    and ``stages`` is empty for a DispatchRays. Returning an empty stages list
-    with no explanation would read as "PIX recorded nothing", which is the same
-    shape as a real gap -- so the note has to say which one it is.
+    and the PSO-shaped ``stages`` list is empty for a DispatchRays. Returning an
+    empty stages list with no explanation would read as "PIX recorded nothing",
+    which is the same shape as a real gap -- so the note has to say which one it is.
+
+    The previous wording here claimed state objects were "not yet modelled". That
+    stopped being true once the DXR work landed, and it was the single worst line in
+    this file: a caller reading it concluded the binding was unavailable and stopped,
+    while ``exports`` / ``hit_groups`` for the very same dispatch were sitting one
+    field away. A stale capability disclaimer is worse than none, because it forecloses
+    the investigation instead of merely failing to help it.
     """
     if draw.state_object_id is not None:
-        return (
-            f"This action runs under raytracing state object {draw.state_object_id} "
-            "(SetPipelineState1). State objects are not yet modelled, so no shader "
-            "stages are reported; the root bindings above are still the compute root "
-            "arguments the dispatch reads. Do not infer a shader from pso_id -- it is "
-            "null on purpose."
-        )
+        return RAYTRACING_STAGE_NOTE
     if draw.pso_id is None:
         return "No pipeline state was bound before this action."
     return ""
@@ -183,6 +195,56 @@ def _classify_table(binding, declared_counts: dict[str, int]) -> dict[str, Any]:
 
 
 def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "draw_index": draw.index,
+        "global_id": draw.global_id,
+        "queue_id": draw.queue_id,
+        "api": draw.api,
+        "effective_kind": draw.effective_kind.value,
+        "pso_id": draw.pso_id,
+        "state_object_id": draw.state_object_id,
+        "root_signature_id": draw.root_signature_id,
+        "descriptor_heap_ids": draw.descriptor_heap_ids,
+        "pipeline_note": _pipeline_note(draw),
+    }
+
+    # A ray dispatch has no PSO, so every PSO-shaped lookup below returns nothing for
+    # it. This branch is why the tool now answers such a pass at all: it previously ran
+    # the rasterisation path unconditionally and reported an empty binding set for a
+    # dispatch whose exports, hit groups and RayGen record panel were fully recoverable.
+    if draw.is_raytracing and draw.state_object_id is not None:
+        payload, degradations = raytracing_binding_payload(
+            capture, draw, max_views=max_views
+        )
+        base.update(payload)
+        base["binding_shape"] = "raytracing"
+        # Kept present and empty so a caller iterating the rasterisation keys does not
+        # hit a KeyError, with the note saying where the real answer is.
+        base["root_descriptors"] = []
+        base["descriptor_tables"] = []
+        base["rasterisation_fields_note"] = (
+            "root_descriptors / descriptor_tables are empty because a ray dispatch binds "
+            "through global root arguments plus per-record local root arguments, not a "
+            "PSO descriptor-table layout. Read global_root_bindings, exports and "
+            "local_root_bindings_by_record instead."
+        )
+        base["_degradations"] = degradations
+        if stage_filter:
+            wanted = str(stage_filter).upper()
+            matched = [
+                row
+                for row in base.get("exports", [])
+                if (row.get("stage") or "").upper() == wanted
+            ]
+            base["exports_filtered_to_stage"] = wanted
+            base["exports"] = matched
+            if not matched:
+                base["stage_filter_note"] = (
+                    f"No export on this state object derives to stage {wanted}. DXR stages "
+                    "are derived, not declared -- see stage_source_note."
+                )
+        return base
+
     shaders = [draw.shader(stage_filter)] if stage_filter else draw.shaders
     shaders = [shader for shader in shaders if shader is not None]
 
@@ -252,29 +314,27 @@ def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[st
                 entry["resource"] = resource.to_dict()
             root_descriptors.append(entry)
 
-    return {
-        "draw_index": draw.index,
-        "global_id": draw.global_id,
-        "api": draw.api,
-        "effective_kind": draw.effective_kind.value,
-        "pso_id": draw.pso_id,
-        "state_object_id": draw.state_object_id,
-        "root_signature_id": draw.root_signature_id,
-        "stages": stage_rows,
-        "declared_totals": declared_counts,
-        "root_descriptors": root_descriptors,
-        "descriptor_tables": tables,
-        "descriptor_heap_ids": draw.descriptor_heap_ids,
-        "pipeline_note": _pipeline_note(draw),
-    }
+    base.update(
+        {
+            "binding_shape": "rasterisation",
+            "stages": stage_rows,
+            "declared_totals": declared_counts,
+            "root_descriptors": root_descriptors,
+            "descriptor_tables": tables,
+            "_degradations": [],
+        }
+    )
+    return base
 
 
 @tool(
     name="pass-bindings",
     summary=(
         "Shader bindings for a whole pass in one call: resolves the pass by name or index, "
-        "picks its representative draws, and returns each shader's declared registers "
-        "together with the runtime bindings and how much to trust them."
+        "picks its representative actions, and returns each shader's declared registers "
+        "together with the runtime bindings and how much to trust them. Handles rasterisation "
+        "and raytracing passes alike -- a ray dispatch is answered with its state object's "
+        "exports, hit groups and per-record local root arguments."
     ),
     category="shaders",
     parameters=with_session(
@@ -282,7 +342,11 @@ def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[st
         stage={
             "type": "string",
             "enum": _STAGES,
-            "description": "Restrict to one shader stage, e.g. CS.",
+            "description": (
+                "Restrict to one shader stage, e.g. CS. On a ray dispatch this filters the "
+                "state object's exports instead, so RAYGEN / CLOSESTHIT / ANYHIT / MISS / "
+                "INTERSECTION / CALLABLE are all valid here."
+            ),
         },
         max_views={
             "type": "integer",
@@ -299,16 +363,21 @@ def _collect(capture, draw, stage_filter: str | None, max_views: int) -> dict[st
         },
     ),
     returns=(
-        "Pass identity, per-stage declared registers (authoritative), runtime root "
-        "descriptors and descriptor tables each tagged with a trust level."
+        "Pass identity and, per representative action, one of two binding shapes. "
+        "Rasterisation: per-stage declared registers (authoritative) plus runtime root "
+        "descriptors and descriptor tables, each tagged with a trust level. Raytracing: "
+        "global root bindings, the state object's shader exports and hit groups, and the "
+        "local root arguments carried by each shader record. `binding_shape` says which."
     ),
     examples=[
         'pix-tool-set pass-bindings --pass-name TileClassificationBuildLists --stage CS',
         "pix-tool-set pass-bindings --pass-index 270",
         "pix-tool-set pass-bindings --queue-id 18704",
         'pix-tool-set pass-bindings --pass-name TileClassification --all-matches',
+        "pix-tool-set pass-bindings --global-id 5367",
+        'pix-tool-set pass-bindings --pass-name ReflectionHardwareRayTracingRGS --stage RAYGEN',
     ],
-    notes=_TRUST_NOTE,
+    notes=_TRUST_NOTE + " " + _RAYTRACING_NOTE,
 )
 def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
@@ -328,17 +397,27 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     pass_payloads: list[dict[str, Any]] = []
     trust_tally: dict[str, int] = {}
+    pending_degradations: list[tuple[str, str, dict[str, Any]]] = []
+    raytracing_draws = 0
 
     for entry in entries:
         marker_path = tuple(entry["marker_path"])
         draws = [d for d in capture.draw_calls if d.marker_path == marker_path]
         if per_pso:
             chosen: list[Any] = []
-            seen: set[int | None] = set()
+            seen: set[Any] = set()
             for draw in draws:
-                if draw.pso_id in seen:
+                # A ray dispatch has pso_id None by design, so keying on pso_id alone
+                # collapsed every dispatch in a pass into one representative and hid the
+                # rest. State object id is the equivalent identity for them.
+                key = (
+                    ("state_object", draw.state_object_id)
+                    if draw.state_object_id is not None
+                    else ("pso", draw.pso_id)
+                )
+                if key in seen:
                     continue
-                seen.add(draw.pso_id)
+                seen.add(key)
                 chosen.append(draw)
         else:
             chosen = draws
@@ -346,6 +425,10 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
         draw_rows = []
         for draw in chosen[:max_draws]:
             row = _collect(capture, draw, stage_filter, max_views)
+            for message, reason, extra in row.pop("_degradations", []):
+                pending_degradations.append((message, reason, extra))
+            if row.get("binding_shape") == "raytracing":
+                raytracing_draws += 1
             for table in row["descriptor_tables"]:
                 trust_tally[table["trust"]] = trust_tally.get(table["trust"], 0) + 1
             for descriptor in row["root_descriptors"]:
@@ -374,6 +457,7 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
         {
             "passes": pass_payloads,
             "pass_count": len(pass_payloads),
+            "raytracing_draws_reported": raytracing_draws,
             "trust_summary": trust_tally,
             "trust_levels": {
                 "reliable": "Value is taken straight from the recorded call or matches the shader declaration.",
@@ -381,8 +465,33 @@ def pass_bindings(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "filler": "Window holds PIX initialisation filler; the real descriptors were not recorded.",
                 "unavailable": "No descriptor data recorded for this table.",
             },
+            "binding_shapes": {
+                "rasterisation": (
+                    "stages + declared_totals + root_descriptors + descriptor_tables, keyed "
+                    "to a PSO."
+                ),
+                "raytracing": (
+                    "global_root_bindings + exports (each raygen carrying the PIX record "
+                    "panel under `bindings`) + hit_groups + local_root_bindings_by_record, "
+                    "keyed to a state object. pso_id is null by design."
+                ),
+            },
         }
     )
+    for message, reason, extra in pending_degradations:
+        result.degrade(message, reason=reason, **extra)
+    if raytracing_draws:
+        # Said explicitly because the empty rasterisation keys are the exact shape that
+        # previously got read as "the tool cannot resolve this pass".
+        result.add_diagnostic(
+            "info",
+            f"{raytracing_draws} reported action(s) are ray dispatches, answered with the "
+            f"raytracing binding shape. Their descriptor_tables / root_descriptors are "
+            f"empty by construction, not for lack of data -- the bindings are under "
+            f"global_root_bindings, exports and local_root_bindings_by_record. For the "
+            f"shader binding table itself use `describe-shader-table`, and for the full "
+            f"pipeline expansion `describe-state-object`.",
+        )
     if trust_tally.get("filler") or trust_tally.get("unavailable"):
         result.degrade(
             "Some runtime descriptor tables could not be recovered from the export; "

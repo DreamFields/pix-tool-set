@@ -136,6 +136,18 @@ def list_pipeline_states(args: dict[str, Any], context: ToolContext) -> ToolResu
     parameters=with_session(
         pso_id={"type": "integer", "description": "Pipeline state id."},
         draw_index={"type": "integer", "description": "Take the PSO bound at this draw."},
+        # global_id was missing here while resolve_draw below already supported it, so
+        # an id copied out of the PIX GUI -- the most natural way in -- was rejected at
+        # the CLI and the caller had to translate it to a draw_index by hand first.
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the action to take the pipeline from. Unique across "
+                "every queue, so this is the selector to use for an id read off the PIX "
+                "GUI. Resolves raytracing actions too, which answer with their state "
+                "object instead of a PSO."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
@@ -145,12 +157,18 @@ def list_pipeline_states(args: dict[str, Any], context: ToolContext) -> ToolResu
             ),
         },
     ),
-    returns="PSO detail plus root signature layout.",
+    returns=(
+        "PSO detail plus root signature layout. A raytracing action answers with "
+        "resolved_kind=raytracing and its state object instead, since a DXR pipeline has "
+        "exports and hit groups rather than fixed stage slots."
+    ),
     examples=[
         "pix-tool-set pipeline-state --pso-id 3184",
         "pix-tool-set pipeline-state --draw-index 2461",
+        "pix-tool-set pipeline-state --global-id 5367",
     ],
 )
+
 def pipeline_state(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     pso_id = args.get("pso_id")

@@ -216,6 +216,43 @@ def main() -> int:
     )
     check("binding model is explained", bool(data.get("binding_model_note")))
 
+    print("\n4b. raygen record-panel bindings align with the PIX GUI (gid 5367)")
+    # The RayGen Root Signature panel for ReflectionHardwareRayTracingRGS lists
+    # nine CBVs by (register, space) plus two static samplers at space=1000.
+    result = call_tool(
+        "shader-bindings", {"session": SESSION, "draw_index": RAY_DRAW_HIT_LIGHTING}
+    )
+    data = result["data"]
+    by_name = {export["name"]: export for export in data["exports"]}
+    raygen = by_name.get("RayGen_fb3c7b0c9e02fb73")
+    check("target raygen export carries a binding view", raygen and "bindings" in raygen)
+    if raygen and "bindings" in raygen:
+        cb = raygen["bindings"]["cbuffers"]
+        expected_cbs = [
+            ("_RootShaderParameters", 0, 1),
+            ("SceneTexturesStruct", 1, 1),
+            ("View", 1, 4),
+            ("LumenCardScene", 2, 1),
+            ("ReflectionStruct", 3, 1),
+            ("ReflectionCaptureSM5", 4, 1),
+            ("FogStruct", 5, 1),
+            ("ForwardLightStruct", 6, 1),
+            ("RaytracingLightGridData", 7, 1),
+        ]
+        got_cbs = [(row["name"], row["register"], row["space"]) for row in cb]
+        check("nine CBVs in (register, space) order", got_cbs == expected_cbs, str(got_cbs))
+        sm = raygen["bindings"]["static_samplers"]
+        expected_sm = [
+            ("D3DStaticPointClampedSampler", 1, 1000),
+            ("D3DStaticBilinearClampedSampler", 3, 1000),
+        ]
+        got_sm = [(row["name"], row["slot"], row["space"]) for row in sm]
+        check(
+            "two static samplers at space=1000",
+            got_sm == expected_sm,
+            str(got_sm),
+        )
+
     print("\n5. pipeline-state falls through to the state object")
     result = call_tool("pipeline-state", {"session": SESSION, "draw_index": RAY_DRAW})
     data = result["data"]

@@ -157,6 +157,28 @@ def pass_shader_source(args: dict[str, Any], context: ToolContext) -> ToolResult
     shaders = [draw.shader(stage_filter)] if stage_filter else draw.shaders
     shaders = [s for s in shaders if s is not None]
     if not shaders:
+        # "This pass binds no such stage" is factually wrong for a ray dispatch: the
+        # pass may bind dozens of shaders, they just live on a state object rather than
+        # a PSO, so draw.shader() cannot see them. Naming the DXR route keeps the
+        # message from closing off an investigation that is still perfectly possible.
+        if draw.state_object_id is not None:
+            state_object = draw.state_object
+            export_count = (
+                len(state_object.resolved_exports) if state_object is not None else 0
+            )
+            raise not_found(
+                "shader",
+                stage_filter or "any",
+                f"This pass is a raytracing dispatch bound to state object "
+                f"{draw.state_object_id}, whose shaders are DXIL library exports rather "
+                f"than PSO stages"
+                + (f" ({export_count} of them)" if export_count else "")
+                + ". This tool reads PSO stages, so it cannot reach them. Use "
+                f"`describe-state-object --draw-index {draw.index}` to list the exports, "
+                f"`pass-bindings --draw-index {draw.index}` for their bindings, or "
+                f"`shader-edit-begin --state-object-id {draw.state_object_id} "
+                f"--export-name <name>` to recover one export's HLSL from the PDB.",
+            )
         raise not_found("shader", stage_filter or "any", "This pass binds no such stage.")
 
     max_lines = args.get("max_lines")

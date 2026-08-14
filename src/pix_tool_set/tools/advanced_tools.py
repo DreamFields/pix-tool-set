@@ -7,7 +7,7 @@ from typing import Any
 
 from ..context import ToolContext
 from ..engine import bindinglabel, resourceevents
-from ..engine.model import EventKind, ShaderStage, ViewKind
+from ..engine.model import EventKind, RootParameterKind, ShaderStage, ViewKind
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
 from ._common import DRAW_SELECTOR, PASS_SELECTOR, resolve_pass, tool, with_session
@@ -266,6 +266,19 @@ def analyze_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 outputs[view.resource_id] = outputs.get(view.resource_id, 0) + 1
         for rid in draw.render_target_resource_ids:
             outputs[rid] = outputs.get(rid, 0) + 1
+        # Root-level bindings, which `srvs` / `uavs` cannot see: those walk the
+        # resolved views of descriptor tables, and a ray dispatch binds almost
+        # everything as a root descriptor instead. Without this the resource flow of
+        # a raytracing pass came back completely empty -- reported as success, so it
+        # read as "this pass touches nothing" rather than "this tool looked in the
+        # wrong place".
+        for binding in draw.bindings:
+            if binding.resource_id is None:
+                continue
+            if binding.kind is RootParameterKind.UAV:
+                outputs[binding.resource_id] = outputs.get(binding.resource_id, 0) + 1
+            elif binding.kind in (RootParameterKind.SRV, RootParameterKind.CBV):
+                inputs[binding.resource_id] = inputs.get(binding.resource_id, 0) + 1
 
     def describe(ids: dict[int, int], limit: int = 15) -> list[dict[str, Any]]:
         rows = []
@@ -289,6 +302,63 @@ def analyze_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
     for draw in draws:
         for shader in draw.shaders:
             shader_mix[shader.stage.value] = shader_mix.get(shader.stage.value, 0) + 1
+
+    # Raytracing work is invisible to every counter above: a ray dispatch has no PSO,
+    # no shaders on draw.shaders, no triangles and no thread_count. Summarising it as
+    # zeroes across the board is a confident wrong answer, so its own shape is counted
+    # here and the payload says the pass is a raytracing one.
+    ray_draws = [draw for draw in draws if draw.is_raytracing]
+    raytracing: dict[str, Any] = {}
+    if ray_draws:
+        state_object_ids = sorted(
+            {d.state_object_id for d in ray_draws if d.state_object_id is not None}
+        )
+        export_stages: dict[str, int] = {}
+        total_exports = 0
+        for state_object_id in state_object_ids:
+            state_object = capture.state_objects.get(state_object_id)
+            if state_object is None:
+                continue
+            for export in state_object.resolved_exports:
+                total_exports += 1
+                if export.stage is not None:
+                    export_stages[export.stage.value] = (
+                        export_stages.get(export.stage.value, 0) + 1
+                    )
+        rays = 0
+        dimensions: list[dict[str, Any]] = []
+        for draw in ray_draws:
+            sbt = draw.shader_binding_table
+            if sbt is None:
+                continue
+            rays += sbt.ray_count or 0
+            dimensions.append(
+                {
+                    "draw_index": draw.index,
+                    "global_id": draw.global_id,
+                    "dispatch_dimensions": [sbt.width, sbt.height, sbt.depth],
+                    "ray_count": sbt.ray_count,
+                    "shader_binding_table_key": sbt.indirect_buffer_key,
+                }
+            )
+        raytracing = {
+            "ray_dispatches": len(ray_draws),
+            "state_object_ids": state_object_ids,
+            "shader_exports": total_exports,
+            "export_stage_mix": export_stages,
+            "rays": rays,
+            "dispatches": dimensions,
+            "note": (
+                "A ray dispatch has no PSO, no triangles and no thread_count, so the "
+                "`workload` block above reads as zero for it by construction. This block "
+                "is the workload of this pass. Run describe-state-object for the pipeline "
+                "and pass-bindings for the bindings."
+            ),
+        }
+        # shader_mix keys off PSO stages, so it is empty here; fill it from the exports
+        # rather than leaving a blank that reads as "no shaders run".
+        if not shader_mix and export_stages:
+            shader_mix = dict(export_stages)
 
     observations: list[dict[str, Any]] = []
     if draws and pso_switches > len(draws) * 0.7:
@@ -334,26 +404,46 @@ def analyze_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "draw_indices": [d.index for d in heavy][:10],
             }
         )
-
-    return ToolResult.success(
-        {
-            "pass": entry,
-            "workload": {
-                "events": len(draws),
-                "triangles": entry["triangle_count"],
-                "compute_threads": entry["thread_count"],
-                "pipeline_state_switches": pso_switches,
-                "distinct_pipeline_states": len(set(pso_sequence)),
-                "avg_triangles_per_draw": round(
-                    entry["triangle_count"] / max(entry["draw_count"], 1), 2
+    if ray_draws:
+        observations.append(
+            {
+                "severity": "info",
+                "topic": "raytracing_pass",
+                "message": (
+                    f"{len(ray_draws)} ray dispatch(es) in this pass, tracing "
+                    f"{raytracing.get('rays', 0)} rays through "
+                    f"{raytracing.get('shader_exports', 0)} shader export(s). The "
+                    f"triangle and thread counters do not apply to them; see the "
+                    f"`raytracing` block."
                 ),
-            },
-            "inputs": describe(inputs),
-            "outputs": describe(outputs),
-            "shader_mix": shader_mix,
-            "observations": observations,
-        }
-    )
+                "draw_indices": [d.index for d in ray_draws][:10],
+            }
+        )
+
+    data: dict[str, Any] = {
+        "pass": entry,
+        "workload": {
+            "events": len(draws),
+            "triangles": entry["triangle_count"],
+            "compute_threads": entry["thread_count"],
+            "pipeline_state_switches": pso_switches,
+            "distinct_pipeline_states": len(set(pso_sequence)),
+            "avg_triangles_per_draw": round(
+                entry["triangle_count"] / max(entry["draw_count"], 1), 2
+            ),
+        },
+        "inputs": describe(inputs),
+        "outputs": describe(outputs),
+        "shader_mix": shader_mix,
+        "observations": observations,
+    }
+    if raytracing:
+        data["raytracing"] = raytracing
+        data["pass_kind"] = "raytracing"
+    else:
+        data["pass_kind"] = "rasterisation"
+
+    return ToolResult.success(data)
 
 
 @tool(
