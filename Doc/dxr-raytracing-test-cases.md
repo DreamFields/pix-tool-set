@@ -204,6 +204,175 @@ pix-tool-set pipeline-state --global-id 5367
 
 ---
 
+## 用例 8：光追分析可用性专项修复（2026-08）
+
+一次真实端到端分析暴露的 8 处工具层问题，修复后的验证用例。
+完整根因与改法见 [光追工具链修复报告](/Doc/raytracing-toolchain-fixes.md)。
+
+### 8.1 全局参数可后置
+
+```powershell
+pix-tool-set list-tools --brief --flat --compact
+```
+
+| 项 | 改动前 | 改动后 |
+|---|---|---|
+| 退出码 | `2`，`unrecognized arguments: --compact` | `0` |
+| `--flat` | 无此参数 | `tool_count=88`，`tools` 为一维数组 |
+
+**看点**：`--compact` / `--traceback` / `--output-json` 现在挂在每个子 parser 上，
+命令名前后皆可。`--pixtool` 仍只在命令名之前——若干工具自己的 schema 已声明同名参数，
+parent 再声明会触发 argparse 冲突。
+
+### 8.2 `--output-json` 绕开 UTF-16 陷阱
+
+```powershell
+pix-tool-set analyze-raytracing --output-json rt.json
+```
+
+| 项 | shell 重定向（`>`） | `--output-json` |
+|---|---|---|
+| 编码 | UTF-16（PowerShell 行为） | UTF-8 |
+| `json.load(..., encoding='utf-8')` | `UnicodeDecodeError: 0xff` | 正常 |
+
+### 8.3 `pass-shader-source` 支持光追（影响最大）
+
+```powershell
+pix-tool-set pass-shader-source --pass-name "ReflectionHardwareRayTracingRGS default" --stage RAYGEN
+```
+
+| 字段 | 改动前 | 改动后 |
+|---|---|---|
+| `status` | `error: shader_not_found` | `success` |
+| `source_tier` | 无 | `pdb-hlsl` |
+| `entry_point` | 无 | `LumenReflectionHardwareRayTracingRGS` |
+| `aliased_export_count` | 无 | `8` |
+| `binding_shape` | 无 | `raytracing` |
+
+**看点**：改动前该函数**已经拿到**了 state object id 与 export 数量，甚至把正确命令拼进了
+suggestion —— 信息齐备却选择失败。现在直接从 state object 的 DXIL library exports 恢复源码，
+并按 HLSL 入口点去重（同一入口点会被编译进多个 collection、产生多个 mangled export，
+不去重会把同一份源码重复输出几十遍）。
+
+### 8.4 光追 dispatch 在事件视图可检索
+
+```powershell
+pix-tool-set list-actions --effective-kind dispatch_rays --detail
+```
+
+| 过滤方式 | 结果 |
+|---|---|
+| `--kind raytracing` | 3 条，**全是** AS 构建，dispatch 一个不见 |
+| `--kind dispatch_rays` | 0 条（导出里没有字面 `DispatchRays`） |
+| `--effective-kind dispatch_rays` | ✅ 2 条：gid 5311、5366 |
+
+**看点**：`find-draw-calls` 早有 `effective_kind`，`list-actions` 却没有，导致同一份数据
+在两个视图里可见性不一致。
+
+### 8.5 `locate-event` 接受加速结构构建
+
+```powershell
+pix-tool-set locate-event --global-id 3752
+```
+
+| 字段 | 改动前 | 改动后 |
+|---|---|---|
+| `status` | `error: event_not_found` | `partial` |
+| `command.api` | —（原报错里写 `<unknown>`） | `BuildRaytracingAccelerationStructure` |
+| `command.source` | 无 | `CommandLists_000.cpp:56277` |
+| `neighbouring_draws` | 无 | 前 gid 3742 / 后 gid 3808 |
+| `acceleration_structure_build` | 无 | `top_level` / 3 instances / dest 3223 |
+
+**连带修复**：`command_by_global_id` 原先只在 GlobalId 注释后 **5 行**窗口内、
+且只匹配 `GetCommandList(N)->Api(` 一种形式。AS 构建要先填一串 D3D12 desc 结构体，
+调用行远在窗口之外且为局部变量形式，故恒判为 `<unknown>`。现扩至 60 行、
+增加局部变量形式，并以"遇到下一个 GlobalId 即停"防止借用后一条命令的 API 名。
+
+### 8.6 无 draw 的 marker 给出精确引导
+
+```powershell
+pix-tool-set pass-info --pass-name "RayTracingBuildScene"
+```
+
+改动前：`No pass matches 'RayTracingBuildScene'` + "Run list-passes"（无指向性，
+读起来像"这个名字不存在"）。
+
+改动后仍是 `pass_not_found`（语义正确：它确实不是 pass），但 suggestion 变为：
+
+```
+'RayTracingBuildScene' is a marker (queue_id=18403) that encloses no draw call,
+so it forms no pass. It contains 3 acceleration structure build(s)
+(global_id 3752, 3753, 3754). Use analyze-acceleration-structures for the full
+description, list-raytracing-work for the ordered timeline, or
+locate-event --global-id <id> for one build's context.
+```
+
+**看点**：pass = "包含至少一个 draw 的 marker" 这个定义本身合理，
+问题只在于报错没区分"名字错了"与"这个概念不适用"。
+
+### 8.7 `analyze-raytracing` 一次拿到全貌
+
+```powershell
+pix-tool-set analyze-raytracing
+pix-tool-set analyze-raytracing --detail
+```
+
+实测输出（会话 `Tiled`）：
+
+```
+summary: ray_dispatches=2, acceleration_structure_builds=3, tlas_instances_total=3,
+         state_objects_declared=81, shader_binding_tables=2, inline_raytracing_passes=3
+
+gid 5311 | ReflectionHardwareRayTracingRGS default     | 232 rays | 0.1889 ms
+         exports=17  hit_groups=4   unique_entry_points=4  sbt=1415_1
+gid 5366 | ReflectionHardwareRayTracingRGS hit-lighting |   2 rays | 0.2463 ms
+         exports=84  hit_groups=58  unique_entry_points=8  sbt=1415_2
+
+builds: (3752, top_level, 3 instances) (3753, top_level, 0) (3754, top_level, 0)
+blobs:  655 个 / 322,986,432 字节
+inline: LumenDirectLightingHardwareRayTracingCS      (gid 4796)
+        HardwareRayTracingCS <indirect> 4x4 probes   (gid 4844)
+        HardwareRayTracingCS default                 (gid 5021)
+```
+
+三条必须验证的语义约束：
+
+| 约束 | 验证点 |
+|---|---|
+| 绝不隐式触发 GPU 回放 | 走 `ensure_timing(allow_export=False)`；无缓存时 `timing.available=false` 且照常返回结构 |
+| inline 识别是证据非声明 | 每条带 `evidence: "pass_name"`；`*IndirectArgs*` pass 被排除（只填间接参数、不发射光线，计入会高估光追占比：6 → 3） |
+| 沿用既有诚实性约定 | `stage_source_note` 与 BLAS geometry 说明原文照带，聚合视图不省略限制条件 |
+
+**看点**：`unique_entry_points` 与 `exports` 的差值本身即信息 ——
+84 个 export 仅对应 8 个真实 HLSL 入口点，说明 UE5 把同一 shader 编进了大量 collection。
+
+### 8.8 回归验证
+
+```powershell
+python -m pytest tests	est_shader_scope.py tests	est_editledger.py tests	est_detect_patches.py -q
+# 24 passed
+```
+
+既有命令全部 `status=success`，未受影响：
+`list-raytracing-work`、`describe-state-object`、`describe-shader-table`、
+`analyze-acceleration-structures`、`list-actions --kind raytracing`、`frame-stats`。
+
+光栅路径未被 DXR 分支影响：
+
+```powershell
+pix-tool-set pass-shader-source --pass-name "Light Grid Create" --stage CS
+# → success / pdb-hlsl / 走 rasterisation 默认分支
+```
+
+### 8.9 确认无解、保持现状的两项
+
+| 项 | 原因 | 现有处理 |
+|---|---|---|
+| BLAS 三角形/顶点数 | 导出的是驱动私有序列化 blob（`DESERIALIZE` 重放），源数据无 `D3D12_RAYTRACING_GEOMETRY_DESC`；blob 大小是压缩结构 | `null` + `geometry_note`，**正确**：凭 blob 大小反推会产出"看起来是测量值的推测值" |
+| postbuild info | 仅当应用调用过 `EmitRaytracingAccelerationStructurePostbuildInfo` 才存在，UE5 这一帧未调用 | note 明确区分"应用没问"与"解析失败" |
+
+---
+
 ## 对应的验收脚本
 
 以下命令均可直接运行（均基于 `Tiled` 会话）：
@@ -222,4 +391,5 @@ python tests\verify_raytracing_pass_analysis.py # 27 项，钉住静默空答、
 ## 相关文档
 
 - [DXR 光追适配计划](/Doc/dxr-raytracing-adaptation-plan.md)
+- [光追工具链修复报告](/Doc/raytracing-toolchain-fixes.md)
 - [Tiled.wpix 分析报告](/Doc/Tiled-wpix-分析报告.md)

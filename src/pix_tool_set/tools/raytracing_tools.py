@@ -675,3 +675,353 @@ def _resolve_instance_hit_group(sbt, instance) -> dict[str, Any]:
     entry["hit_group"] = match.shader_identifier
     entry["root_constants"] = list(match.root_constants)
     return entry
+
+
+# ======================================================================
+@tool(
+    name="analyze-raytracing",
+    summary=(
+        "Whole-frame raytracing overview in one call: ray dispatches with their "
+        "pipelines and tables, acceleration structure builds with their instances, "
+        "the inline-raytracing compute passes, and measured GPU cost when cached."
+    ),
+    category="advanced",
+    parameters=with_session(
+        detail={
+            "type": "boolean",
+            "description": (
+                "Include per-export listings, per-instance transforms and shader "
+                "record dumps instead of just the counts and headline fields."
+            ),
+        },
+        include_inline={
+            "type": "boolean",
+            "description": (
+                "Also report compute passes that trace rays through TraceRayInline "
+                "(DXR 1.1). These have no state object and no shader table, so every "
+                "state-object tool is blind to them, yet they are raytracing work. "
+                "Default true."
+            ),
+        },
+        include_timing={
+            "type": "boolean",
+            "description": (
+                "Attach measured GPU duration per dispatch. Only uses an existing "
+                "cached measurement; this tool never triggers a replay. Run "
+                "export-timing or event-timing first to populate it. Default true."
+            ),
+        },
+    ),
+    returns=(
+        "One payload with: summary counts, ray_dispatches (pipeline + table + cost), "
+        "acceleration_structures (builds, instances, blob totals), "
+        "inline_raytracing passes, and the capability notes that apply."
+    ),
+    examples=[
+        "pix-tool-set analyze-raytracing",
+        "pix-tool-set analyze-raytracing --detail",
+        "pix-tool-set analyze-raytracing --include-inline false",
+    ],
+    notes=(
+        "This is the entry point for 'what raytracing does this frame do'. It answers "
+        "in one call what otherwise takes list-raytracing-work, describe-state-object, "
+        "describe-shader-table, analyze-acceleration-structures and event-timing. "
+        + STAGE_SOURCE_NOTE
+        + " "
+        + BLAS_GEOMETRY_NOTE
+    ),
+)
+def analyze_raytracing(args: dict[str, Any], context: ToolContext) -> ToolResult:
+    capture = context.capture(args)
+    detail = bool(args.get("detail"))
+    include_inline = args.get("include_inline")
+    include_inline = True if include_inline is None else bool(include_inline)
+    include_timing = args.get("include_timing")
+    include_timing = True if include_timing is None else bool(include_timing)
+
+    # ---- measured cost, only if something already paid for the replay ----------
+    timing_table = None
+    timing_available = False
+    if include_timing:
+        try:
+            from ..engine import timing as timing_mod
+
+            # allow_export=False is the whole point: an overview must never silently
+            # trigger a ~100s GPU replay. If nothing is cached, the answer is simply
+            # structural and says so.
+            timing_table, _report = timing_mod.ensure_timing(
+                capture,
+                counters=timing_mod.TIMING_GLOB,
+                timeout=1800,
+                force=False,
+                allow_export=False,
+            )
+            timing_available = timing_table is not None
+        except Exception:  # noqa: BLE001
+            # A missing or unreadable cache is not an error here: cost is an optional
+            # enrichment and the structural answer stands without it.
+            timing_table = None
+            timing_available = False
+
+    # ---- ray dispatches --------------------------------------------------------
+    dispatches: list[dict[str, Any]] = []
+    for draw in capture.draw_calls:
+        if draw.effective_kind is not EventKind.DISPATCH_RAYS and not draw.is_raytracing:
+            continue
+        sbt = draw.shader_binding_table
+        state_object = draw.state_object
+
+        entry: dict[str, Any] = {
+            "draw_index": draw.index,
+            "global_id": draw.global_id,
+            "queue_id": draw.queue_id,
+            "queue_name": draw.queue_name,
+            "pass_name": draw.pass_name,
+            "api": draw.api,
+            "effective_kind": draw.effective_kind.value,
+            "state_object_id": draw.state_object_id,
+            "shader_binding_table_key": draw.indirect_argument_buffer,
+            "dispatch_dimensions": [sbt.width, sbt.height, sbt.depth] if sbt else None,
+            "ray_count": sbt.ray_count if sbt else None,
+        }
+
+        if state_object is not None:
+            exports = list(state_object.resolved_exports)
+            by_stage: dict[str, int] = {}
+            for export in exports:
+                key = export.stage.value if export.stage else "unknown"
+                by_stage[key] = by_stage.get(key, 0) + 1
+            entry["pipeline"] = {
+                "max_payload_size": state_object.max_payload_size,
+                "max_attribute_size": state_object.max_attribute_size,
+                "max_recursion_depth": state_object.max_recursion_depth,
+                "flags": list(state_object.flags or []),
+                "export_count": len(exports),
+                "hit_group_count": len(state_object.resolved_hit_groups),
+                "collection_count": len(state_object.existing_collection_ids or []),
+                "exports_by_stage": by_stage,
+                "global_root_signature_id": state_object.global_root_signature_id,
+            }
+            # The distinct HLSL shaders behind the mangled exports: a UE5 RTPSO lists
+            # the same entry point once per collection, so the raw export count says
+            # little about how many shaders were actually authored.
+            unique_entries: dict[str, str] = {}
+            for export in exports:
+                name = export.original_name or export.name
+                if name and name not in unique_entries:
+                    unique_entries[name] = export.stage.value if export.stage else "unknown"
+            entry["pipeline"]["unique_entry_points"] = [
+                {"entry_point": name, "stage": stage}
+                for name, stage in sorted(unique_entries.items())
+            ]
+            if detail:
+                entry["pipeline"]["exports"] = [
+                    {
+                        "name": export.name,
+                        "original_name": export.original_name,
+                        "stage": export.stage.value if export.stage else None,
+                        "stage_source": export.stage_source,
+                        "defining_state_object_id": export.defining_state_object_id,
+                    }
+                    for export in exports
+                ]
+                entry["pipeline"]["hit_groups"] = [
+                    {
+                        "name": group.name,
+                        "type": group.type,
+                        "closest_hit": group.closest_hit,
+                        "any_hit": group.any_hit,
+                        "intersection": group.intersection,
+                    }
+                    for group in state_object.resolved_hit_groups
+                ]
+
+        if sbt is not None:
+            regions: dict[str, Any] = {}
+            for label in ("raygen", "miss", "hit_group", "callable"):
+                region = getattr(sbt, label, None)
+                if region is None:
+                    # A null region means the pipeline has no shader of that class,
+                    # which is not the same as a region holding zero records.
+                    regions[label] = None
+                    continue
+                regions[label] = {
+                    "size_in_bytes": region.size_in_bytes,
+                    "stride_in_bytes": region.stride_in_bytes,
+                    "record_capacity": region.record_capacity,
+                }
+            counts: dict[str, int] = {}
+            for record in sbt.records:
+                counts[record.table] = counts.get(record.table, 0) + 1
+            entry["shader_binding_table"] = {
+                "indirect_buffer_key": sbt.indirect_buffer_key,
+                "raygen_identifier": sbt.raygen_identifier,
+                "regions": regions,
+                "record_count": len(sbt.records),
+                "records_by_table": counts,
+                "records_outside_declared_regions": sum(
+                    1 for record in sbt.records if not record.in_declared_region
+                ),
+            }
+            if detail:
+                entry["shader_binding_table"]["records"] = [
+                    {
+                        "table": record.table,
+                        "offset": record.offset,
+                        "shader_identifier": record.shader_identifier,
+                        "in_declared_region": record.in_declared_region,
+                        "root_constants": list(record.root_constants),
+                    }
+                    for record in sbt.records
+                ]
+
+        if timing_table is not None and draw.global_id is not None:
+            measured = timing_table.lookup(global_id=draw.global_id)
+            if measured is not None:
+                entry["measured_cost"] = {
+                    "duration_ns": measured.duration_ns,
+                    "duration_ms": measured.duration_ms,
+                }
+
+        dispatches.append(entry)
+
+    # ---- acceleration structures ----------------------------------------------
+    builds: list[dict[str, Any]] = []
+    total_instances = 0
+    for build in capture.acceleration_structure_builds:
+        total_instances += len(build.instances)
+        row: dict[str, Any] = {
+            "global_id": build.global_id,
+            "type": build.type,
+            "flags": list(build.flags or []),
+            "instance_count": len(build.instances),
+            "dest_resource_id": build.dest_resource_id,
+            "pass_name": build.marker_path[-1] if build.marker_path else "",
+            "source": f"{build.source_file}:{build.source_line}",
+            "triangle_count": None,
+            "vertex_count": None,
+        }
+        if detail and build.instances:
+            row["instances"] = [
+                {
+                    "index": instance.index,
+                    "instance_id": instance.instance_id,
+                    "instance_mask": instance.instance_mask,
+                    "contribution_to_hit_group_index": (
+                        instance.contribution_to_hit_group_index
+                    ),
+                    "blas_resource_id": instance.blas_resource_id,
+                    "transform": list(instance.transform or []),
+                }
+                for instance in build.instances
+            ]
+        builds.append(row)
+
+    # ---- inline raytracing (DXR 1.1) ------------------------------------------
+    inline_rows: list[dict[str, Any]] = []
+    if include_inline:
+        seen_passes: set[str] = set()
+        for draw in capture.draw_calls:
+            if draw.state_object_id is not None:
+                continue
+            if draw.effective_kind not in (EventKind.DISPATCH, EventKind.EXECUTE_INDIRECT):
+                continue
+            name = draw.pass_name or ""
+            flat = name.replace(" ", "").lower()
+            # UE5 names every inline path "...HardwareRayTracing...". Matching the pass
+            # name is evidence, not proof, so the payload says so rather than implying
+            # the export declared it.
+            if "hardwareraytracing" not in flat:
+                continue
+            # The *IndirectArgs* passes only fill an indirect argument buffer for the
+            # dispatch that follows; they trace no rays. Counting them as raytracing
+            # work would overstate how much of the frame traces.
+            if "indirectargs" in flat:
+                continue
+            if name in seen_passes:
+                continue
+            seen_passes.add(name)
+            inline_rows.append(
+                {
+                    "draw_index": draw.index,
+                    "global_id": draw.global_id,
+                    "pass_name": name,
+                    "api": draw.api,
+                    "effective_kind": draw.effective_kind.value,
+                    "pso_id": draw.pso_id,
+                    "evidence": "pass_name",
+                }
+            )
+
+    summary = {
+        "ray_dispatches": len(dispatches),
+        "acceleration_structure_builds": len(builds),
+        "tlas_instances_total": total_instances,
+        "state_objects_declared": len(capture.state_objects),
+        "shader_binding_tables": len(capture.shader_binding_tables),
+        "inline_raytracing_passes": len(inline_rows),
+        "frame_does_raytracing": bool(dispatches or builds or inline_rows),
+    }
+
+    blob_total = 0
+    blob_bytes = 0
+    try:
+        serialized = getattr(capture, "serialized_acceleration_structures", None)
+        if serialized:
+            blob_total = len(serialized)
+            blob_bytes = sum(int(getattr(b, "serialized_size", 0) or 0) for b in serialized)
+    except Exception:  # noqa: BLE001
+        blob_total = 0
+
+    data: dict[str, Any] = {
+        "summary": summary,
+        "ray_dispatches": dispatches,
+        "acceleration_structures": {
+            "builds": builds,
+            "serialized_blob_count": blob_total or None,
+            "serialized_bytes": blob_bytes or None,
+            "geometry_availability": {
+                "triangle_counts_available": False,
+                "vertex_counts_available": False,
+                "reason": BLAS_GEOMETRY_NOTE,
+            },
+        },
+        "inline_raytracing": inline_rows,
+        "timing": {
+            "available": timing_available,
+            "note": (
+                "Measured TOP-to-EOP duration from a cached GPU replay."
+                if timing_available
+                else "No cached measurement. Run export-timing (one replay) to populate "
+                "it, then re-run this tool; it never replays on its own."
+            ),
+        },
+        "stage_source_note": STAGE_SOURCE_NOTE,
+    }
+
+    result = ToolResult.success(data)
+    if not summary["frame_does_raytracing"]:
+        result.add_diagnostic(
+            "info",
+            "This frame submits no raytracing work at all: no dispatches, no "
+            "acceleration structure builds, no inline paths. That is a fact about the "
+            "capture, not a parse failure.",
+        )
+        return result
+
+    if dispatches and not timing_available and include_timing:
+        result.add_diagnostic(
+            "info",
+            "Structural answer is complete; cost is absent because no timing replay "
+            "has been cached for this session. Run export-timing once to add it.",
+        )
+    if inline_rows:
+        result.add_diagnostic(
+            "info",
+            f"{len(inline_rows)} compute pass(es) trace rays through TraceRayInline. "
+            "They have no state object or shader table, so describe-state-object and "
+            "describe-shader-table cannot see them; read their HLSL with "
+            "pass-shader-source --stage CS. Identified by UE5 pass naming, so treat it "
+            "as evidence rather than a declaration.",
+        )
+    return result

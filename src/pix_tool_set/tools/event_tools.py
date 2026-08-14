@@ -38,7 +38,18 @@ _KIND_VALUES = [kind.value for kind in EventKind]
         kind={
             "type": "string",
             "enum": _KIND_VALUES,
-            "description": "Keep only events of this kind.",
+            "description": "Keep only events of this kind (the literal D3D12 API call).",
+        },
+        effective_kind={
+            "type": "string",
+            "enum": ["draw", "dispatch", "dispatch_rays", "execute_indirect"],
+            "description": (
+                "Keep only events by what the GPU actually runs. A UE5 export contains no "
+                "literal DispatchRays call -- ray dispatches appear as ExecuteIndirect on a "
+                "DISPATCH_RAYS command signature -- so --kind raytracing finds only the "
+                "acceleration structure builds while --effective-kind dispatch_rays finds "
+                "the dispatches that actually trace rays."
+            ),
         },
         drawable_only={
             "type": "boolean",
@@ -74,15 +85,31 @@ def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
         )
 
     kind = args.get("kind")
+    effective = args.get("effective_kind")
     marker = (args.get("marker") or "").lower()
     lo = args.get("min_queue_id")
     hi = args.get("max_queue_id")
     drawable_only = bool(args.get("drawable_only"))
 
+    # effective_kind lives on the draw call, not on the event row, so build the set of
+    # Global IDs whose action actually runs the requested work. Without this, ray
+    # dispatches are unreachable from the event view: their API name is ExecuteIndirect.
+    effective_gids: set[int] | None = None
+    if effective:
+        effective_gids = {
+            draw.global_id
+            for draw in capture.draw_calls
+            if draw.effective_kind.value == effective and draw.global_id is not None
+        }
+
     filtered = []
     for event in events:
         if kind and event.kind.value != kind:
             continue
+        if effective_gids is not None:
+            gid = getattr(event, "global_id", None)
+            if gid is None or gid not in effective_gids:
+                continue
         if drawable_only and event.kind not in DRAW_KINDS:
             continue
         # Range filtering on Queue ID rather than Global ID: every row has a Queue ID,
@@ -96,12 +123,20 @@ def list_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
         filtered.append(event)
 
     window = filtered[offset : offset + limit] if limit else filtered[offset:]
-    return ToolResult.success(
+    result = ToolResult.success(
         {
             "events": [event.to_dict(detail=detail) for event in window],
             **page_envelope(len(filtered), offset, limit, len(window)),
         }
     )
+    if effective and not filtered:
+        result.add_diagnostic(
+            "info",
+            f"No event resolves to effective_kind={effective!r}. Note that events on a "
+            "queue the exported event list does not cover have no row here; use "
+            f"find-draw-calls --effective-kind {effective} to reach those.",
+        )
+    return result
 
 
 @tool(
@@ -458,6 +493,107 @@ def locate_event(args: dict[str, Any], context: ToolContext) -> ToolResult:
                 "for draw-level tools.",
             )
             return result
+
+        # The id may name a recorded command that is not an action: the canonical case is
+        # BuildRaytracingAccelerationStructure, which has a marker path, a generated
+        # source line and neighbouring draws -- exactly what this tool reports. Refusing
+        # it would deny an answer the export can perfectly well give, so degrade instead.
+        gid = args.get("global_id")
+        command = None
+        if gid is not None and hasattr(capture, "command_by_global_id"):
+            command = capture.command_by_global_id(int(gid))
+        if command is not None:
+            # command_by_global_id returns {api, source_file, source_line}; it has no
+            # marker path. Acceleration structure builds do carry one in the parsed
+            # AS records, so recover it from there when the id is a build.
+            marker_path: list[str] = []
+            as_build = None
+            for build in getattr(capture, "acceleration_structure_builds", []) or []:
+                if build.global_id is not None and int(build.global_id) == int(gid):
+                    as_build = build
+                    marker_path = list(build.marker_path or ())
+                    break
+            pass_entry = next(
+                (p for p in capture.passes if list(p["marker_path"]) == marker_path), None
+            ) if marker_path else None
+            nearest = [
+                d
+                for d in capture.draw_calls
+                if d.global_id is not None and d.global_id >= int(gid)
+            ]
+            following = nearest[0] if nearest else None
+            preceding_all = [
+                d
+                for d in capture.draw_calls
+                if d.global_id is not None and d.global_id <= int(gid)
+            ]
+            preceding = preceding_all[-1] if preceding_all else None
+            payload: dict[str, Any] = {
+                "is_action": False,
+                "command": {
+                    "global_id": int(gid),
+                    "api": command.get("api"),
+                    "marker_path": marker_path,
+                    "pass_name": marker_path[-1] if marker_path else None,
+                    "source": f"{command.get('source_file')}:{command.get('source_line')}",
+                },
+                "pass": (
+                    {
+                        "pass_index": pass_entry["pass_index"],
+                        "name": pass_entry["name"],
+                        **pass_identity(pass_entry),
+                        "marker_path": pass_entry["marker_path"],
+                        "first_draw_index": pass_entry["first_draw_index"],
+                    }
+                    if pass_entry
+                    else None
+                ),
+                "neighbouring_draws": {
+                    "preceding": (
+                        {
+                            "draw_index": preceding.index,
+                            "global_id": preceding.global_id,
+                            "api": preceding.api,
+                            "pass_name": preceding.marker_path[-1]
+                            if preceding.marker_path
+                            else None,
+                        }
+                        if preceding is not None
+                        else None
+                    ),
+                    "following": (
+                        {
+                            "draw_index": following.index,
+                            "global_id": following.global_id,
+                            "api": following.api,
+                            "pass_name": following.marker_path[-1]
+                            if following.marker_path
+                            else None,
+                        }
+                        if following is not None
+                        else None
+                    ),
+                },
+            }
+            if as_build is not None:
+                payload["acceleration_structure_build"] = {
+                    "type": getattr(as_build, "type", None),
+                    "instance_count": len(getattr(as_build, "instances", []) or []),
+                    "dest_resource_id": getattr(as_build, "dest_resource_id", None),
+                    "flags": list(getattr(as_build, "flags", []) or []),
+                }
+            result = ToolResult.partial(payload)
+            result.degrade(
+                f"Global ID {gid} is a {command.get('api')} command, not an action, so "
+                "there is no draw index, no position within the draw list and no counters.",
+                remedy=(
+                    "Marker path, generated source line and the surrounding draws are "
+                    "reported above. For acceleration structure builds specifically, "
+                    "analyze-acceleration-structures gives the full description."
+                ),
+            )
+            return result
+
         # Delegate the miss so the two Queue ID failure modes are described in one place;
         # a bare "not found" here would hide the row-order trap that makes a wrong id look
         # like a right one elsewhere.

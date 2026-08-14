@@ -13,6 +13,10 @@
    - `partial` — 结果可用但有降级，原因在 `diagnostics`
    - `error` — 未产出结果，恢复路径看 `error.code` 与 `error.suggestion`
 4. 退出码：`0` 成功或 partial，`1` 工具级错误，`2` 命令行参数错误。
+5. 全局参数 `--compact` / `--traceback` / `--output-json` **在命令名前后都可使用**
+   （`--pixtool` 仅限命令名之前）。
+6. 需要把结果落盘时用 `--output-json <PATH>`，工具会以 UTF-8 写入；
+   **不要依赖 shell 重定向**——PowerShell 的 `>` 写出的是 UTF-16，会让下游 JSON 解析失败。
 
 ## 二、建议的调用循环
 
@@ -87,6 +91,32 @@ find-draw-calls --pass-name <关键字> → draw-state --draw-index <n>
 → shader-bindings --draw-index <n> --stage PS
 ```
 
+**「这一帧的光追情况」**
+```
+analyze-raytracing                 一次拿到全貌：dispatch + 管线 + SBT + 加速结构 + inline
+analyze-raytracing --detail        再要 export 清单、实例变换矩阵、SBT 逐条记录
+```
+这是光追分析的**首选入口**，替代原先「`list-raytracing-work` → `describe-state-object`
+→ `describe-shader-table` → `analyze-acceleration-structures` → `event-timing`」的多次调用。
+三个必须知道的语义：
+
+- 它**从不触发 GPU 回放**。`timing.available=false` 表示没有缓存测量值，
+  需要耗时就先跑一次 `export-timing`，再重新调用本命令。
+- `inline_raytracing[]` 是走 `TraceRayInline`（DXR 1.1）的**计算 pass**：没有 state object、
+  没有 SBT，所以 `describe-state-object` / `describe-shader-table` 看不到它们，
+  读源码要用 `pass-shader-source --stage CS`。该识别基于 UE5 pass 命名，
+  响应里以 `evidence: "pass_name"` 标明是证据而非声明。
+- BLAS 的三角形/顶点数恒为 `null`，这是驱动私有 blob 决定的，不是解析失败。
+
+**「怎么找到光追的 dispatch」**
+```
+list-actions --effective-kind dispatch_rays        事件视图
+find-draw-calls --effective-kind dispatch_rays     draw 视图（含未导出队列）
+```
+**不要用 `--kind dispatch_rays` 或 `--kind raytracing`**：UE5 导出里没有字面
+`DispatchRays`，ray dispatch 表现为挂在 DISPATCH_RAYS command signature 上的
+`ExecuteIndirect`；`--kind raytracing` 只会返回加速结构构建。
+
 **「这个光追 pass 绑了什么」**
 ```
 pass-bindings --global-id <PIX GUI 的 Global ID>
@@ -113,6 +143,16 @@ pass-bindings --global-id <PIX GUI 的 Global ID>
 list-shaders --stage CS --unique → shader-reflection --pso-id <id> --stage CS
 → disassemble-shader --pso-id <id> --stage CS -o cs.txt
 ```
+
+光追 shader 同样用 `pass-shader-source`，它会自动走 state object 的 DXIL library exports：
+```
+pass-shader-source --pass-name "<光追 pass>" --stage RAYGEN
+pass-shader-source --pass-name "<光追 pass>" --export-name MaterialCHS
+```
+响应中 `binding_shape: "raytracing"` 表示走的是 DXR 分支，此时 `pso_id` 为 `null`
+属**管线形状使然**。同一个 HLSL 入口点会被编译进多个 collection、产生多个 mangled export，
+因此结果**按入口点去重**，`aliased_export_count` 说明该行代表多少个 export。
+只有需要**改写** shader 时才用 `shader-edit-begin`（它额外产出编译参数与可回滚副本）。
 
 **「这块纹理/缓冲区里的值是多少」**
 ```

@@ -16,13 +16,22 @@ from pathlib import Path
 from typing import Any
 
 from ..context import ToolContext
-from ..engine import shaderpdb
+from ..engine import dxbc, shaderpdb
 from ..engine.model import ShaderStage
 from ..errors import not_found
 from ..results import ToolResult
 from ._common import PASS_SELECTOR, resolve_pass, tool, with_session
 
 _STAGES = [stage.value for stage in ShaderStage]
+
+_SOURCE_TIERS = {
+    "pdb-hlsl": "Real HLSL recovered from the engine's shader PDB.",
+    "embedded-hlsl": "Real HLSL was embedded in the capture's shader container.",
+    "dxil-disassembly": (
+        "No HLSL available; returning DXIL text plus the entry point name."
+    ),
+    "unavailable": "Neither source nor disassembly could be produced.",
+}
 
 _NOTE = (
     "Original HLSL is not stored inside a .wpix unless the shader was built with "
@@ -94,6 +103,168 @@ def _resolve_source(shader, search_dirs: list[Path]) -> dict[str, Any]:
     return outcome
 
 
+def _dxr_export_rows(
+    capture,
+    draw,
+    search_dirs: list[Path],
+    stage_filter: str | None,
+    export_filter: str | None,
+    max_lines: int,
+    out_dir: Path | None,
+    want_body: bool,
+    want_entry: bool,
+) -> tuple[list[dict[str, Any]], list[str], set[str], dict[str, Any]]:
+    """Source rows for a DISPATCH_RAYS action, whose shaders live on a state object.
+
+    A raytracing shader is an export of a DXIL_LIBRARY inside a COLLECTION, so
+    ``draw.shaders`` is empty and the PSO-stage walk finds nothing. Refusing to
+    answer here would be wrong: the exports, their PDBs and their HLSL are all
+    reachable, just through the state object rather than through a PSO. This is the
+    DXR sibling of the per-shader loop above.
+    """
+    state_object = draw.state_object
+    if state_object is None:
+        return [], [], set(), {"reason": "the action names a state object the export does not contain"}
+
+    exports = list(state_object.resolved_exports)
+    if stage_filter:
+        wanted = str(stage_filter).upper()
+        exports = [e for e in exports if (e.stage.value if e.stage else "") == wanted]
+    if export_filter:
+        exact = [e for e in exports if e.name == export_filter]
+        exports = exact or [e for e in exports if e.original_name == export_filter]
+
+    # One HLSL entry point is compiled into many collections under different mangled
+    # names. Returning all of them would repeat the same source dozens of times, so
+    # de-duplicate by entry point and record how many exports each row stands for.
+    grouped: dict[str, list[Any]] = {}
+    for export in exports:
+        key = export.original_name or export.name
+        grouped.setdefault(key, []).append(export)
+
+    rows: list[dict[str, Any]] = []
+    output_paths: list[str] = []
+    tiers: set[str] = set()
+
+    for entry_name, group in grouped.items():
+        export = group[0]
+        blob = b""
+        if export.dxil_blob_index is not None:
+            try:
+                blob = capture._load_blob(export.dxil_blob_index)
+            except Exception:  # noqa: BLE001
+                blob = b""
+
+        debug_name = ""
+        shader_hash = ""
+        disassembly = ""
+        if blob:
+            try:
+                container = dxbc.DxbcContainer.parse(blob)
+                debug_name = container.debug_name or ""
+                shader_hash = container.shader_hash or ""
+            except ValueError:
+                pass
+
+        recovery: dict[str, Any] = {
+            "pdb_path": None,
+            "recovered": False,
+            "method": None,
+            "detail": None,
+            "compile_args": [],
+        }
+        text = ""
+        tier = "unavailable"
+
+        pdb_path = None
+        if search_dirs:
+            pdb_path = shaderpdb.find_pdb(search_dirs, shader_hash, debug_name)
+            if pdb_path is None:
+                # Some engines file the PDB by entry point rather than container hash.
+                pdb_path = shaderpdb.find_pdb(search_dirs, "", entry_name or "")
+        if pdb_path is not None:
+            report = shaderpdb.extract_sources(pdb_path)
+            recovery.update(
+                {
+                    "pdb_path": str(pdb_path),
+                    "recovered": bool(report.get("ok")),
+                    "method": report.get("method"),
+                    "detail": report.get("detail"),
+                    "compile_args": report.get("compile_args") or [],
+                }
+            )
+            if report.get("ok"):
+                full = report.get("full_text") or ""
+                body = report.get("shader_body") or ""
+                text = (body if want_body and body else full) or full
+                tier = "pdb-hlsl"
+                if want_entry and text:
+                    sliced = shaderpdb.slice_entry_function(text, entry_name)
+                    if sliced:
+                        text = sliced
+                        recovery["scope"] = "entry-function"
+                    else:
+                        recovery["scope"] = "translation-unit"
+        elif search_dirs:
+            recovery["detail"] = (
+                f"no PDB named {debug_name or shader_hash or entry_name!r} in the supplied dirs"
+            )
+        else:
+            recovery["detail"] = "no --pdb-dirs supplied"
+
+        if tier != "pdb-hlsl" and blob:
+            try:
+                disassembly = dxbc.ShaderDisassembler().disassemble(blob)
+            except Exception:  # noqa: BLE001
+                disassembly = ""
+            if disassembly:
+                text = disassembly
+                tier = "dxil-disassembly"
+        tiers.add(tier)
+
+        stage_tag = export.stage.value if export.stage else "LIB"
+        if out_dir is not None and text:
+            suffix = "dxil.txt" if tier == "dxil-disassembly" else "hlsl"
+            safe = f"so{state_object.api_id}_{export.name}_{entry_name}"[:80]
+            safe = safe.replace("/", "_").replace(":", "_").strip()
+            path = out_dir / f"{safe}.{suffix}"
+            path.write_text(text, encoding="utf-8", errors="replace")
+            output_paths.append(str(path))
+
+        lines = text.splitlines()
+        truncated = bool(max_lines) and len(lines) > max_lines
+        rows.append(
+            {
+                "stage": stage_tag,
+                "stage_source": export.stage_source,
+                "source_tier": tier,
+                "export_name": export.name,
+                "entry_point": entry_name,
+                "shader_hash": shader_hash,
+                "pdb_name": debug_name,
+                "byte_size": len(blob) if blob else None,
+                "defining_state_object_id": export.defining_state_object_id,
+                "aliased_export_count": len(group),
+                "aliased_export_names": [e.name for e in group][:12],
+                "pdb_recovery": recovery,
+                "line_count": len(lines),
+                "truncated": truncated,
+                "text": "\n".join(lines[:max_lines]) if truncated else text,
+            }
+        )
+
+    rows.sort(key=lambda row: (str(row.get("stage")), str(row.get("entry_point"))))
+    meta = {
+        "state_object_id": state_object.api_id,
+        "export_total": len(state_object.resolved_exports),
+        "export_returned": len(rows),
+        "hit_group_total": len(state_object.resolved_hit_groups)
+        if hasattr(state_object, "resolved_hit_groups")
+        else None,
+    }
+    return rows, output_paths, tiers, meta
+
+
 @tool(
     name="pass-shader-source",
     summary=(
@@ -105,6 +276,13 @@ def _resolve_source(shader, search_dirs: list[Path]) -> dict[str, Any]:
     parameters=with_session(
         PASS_SELECTOR,
         stage={"type": "string", "enum": _STAGES, "description": "Restrict to one stage."},
+        export_name={
+            "type": "string",
+            "description": (
+                "Raytracing only: restrict to one DXIL library export, by mangled name "
+                "(CHS_<hash>) or HLSL entry point. Ignored for rasterisation passes."
+            ),
+        },
         max_lines={
             "type": "integer",
             "description": "Inline text line cap. Default 120; 0 means no limit.",
@@ -156,30 +334,6 @@ def pass_shader_source(args: dict[str, Any], context: ToolContext) -> ToolResult
     stage_filter = args.get("stage")
     shaders = [draw.shader(stage_filter)] if stage_filter else draw.shaders
     shaders = [s for s in shaders if s is not None]
-    if not shaders:
-        # "This pass binds no such stage" is factually wrong for a ray dispatch: the
-        # pass may bind dozens of shaders, they just live on a state object rather than
-        # a PSO, so draw.shader() cannot see them. Naming the DXR route keeps the
-        # message from closing off an investigation that is still perfectly possible.
-        if draw.state_object_id is not None:
-            state_object = draw.state_object
-            export_count = (
-                len(state_object.resolved_exports) if state_object is not None else 0
-            )
-            raise not_found(
-                "shader",
-                stage_filter or "any",
-                f"This pass is a raytracing dispatch bound to state object "
-                f"{draw.state_object_id}, whose shaders are DXIL library exports rather "
-                f"than PSO stages"
-                + (f" ({export_count} of them)" if export_count else "")
-                + ". This tool reads PSO stages, so it cannot reach them. Use "
-                f"`describe-state-object --draw-index {draw.index}` to list the exports, "
-                f"`pass-bindings --draw-index {draw.index}` for their bindings, or "
-                f"`shader-edit-begin --state-object-id {draw.state_object_id} "
-                f"--export-name <name>` to recover one export's HLSL from the PDB.",
-            )
-        raise not_found("shader", stage_filter or "any", "This pass binds no such stage.")
 
     max_lines = args.get("max_lines")
     max_lines = 120 if max_lines is None else int(max_lines)
@@ -189,6 +343,81 @@ def pass_shader_source(args: dict[str, Any], context: ToolContext) -> ToolResult
     out_dir = Path(str(args["output_dir"])).expanduser() if args.get("output_dir") else None
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    want_body = args.get("body_only")
+    want_body = True if want_body is None else bool(want_body)
+    want_entry = args.get("entry_only")
+    want_entry = True if want_entry is None else bool(want_entry)
+
+    if not shaders and draw.state_object_id is not None:
+        # A raytracing dispatch. Its shaders are DXIL library exports on the state
+        # object, not PSO stages, so answer from there instead of refusing: every
+        # ingredient (export list, container hash, PDB, HLSL) is available.
+        rows, output_paths, tiers, rt_meta = _dxr_export_rows(
+            capture,
+            draw,
+            search_dirs,
+            stage_filter,
+            args.get("export_name"),
+            max_lines,
+            out_dir,
+            want_body,
+            want_entry,
+        )
+        if not rows:
+            state_object = draw.state_object
+            names = sorted(
+                {f"{e.name} ({e.original_name})" for e in state_object.resolved_exports}
+            )[:20] if state_object is not None else []
+            raise not_found(
+                "shader",
+                args.get("export_name") or stage_filter or "any",
+                "This raytracing pass is bound to state object "
+                f"{draw.state_object_id}, but no export matched the filter. Available "
+                "exports: " + (", ".join(names) or "<none>"),
+            )
+        data = {
+            "pass_index": entry["pass_index"],
+            "pass_name": entry["name"],
+            "marker_path": entry["marker_path"],
+            "draw_index": draw.index,
+            "global_id": draw.global_id,
+            "queue_id": entry.get("first_queue_id"),
+            "pso_id": None,
+            "binding_shape": "raytracing",
+            "raytracing": rt_meta,
+            "pdb_dirs_used": [str(p) for p in search_dirs],
+            "stages": rows,
+            "source_tiers": _SOURCE_TIERS,
+        }
+        if tiers <= {"pdb-hlsl", "embedded-hlsl"}:
+            result = ToolResult.success(data, output_paths=output_paths)
+            result.add_diagnostic(
+                "info",
+                "Raytracing pass: these are DXIL library exports of state object "
+                f"{rt_meta.get('state_object_id')}, de-duplicated by HLSL entry point "
+                "(aliased_export_count says how many mangled exports share each row). "
+                "There is no PSO, so pso_id is null by pipeline shape, not by data loss.",
+            )
+            return result
+        result = ToolResult.partial(data, output_paths=output_paths)
+        result.degrade(
+            "Returning DXIL disassembly for at least one raytracing export instead of "
+            "original source.",
+            reason=(
+                "the supplied --pdb-dirs did not contain a matching PDB"
+                if search_dirs
+                else "no --pdb-dirs was supplied"
+            ),
+            remedy=(
+                r"Pass --pdb-dirs <Project>\Saved\ShaderSymbols\PCD3D_SM6 to recover "
+                "real source."
+            ),
+        )
+        return result
+
+    if not shaders:
+        raise not_found("shader", stage_filter or "any", "This pass binds no such stage.")
 
     output_paths: list[str] = []
     rows: list[dict[str, Any]] = []
@@ -202,12 +431,8 @@ def pass_shader_source(args: dict[str, Any], context: ToolContext) -> ToolResult
 
         if recovery["recovered"]:
             tier = "pdb-hlsl"
-            want_body = args.get("body_only")
-            want_body = True if want_body is None else bool(want_body)
             text = (body if want_body and body else full) or full
 
-            want_entry = args.get("entry_only")
-            want_entry = True if want_entry is None else bool(want_entry)
             if want_entry:
                 sliced = shaderpdb.slice_entry_function(text, shader.entry_point)
                 if sliced:
@@ -267,14 +492,7 @@ def pass_shader_source(args: dict[str, Any], context: ToolContext) -> ToolResult
         "pso_id": draw.pso_id,
         "pdb_dirs_used": [str(p) for p in search_dirs],
         "stages": rows,
-        "source_tiers": {
-            "pdb-hlsl": "Real HLSL recovered from the engine's shader PDB.",
-            "embedded-hlsl": "Real HLSL was embedded in the capture's shader container.",
-            "dxil-disassembly": (
-                "No HLSL available; returning DXIL text plus the entry point name."
-            ),
-            "unavailable": "Neither source nor disassembly could be produced.",
-        },
+        "source_tiers": _SOURCE_TIERS,
     }
     # A null queue_id here means the pass sits on a queue the event list export missed,
     # not that the shader lookup failed. The two look identical in the payload, and the

@@ -269,9 +269,9 @@ def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
             raise not_found(
                 "pass",
                 f"global_id={global_id}",
-                f"Global ID {global_id} is a {cmd.api} command. It is not enclosed by a "
-                f"pass marker, so no pass contains it. Use find-pass with a pass name or "
-                f"index instead.",
+                f"Global ID {global_id} is a {cmd.get('api')} command. It is not enclosed "
+                f"by a pass marker, so no pass contains it. Use find-pass with a pass name "
+                f"or index instead.",
             )
         raise not_found(
             "pass",
@@ -312,6 +312,48 @@ def resolve_pass(capture, args: dict[str, Any]) -> dict[str, Any]:
         )
     entry = capture.find_pass(key)
     if entry is None:
+        # A pass is a marker that encloses at least one draw. Markers that enclose only
+        # non-action commands -- RayTracingBuildScene, whose body is nothing but
+        # BuildRaytracingAccelerationStructure calls, is the canonical case -- produce no
+        # pass, so a plain "no pass matches" reads as "this name does not exist" when in
+        # fact the name is right and the concept does not apply. Name the marker and the
+        # tools that can reach it.
+        if isinstance(key, str):
+            needle = key.lower()
+            markers = [
+                event
+                for event in capture.events
+                if getattr(event, "kind", None) is not None
+                and event.kind.value == "marker"
+                and needle in event.name.lower()
+            ]
+            if markers:
+                marker = markers[0]
+                as_gids = [
+                    build.global_id
+                    for build in (getattr(capture, "acceleration_structure_builds", []) or [])
+                    if marker.name in (build.marker_path or ())
+                ]
+                hint = (
+                    f"{marker.name!r} is a marker (queue_id={marker.queue_id}) that "
+                    "encloses no draw call, so it forms no pass. "
+                )
+                if as_gids:
+                    ids = ", ".join(str(g) for g in as_gids[:6])
+                    hint += (
+                        f"It contains {len(as_gids)} acceleration structure build(s) "
+                        f"(global_id {ids}). Use analyze-acceleration-structures for the "
+                        f"full description, list-raytracing-work for the ordered timeline, "
+                        f"or locate-event --global-id <id> for one build's context."
+                    )
+                else:
+                    hint += (
+                        "Use list-actions --marker "
+                        f"{marker.name!r} to see the commands inside it, or "
+                        "locate-event --queue-id "
+                        f"{marker.queue_id} for the marker itself."
+                    )
+                raise not_found("pass", key, hint)
         raise not_found("pass", key, "Run list-passes to see valid names and indices.")
     return entry
 

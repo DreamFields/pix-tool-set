@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from .context import ToolContext
@@ -31,12 +32,58 @@ __all__ = ["main", "build_parser"]
 _GLOBAL_FLAGS = ("--pixtool",)
 
 
-def _emit(payload: dict[str, Any], compact: bool = False) -> None:
+def _build_global_parent() -> argparse.ArgumentParser:
+    """The output-shaping global flags, as a reusable parent parser.
+
+    argparse only consumes a flag on the parser that declares it. Declaring these
+    on the top-level parser alone means ``pix-tool-set list-tools --compact`` fails
+    with "unrecognized arguments", because by then the subparser owns the argv tail.
+    Attaching the same options to every subparser via ``parents=`` makes both
+    ``pix-tool-set --compact <cmd>`` and ``pix-tool-set <cmd> --compact`` work, which
+    is what anyone would type.
+
+    ``--pixtool`` is deliberately NOT here: several tools declare it in their own
+    schema, and a parent copy would collide with theirs. It stays on the top-level
+    parser only, and ``_execute`` already falls back to the tool argument.
+    """
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("--compact", action="store_true", help="Emit single-line JSON.")
+    parent.add_argument("--traceback", action="store_true", help="Print Python tracebacks.")
+    parent.add_argument(
+        "--output-json",
+        metavar="PATH",
+        help=(
+            "Write the JSON envelope to this file as UTF-8 instead of relying on shell "
+            "redirection. PowerShell's '>' writes UTF-16, which breaks downstream JSON "
+            "parsers; this flag avoids that entirely."
+        ),
+    )
+    return parent
+
+
+def _emit(payload: dict[str, Any], compact: bool = False, output_json: str | None = None) -> None:
     if compact:
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     else:
         text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if output_json:
+        path = Path(str(output_json)).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # newline="" keeps the bytes exactly as written, so a reader that opens the
+        # file with encoding="utf-8" gets byte-for-byte what the tool produced.
+        path.write_text(text, encoding="utf-8", newline="")
+        print(json.dumps({"status": "written", "path": str(path)}, ensure_ascii=False))
+        return
     print(text)
+
+
+def _emit_for(payload: dict[str, Any], namespace: argparse.Namespace) -> None:
+    """Emit using whatever output options the namespace carries."""
+    _emit(
+        payload,
+        getattr(namespace, "compact", False),
+        getattr(namespace, "output_json", None),
+    )
 
 
 def _failure(exc: Exception, tool_name: str = "") -> ToolResult:
@@ -98,8 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
     load_builtin_tools()
     registry = get_registry()
 
+    global_parent = _build_global_parent()
+
     parser = argparse.ArgumentParser(
         prog="pix-tool-set",
+        parents=[global_parent],
         description=(
             "Scriptable analysis of PIX (.wpix) GPU captures. Start with `session-open`, "
             "then query. Run `list-tools` for the machine-readable catalogue."
@@ -111,26 +161,41 @@ def build_parser() -> argparse.ArgumentParser:
             "  pix-tool-set frame-stats\n"
             "  pix-tool-set list-passes --limit 20\n"
             "  pix-tool-set draw-state --draw-index 100\n"
+            "\n"
+            "Global flags (--compact, --traceback, --output-json) are accepted\n"
+            "both before and after the command name; --pixtool goes before it.\n"
         ),
     )
     parser.add_argument("--pixtool", help="Path to pixtool.exe when auto-detection fails.")
-    parser.add_argument("--compact", action="store_true", help="Emit single-line JSON.")
-    parser.add_argument("--traceback", action="store_true", help="Print Python tracebacks.")
 
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
     catalogue = sub.add_parser(
-        "list-tools", help="List every tool with its JSON Schema (machine-readable)."
+        "list-tools",
+        parents=[global_parent],
+        help="List every tool with its JSON Schema (machine-readable).",
     )
     catalogue.add_argument("--category", choices=sorted(CATEGORY_TITLES), help="Filter by category.")
     catalogue.add_argument(
         "--brief", action="store_true", help="Omit schemas; names and summaries only."
     )
+    catalogue.add_argument(
+        "--flat",
+        action="store_true",
+        help=(
+            "Emit a flat 'tools' array instead of the category-nested shape, so a script "
+            "can iterate without walking two levels."
+        ),
+    )
 
-    describe = sub.add_parser("describe", help="Show the full schema for one tool.")
+    describe = sub.add_parser(
+        "describe", parents=[global_parent], help="Show the full schema for one tool."
+    )
     describe.add_argument("tool_name", help="Tool name or alias.")
 
-    runner = sub.add_parser("run", help="Run a tool with a JSON argument object.")
+    runner = sub.add_parser(
+        "run", parents=[global_parent], help="Run a tool with a JSON argument object."
+    )
     runner.add_argument("tool_name", help="Tool name or alias.")
     runner.add_argument(
         "--json-args", default="{}", help="Arguments as a JSON object, e.g. '{\"limit\": 10}'."
@@ -139,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     for definition in registry.list_tools():
         tool_parser = sub.add_parser(
             definition.name,
+            parents=[global_parent],
             help=definition.summary,
             description=definition.summary
             + (f"\n\nNote: {definition.notes}" if definition.notes else ""),
@@ -149,7 +215,9 @@ def build_parser() -> argparse.ArgumentParser:
         )
         _add_tool_flags(tool_parser, definition)
         for alias in definition.aliases:
-            alias_parser = sub.add_parser(alias, help=f"Alias for {definition.name}.")
+            alias_parser = sub.add_parser(
+                alias, parents=[global_parent], help=f"Alias for {definition.name}."
+            )
             _add_tool_flags(alias_parser, definition)
 
     return parser
@@ -163,6 +231,29 @@ def _cmd_list_tools(args: argparse.Namespace) -> int:
         grouped.setdefault(definition.category, []).append(
             definition.to_metadata(verbose=verbose)
         )
+    usage = {
+        "invoke": "pix-tool-set run <tool> --json-args '{...}'",
+        "direct": "pix-tool-set <tool> --flag value",
+        "describe": "pix-tool-set describe <tool>",
+    }
+    if getattr(args, "flat", False):
+        # A flat array is what a script actually wants: the nested shape forces every
+        # consumer to walk categories[].tools[] before it can filter by name.
+        flat: list[dict[str, Any]] = []
+        for category, items in sorted(grouped.items()):
+            for item in items:
+                entry = dict(item)
+                entry.setdefault("category", category)
+                flat.append(entry)
+        flat.sort(key=lambda item: str(item.get("name", "")))
+        payload = {
+            "status": "success",
+            "tool_count": len(flat),
+            "tools": flat,
+            "usage": usage,
+        }
+        _emit_for(payload, args)
+        return 0
     payload = {
         "status": "success",
         "tool_count": sum(len(items) for items in grouped.values()),
@@ -174,13 +265,9 @@ def _cmd_list_tools(args: argparse.Namespace) -> int:
             }
             for category, items in sorted(grouped.items())
         ],
-        "usage": {
-            "invoke": "pix-tool-set run <tool> --json-args '{...}'",
-            "direct": "pix-tool-set <tool> --flag value",
-            "describe": "pix-tool-set describe <tool>",
-        },
+        "usage": usage,
     }
-    _emit(payload, args.compact)
+    _emit_for(payload, args)
     return 0
 
 
@@ -200,7 +287,7 @@ def _cmd_describe(args: argparse.Namespace) -> int:
             "json": f"pix-tool-set run {definition.name} --json-args '{{...}}'",
         },
     }
-    _emit(payload, args.compact)
+    _emit_for(payload, args)
     return 0
 
 
@@ -219,7 +306,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         payload = json.loads(args.json_args)
     except Exception as exc:  # noqa: BLE001
         result = _failure(exc, args.tool_name)
-        _emit(result.to_dict(), args.compact)
+        _emit_for(result.to_dict(), args)
         return 1
 
     timer = activity.Timer(args.tool_name, payload if isinstance(payload, dict) else {}, "cli:run")
@@ -235,7 +322,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         result = _failure(exc, args.tool_name)
     envelope = result.to_dict()
     timer.finish(envelope, session=_session_hint(payload if isinstance(payload, dict) else {}))
-    _emit(envelope, args.compact)
+    _emit_for(envelope, args)
     return 0 if result.status != "error" else 1
 
 
@@ -263,7 +350,7 @@ def _cmd_direct(args: argparse.Namespace) -> int:
         result = _failure(exc, tool_name)
     envelope = result.to_dict()
     timer.finish(envelope, session=_session_hint(tool_args))
-    _emit(envelope, args.compact)
+    _emit_for(envelope, args)
     return 0 if result.status != "error" else 1
 
 
@@ -277,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return _cmd_describe(args)
         except PixToolError as exc:
-            _emit(_failure(exc, args.tool_name).to_dict(), args.compact)
+            _emit_for(_failure(exc, args.tool_name).to_dict(), args)
             return 1
     if args.command == "run":
         return _cmd_run(args)

@@ -949,7 +949,14 @@ class Capture:
         if not hasattr(self, "_command_index_cache"):
             self._command_index_cache: dict[int, dict[str, Any]] = {}
             pattern = re.compile(r"//\s*GlobalId\s*=\s*(\d+)")
+            # Two call shapes appear in the export: the inline
+            # GetCommandList(N)->Api(...) form, and a local-variable form such as
+            # `commandList->Api(...)` / `pCommandList4->Api(...)`, which is what the
+            # generator emits for calls needing a versioned interface --
+            # BuildRaytracingAccelerationStructure among them. Matching only the first
+            # shape reported those as "<unknown>".
             call_re = re.compile(r"GetCommandList\((\d+)\)->(\w+)\(")
+            local_call_re = re.compile(r"\b\w*[Cc]ommand[Ll]ist\w*\s*->\s*(\w+)\s*\(")
             for path in sorted(self.export_dir.glob("CommandLists_*.cpp")):
                 lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
                 for i, line in enumerate(lines):
@@ -958,10 +965,20 @@ class Capture:
                         continue
                     gid = int(m.group(1))
                     api = None
-                    for j in range(i + 1, min(i + 6, len(lines))):
+                    # A wider window than 6 lines: a build sets up its D3D12 desc
+                    # structs before the call, so the call can sit well below the
+                    # GlobalId comment. Stop at the next GlobalId so a command can
+                    # never borrow the following one's API name.
+                    for j in range(i + 1, min(i + 60, len(lines))):
+                        if pattern.search(lines[j]):
+                            break
                         c = call_re.search(lines[j])
                         if c:
                             api = c.group(2)
+                            break
+                        c2 = local_call_re.search(lines[j])
+                        if c2:
+                            api = c2.group(1)
                             break
                     self._command_index_cache[gid] = {
                         "global_id": gid,
