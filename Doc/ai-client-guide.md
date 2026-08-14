@@ -152,6 +152,12 @@ session-set-pdb-dirs --pdb-dirs <Project>\Saved\ShaderSymbols\PCD3D_SM6
 Queue ID 互通（GUI 的 ID 按队列各自编号）。从 GUI 抄 ID 回来查时，**推荐用 `--global-id`**
 ——它是跨队列唯一的，不需要先确认队列。`queue_id` 只用于工具自己输出过的 id；如果误把
 一个 `global_id` 当 `queue_id` 传入，未命中时错误消息会提示改用 `--global-id`。
+**凡是接受 `--queue-id` 的工具都同时接受 `--global-id`**，包括纹理/像素读取类
+（`pick-pixel`、`read-texture-pixels`、`texture-pixel-stats`、`sample-pixel-region`、
+`export-texture`、`export-uav-slice`、`read-resource-texture`、`read-replay-target`、
+`find-depth-content`）和列表/耗时类（`list-draw-calls`、`find-draw-calls`、`pass-cost`、
+`event-timing`）。所以任何时候都不需要先把 GUI 的 Global ID 手工换算成 Queue ID
+——底层 `pixtool save-resource` 本来就是按 Global ID 取资源的。
 `apply` 不带 `--patch` 时只编译并校验绑定签名，不改动任何文件，适合先试错。
 返回 `partial` 且 `binding_check.identical=false` 表示替换不是 slot 兼容的，
 已被拒绝打补丁，需要先恢复原有资源声明。

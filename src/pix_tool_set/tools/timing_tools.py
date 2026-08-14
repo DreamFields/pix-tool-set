@@ -111,12 +111,20 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
             "enum": ["event", "pass"],
             "description": "Report individual events or aggregate per pass. Default pass.",
         },
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event to look up. Works across every queue, so this "
+                "is the selector for an id copied out of the PIX GUI; the measurement "
+                "table indexes both ids."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' to look up. Only events whose queue was "
                 "exported have one; do not copy this id out of the PIX GUI on a "
-                "multi-queue capture."
+                "multi-queue capture -- use global_id for that."
             ),
         },
         pass_name={"type": "string", "description": "Restrict to passes matching this substring."},
@@ -143,6 +151,7 @@ def export_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Measured durations in nanoseconds and milliseconds.",
     examples=[
         "pix-tool-set event-timing --limit 15",
+        "pix-tool-set event-timing --global-id 5367",
         "pix-tool-set event-timing --queue-id 18704",
         "pix-tool-set event-timing --group-by event --limit 20",
     ],
@@ -166,7 +175,56 @@ def event_timing(args: dict[str, Any], context: ToolContext) -> ToolResult:
         )
         return result
 
+    global_id = args.get("global_id")
     queue_id = args.get("queue_id")
+    if global_id is not None:
+        # The measurement table indexes both ids, so a Global ID needs no translation.
+        # Its miss cases differ from Queue ID's: there is no row-order trap, only
+        # "not an event here" versus "an event with no counter sample".
+        entry = table.lookup(global_id=global_id)
+        if entry is None:
+            event = capture.resolve_event(global_id=int(global_id))
+            if event is None:
+                raise not_found(
+                    "timing",
+                    f"global_id={global_id}",
+                    f"No event in this capture carries Global ID {global_id}. Run "
+                    "list-draw-calls or search-actions to find one.",
+                )
+            raise not_found(
+                "timing",
+                f"global_id={global_id}",
+                f"Global ID {global_id} is {event.name!r}, and it carries no counter "
+                "sample in this capture. Only events the timing replay sampled have a "
+                "duration; run event-timing without a selector to see which ones do.",
+            )
+        event = capture.resolve_event(global_id=entry.global_id, queue_id=entry.queue_id)
+        pass_entry = capture.find_pass_by_event(
+            global_id=entry.global_id, queue_id=entry.queue_id
+        )
+        return ToolResult.success(
+            {
+                "available": True,
+                "timing_column": table.timing_column,
+                "event": {
+                    "queue_id": entry.queue_id,
+                    "global_id": entry.global_id,
+                    "name": event.name if event else None,
+                    "duration_ns": entry.duration_ns,
+                    "duration_ms": round(entry.duration_ms, 4),
+                },
+                "pass": (
+                    {
+                        "pass_index": pass_entry["pass_index"],
+                        "name": pass_entry["name"],
+                        **pass_identity(pass_entry),
+                    }
+                    if pass_entry
+                    else None
+                ),
+            }
+        )
+
     if queue_id is not None:
         entry = table.lookup(queue_id=queue_id)
         if entry is None:

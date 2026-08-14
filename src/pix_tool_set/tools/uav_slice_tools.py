@@ -164,12 +164,19 @@ def _read_uint_field(capture, draw, cbuffer: dict, field: dict) -> int | None:
                 "selector so the shader's declaration can be read."
             ),
         },
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the pass's event. Unique across every queue, so this is "
+                "the selector for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' of the pass. Present on every row of that "
-                "export, which covers a single command queue; use draw_index for a pass "
-                "outside it. Global ID is reported in the results only."
+                "export, which covers a single command queue; use global_id or draw_index "
+                "for a pass outside it."
             ),
         },
         draw_index={"type": "integer", "description": "Draw index of the pass."},
@@ -198,6 +205,7 @@ def _read_uint_field(capture, draw, cbuffer: dict, field: dict) -> int | None:
     returns="Slice footprint, value distribution, and written file paths.",
     examples=[
         "pix-tool-set export-uav-slice --queue-id 18461 --name RWLightGrid --slice 2",
+        "pix-tool-set export-uav-slice --global-id 5312 --name RWLightGrid --slice 2",
         "pix-tool-set export-uav-slice --resource-id 824 --slice 0 --output G:\\out",
     ],
     notes=_NOTE,
@@ -212,11 +220,12 @@ def export_uav_slice(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if resource_id is None and args.get("name"):
         draw = capture.resolve_draw(
             draw_index=args.get("draw_index"),
+            global_id=args.get("global_id"),
             queue_id=args.get("queue_id"),
         )
         if draw is None:
             raise invalid_argument(
-                "queue_id/draw_index",
+                "global_id/queue_id/draw_index",
                 "resolving a UAV by name needs a pass selector too",
             )
         found, detail = _find_by_name(capture, draw, str(args["name"]))

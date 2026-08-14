@@ -47,13 +47,19 @@ def _depth_events(capture, resource_id: int) -> list:
     category="textures",
     parameters=with_session(
         resource_id={"type": "integer", "description": "Depth-stencil resource id."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event to take the depth target from. Unique across "
+                "every queue, so use this for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' of the event to take the depth target "
                 "from. Every row of that export has one, but the export covers a single "
-                "command queue, so use draw_index for actions outside it; Global ID is "
-                "reported in the results only."
+                "command queue, so use global_id or draw_index for actions outside it."
             ),
         },
         draw_index={"type": "integer", "description": "Take the depth target from this draw."},
@@ -73,6 +79,7 @@ def _depth_events(capture, resource_id: int) -> list:
     returns="Per-event content classification and the best event to export from.",
     examples=[
         "pix-tool-set find-depth-content --queue-id 17765",
+        "pix-tool-set find-depth-content --global-id 5417",
         "pix-tool-set find-depth-content --resource-id 1985 --max-probes 16 --stop-on-first false",
     ],
     notes=_NOTE,
@@ -92,13 +99,14 @@ def find_depth_content(args: dict[str, Any], context: ToolContext) -> ToolResult
     if resource_id is None:
         draw = capture.resolve_draw(
             draw_index=args.get("draw_index"),
+            global_id=args.get("global_id"),
             queue_id=args.get("queue_id"),
         )
         if draw is None:
             raise not_found(
                 "depth resource",
                 "<no selector>",
-                "Pass --resource-id, or a pass selector such as --queue-id.",
+                "Pass --resource-id, or a pass selector such as --global-id.",
             )
         resource_id = draw.depth_stencil_resource_id
         if resource_id is None:

@@ -46,17 +46,32 @@ def _resolve_resource(capture, args: dict[str, Any]):
     # Locate the depth or a render target of a pass instead.
     selector = {
         key: args.get(key)
-        for key in ("draw_index", "queue_id", "pass_index", "pass_name")
+        for key in ("draw_index", "global_id", "queue_id", "pass_index", "pass_name")
         if args.get(key) is not None
     }
     if not selector:
         raise invalid_argument(
             "resource_id",
-            "Pass --resource-id, or identify a pass with --queue-id/"
+            "Pass --resource-id, or identify a pass with --global-id/--queue-id/"
             "--pass-name/--draw-index plus --target depth|rt0|rt1...",
         )
     if args.get("draw_index") is not None:
         draw = capture.draw_call(int(args["draw_index"]))
+    elif args.get("global_id") is not None:
+        # A Global ID names one action directly, so prefer that over the pass's first
+        # draw: the caller pointed at a specific event, and its render targets can
+        # differ from the first draw's inside the same pass.
+        draw = capture.draw_call_by_global_id(int(args["global_id"]))
+        if draw is None:
+            entry = capture.find_pass_by_event(global_id=args.get("global_id"))
+            if entry is None:
+                raise not_found(
+                    "pass",
+                    f"global_id={args['global_id']}",
+                    "No action or pass carries that Global ID. Run list-draw-calls to "
+                    "find one.",
+                )
+            draw = capture.draw_call(entry["first_draw_index"])
     else:
         entry = None
         if args.get("queue_id") is not None:
@@ -279,12 +294,20 @@ def _encode_png(pixels: bytearray, width: int, height: int) -> bytes:
     category="textures",
     parameters=with_session(
         resource_id={"type": "integer", "description": "Texture resource id."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of any event inside the pass to take the target from. "
+                "Resolves across every queue, so use this for an id copied out of the "
+                "PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' to take the target from. Present on every "
-                "row of that export, which covers a single command queue; use pass_name "
-                "or pass_index otherwise. Global ID is reported in the results only."
+                "row of that export, which covers a single command queue; use global_id, "
+                "pass_name or pass_index otherwise."
             ),
         },
         pass_name={"type": "string", "description": "Pass name to take the target from."},
@@ -326,6 +349,7 @@ def _encode_png(pixels: bytearray, width: int, height: int) -> bytes:
     returns="Footprint of every plane, value statistics, optional pixel samples and file paths.",
     examples=[
         "pix-tool-set read-resource-texture --queue-id 17765 --target depth",
+        "pix-tool-set read-resource-texture --global-id 5417 --target rt0",
         "pix-tool-set read-resource-texture --queue-id 17765 --target depth --at-x 766 --at-y 382",
         "pix-tool-set read-resource-texture --resource-id 1896 --z 225 --at-x 234 --at-y 234",
         "pix-tool-set read-resource-texture --resource-id 1985 --output G:\\out --png G:\\out",

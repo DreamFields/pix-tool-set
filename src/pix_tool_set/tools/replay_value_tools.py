@@ -147,13 +147,19 @@ def _read_depth_levels(
     category="textures",
     parameters=with_session(
         draw_index={"type": "integer", "description": "Draw index to replay."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event to replay. Unique across every queue, so this "
+                "is the selector for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' of the event. Present on every row of that "
-                "export, but the export covers a single command queue, so draw_index is "
-                "the selector that always resolves; Global ID is reported in the results "
-                "only."
+                "export, but the export covers a single command queue, so global_id or "
+                "draw_index are the selectors that always resolve."
             ),
         },
         pass_name={"type": "string", "description": "Pass name (substring match)."},
@@ -179,6 +185,7 @@ def _read_depth_levels(
     returns="Format, dimensions, value statistics, optional pixel samples and the DDS path.",
     examples=[
         "pix-tool-set read-replay-target --queue-id 17765 --rtv 1 --at-x 766 --at-y 382",
+        "pix-tool-set read-replay-target --global-id 5417 --at-x 810 --at-y 284",
         "pix-tool-set read-replay-target --draw-index 2352 --depth --at-x 766 --at-y 382",
         "pix-tool-set read-replay-target --draw-index 231 --pixels 4",
     ],
@@ -197,6 +204,7 @@ def read_replay_target(args: dict[str, Any], context: ToolContext) -> ToolResult
 
     draw = capture.resolve_draw(
         draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
         queue_id=args.get("queue_id"),
     )
     if draw is None and args.get("pass_name"):
@@ -205,7 +213,8 @@ def read_replay_target(args: dict[str, Any], context: ToolContext) -> ToolResult
             draw = capture.draw_call(entry["first_draw_index"])
     if draw is None:
         raise invalid_argument(
-            "draw_index/queue_id/pass_name", "provide one way to select the event"
+            "draw_index/global_id/queue_id/pass_name",
+            "provide one way to select the event",
         )
 
     slot = int(args.get("rtv") or 0)

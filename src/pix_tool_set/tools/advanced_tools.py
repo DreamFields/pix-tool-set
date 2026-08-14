@@ -10,7 +10,14 @@ from ..engine import bindinglabel, resourceevents
 from ..engine.model import EventKind, RootParameterKind, ShaderStage, ViewKind
 from ..errors import PixToolError, invalid_argument, not_found
 from ..results import ToolResult
-from ._common import DRAW_SELECTOR, PASS_SELECTOR, resolve_pass, tool, with_session
+from ._common import (
+    DRAW_SELECTOR,
+    PASS_SELECTOR,
+    resolve_draw,
+    resolve_pass,
+    tool,
+    with_session,
+)
 from .texture_tools import read_png
 
 _REPLAY_NOTE = (
@@ -459,12 +466,19 @@ def analyze_pass(args: dict[str, Any], context: ToolContext) -> ToolResult:
         width={"type": "integer", "description": "Region width. Default 32."},
         height={"type": "integer", "description": "Region height. Default 32."},
         resource_id={"type": "integer", "description": "Render target resource id."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event whose contents to sample. Unique across every "
+                "queue, so use this for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "PIX GUI 'Queue ID' of the event whose contents to sample. This id is "
                 "present only for events on the queue the event list export covers; use "
-                "draw_index for the rest."
+                "global_id for the rest."
             ),
         },
         depth={"type": "boolean", "description": "Sample the depth buffer."},
@@ -484,8 +498,9 @@ def sample_pixel_region(args: dict[str, Any], context: ToolContext) -> ToolResul
     capture = context.capture(args)
     resource_id = args.get("resource_id")
     queue_id = args.get("queue_id")
-    if resource_id is None and queue_id is None:
-        raise invalid_argument("resource_id/queue_id", "provide at least one")
+    global_id = args.get("global_id")
+    if resource_id is None and queue_id is None and global_id is None:
+        raise invalid_argument("resource_id/global_id/queue_id", "provide at least one")
 
     path, diagnostics = _texture_export(
         context,
@@ -493,6 +508,7 @@ def sample_pixel_region(args: dict[str, Any], context: ToolContext) -> ToolResul
         capture,
         resource_id=int(resource_id) if resource_id is not None else None,
         queue_id=int(queue_id) if queue_id is not None else None,
+        global_id=int(global_id) if global_id is not None else None,
         rtv=int(args.get("rtv") or 0),
         depth=bool(args.get("depth")),
         stem=f"region_{resource_id if resource_id is not None else queue_id}",
@@ -567,11 +583,19 @@ def sample_pixel_region(args: dict[str, Any], context: ToolContext) -> ToolResul
         y={"type": "integer", "description": "Pixel Y coordinate."},
         resource_id={"type": "integer", "description": "Render target resource id."},
         draw_index={"type": "integer", "description": "Skip coverage search and use this draw."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event to use instead of the coverage search. Unique "
+                "across every queue, so use this for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "PIX GUI 'Queue ID' of the event to use instead of the coverage search. "
-                "Present only for events on the exported queue; draw_index always works."
+                "Present only for events on the exported queue; global_id and draw_index "
+                "always work."
             ),
         },
         max_lines={"type": "integer", "description": "Disassembly lines to inline. Default 200."},
@@ -592,11 +616,21 @@ def debug_pixel_shader(args: dict[str, Any], context: ToolContext) -> ToolResult
     capture = context.capture(args)
     draw = capture.resolve_draw(
         draw_index=args.get("draw_index"),
+        global_id=args.get("global_id"),
         queue_id=args.get("queue_id"),
     )
 
     coverage_note = None
     if draw is None:
+        # An explicit selector that resolved to nothing must fail, not fall through to
+        # the coverage search: the search would answer with whichever draw happens to
+        # cover the pixel, which is a different event than the one asked for, and the
+        # payload would look like a successful lookup of the requested id.
+        if any(
+            args.get(key) is not None
+            for key in ("draw_index", "global_id", "queue_id")
+        ):
+            resolve_draw(capture, args)
         x, y = args.get("x"), args.get("y")
         if x is None or y is None:
             raise invalid_argument("x/y", "provide coordinates or a draw selector")

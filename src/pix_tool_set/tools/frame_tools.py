@@ -190,12 +190,19 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         PAGE_PARAMS,
         pass_name={"type": "string", "description": "Restrict to passes matching this name."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of any event inside a pass. Reports just that pass, across "
+                "every queue -- use this for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' of any row inside a pass. Reports just "
-                "that pass. Available for the exported queue only; pass_name reaches the "
-                "rest."
+                "that pass. Available for the exported queue only; global_id or pass_name "
+                "reach the rest."
 
             ),
         },
@@ -230,6 +237,7 @@ def pass_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Per-pass measured GPU duration and share of the frame, plus the cost model.",
     examples=[
         "pix-tool-set pass-cost --limit 15",
+        "pix-tool-set pass-cost --global-id 5367",
         "pix-tool-set pass-cost --queue-id 18704",
         "pix-tool-set pass-cost --no-measure --limit 15",
         "pix-tool-set pass-cost --force-measure",
@@ -293,7 +301,7 @@ def pass_cost(args: dict[str, Any], context: ToolContext) -> ToolResult:
 
     # An id names exactly one pass, so it selects rather than filters. Names are a
     # substring match and can legitimately hit several passes with the same label.
-    if args.get("queue_id") is not None:
+    if args.get("queue_id") is not None or args.get("global_id") is not None:
         wanted = resolve_pass(capture, args)
         rows = [row for row in rows if row["pass_index"] == wanted["pass_index"]]
 

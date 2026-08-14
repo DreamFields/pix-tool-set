@@ -23,6 +23,7 @@ from ..results import ToolResult
 from ._common import (
     DRAW_SELECTOR,
     PAGE_PARAMS,
+    QUEUE_ID_IS_ROW_ORDER,
     page_args,
     page_envelope,
     percent,
@@ -193,12 +194,18 @@ def _texture_export(
     rtv: int,
     depth: bool,
     stem: str,
+    global_id: int | None = None,
 ) -> tuple[Path, list[dict[str, Any]]]:
     """Ask pixtool to materialise a texture as PNG. Returns (path, diagnostics).
 
-    Queue ID is the only event identifier accepted as input; it is translated here
-    into the Global ID that ``pixtool save-resource`` needs on its command line.
-    Global ID is still reported back in the diagnostics.
+    Global ID is what ``pixtool save-resource`` actually needs on its command line, so
+    it is accepted directly. A Queue ID is translated into one here. For a long while
+    Queue ID was the only accepted input, which inverted the ids' reliability: the id
+    the PIX GUI shows and that is unique across every queue had to be converted by hand
+    into an id that exists only for the exported queue and whose column is row order,
+    so a wrong-queue value resolved to an unrelated event instead of failing.
+
+    An explicit Global ID wins over a Queue ID, since it is the unambiguous one.
     """
     record = context.session(args)
     if not record.capture_path:
@@ -208,14 +215,26 @@ def _texture_export(
             stage="texture",
             suggestion="Re-open with `session-open --capture <file.wpix>`.",
         )
-    global_id: int | None = None
-    if queue_id is not None:
+    if global_id is not None:
+        # Validate rather than trust: pixtool would accept any integer and save
+        # whatever state it finds, so an id absent from the capture has to fail here
+        # or it returns a plausible-looking image for an event that never ran.
+        if capture.resolve_event(global_id=int(global_id)) is None:
+            raise not_found(
+                "event",
+                f"global_id={global_id}",
+                "No event in this capture carries that Global ID. Run list-draw-calls "
+                "or search-actions to find one.",
+            )
+        global_id = int(global_id)
+    elif queue_id is not None:
         event = capture.resolve_event(queue_id=int(queue_id))
         if event is None or event.global_id is None:
             raise not_found(
                 "event",
                 f"queue_id={queue_id}",
-                "Use locate-event to check the id, or list-draw-calls to find one.",
+                "Use locate-event to check the id, or list-draw-calls to find one. "
+                + QUEUE_ID_IS_ROW_ORDER,
             )
         global_id = event.global_id
     if global_id is None and resource_id is not None:
@@ -244,6 +263,15 @@ def _texture_export(
             "level": "info",
             "message": "Texture exported through pixtool save-resource.",
             "global_id": global_id,
+            "event_selected_by": (
+                "global_id"
+                if args.get("global_id") is not None
+                else "queue_id"
+                if queue_id is not None
+                else "last draw that bound the resource"
+                if global_id is not None
+                else "none"
+            ),
             "rtv": None if depth else rtv,
             "depth": depth,
         }
@@ -511,12 +539,20 @@ def texture_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     category="textures",
     parameters=with_session(
         resource_id={"type": "integer", "description": "Resource id to export."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event whose contents to capture. This is what "
+                "pixtool needs internally and it is unique across every queue, so it is "
+                "the selector to use for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' of the event whose contents to capture. "
-                "Present only for events on the queue that export covers; use draw_index "
-                "or pass_name for the rest."
+                "Present only for events on the queue that export covers; use global_id "
+                "for the rest."
             ),
         },
         rtv={"type": "integer", "description": "Render target slot index. Default 0."},
@@ -526,6 +562,7 @@ def texture_info(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Path of the written image plus the event that supplied it.",
     examples=[
         "pix-tool-set export-texture --resource-id 641 -o rt.png",
+        "pix-tool-set export-texture --global-id 5417 --resource-id 756 -o gbuffer_a.png",
         "pix-tool-set export-texture --queue-id 18704 --depth -o depth.png",
     ],
     notes=_PIXEL_NOTE,
@@ -534,8 +571,9 @@ def export_texture(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     resource_id = args.get("resource_id")
     queue_id = args.get("queue_id")
-    if resource_id is None and queue_id is None:
-        raise invalid_argument("resource_id/queue_id", "provide at least one")
+    global_id = args.get("global_id")
+    if resource_id is None and queue_id is None and global_id is None:
+        raise invalid_argument("resource_id/global_id/queue_id", "provide at least one")
 
     stem = f"texture_{resource_id if resource_id is not None else 'qid' + str(queue_id)}"
     path, diagnostics = _texture_export(
@@ -544,6 +582,7 @@ def export_texture(args: dict[str, Any], context: ToolContext) -> ToolResult:
         capture,
         resource_id=int(resource_id) if resource_id is not None else None,
         queue_id=int(queue_id) if queue_id is not None else None,
+        global_id=int(global_id) if global_id is not None else None,
         rtv=int(args.get("rtv") or 0),
         depth=bool(args.get("depth")),
         stem=stem,
@@ -689,12 +728,19 @@ def export_draw_textures(args: dict[str, Any], context: ToolContext) -> ToolResu
     category="textures",
     parameters=with_session(
         resource_id={"type": "integer", "description": "Resource id to read."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event whose contents to read. Unique across every "
+                "queue, so use this for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' of the event whose contents to read. "
-                "Present only for events on the queue that export covers; use draw_index "
-                "or pass_name for the rest."
+                "Present only for events on the queue that export covers; use global_id "
+                "for the rest."
             ),
         },
         x={"type": "integer", "description": "Left edge. Default 0."},
@@ -716,8 +762,9 @@ def read_texture_pixels(args: dict[str, Any], context: ToolContext) -> ToolResul
     capture = context.capture(args)
     resource_id = args.get("resource_id")
     queue_id = args.get("queue_id")
-    if resource_id is None and queue_id is None:
-        raise invalid_argument("resource_id/queue_id", "provide at least one")
+    global_id = args.get("global_id")
+    if resource_id is None and queue_id is None and global_id is None:
+        raise invalid_argument("resource_id/global_id/queue_id", "provide at least one")
 
     path, diagnostics = _texture_export(
         context,
@@ -725,6 +772,7 @@ def read_texture_pixels(args: dict[str, Any], context: ToolContext) -> ToolResul
         capture,
         resource_id=int(resource_id) if resource_id is not None else None,
         queue_id=int(queue_id) if queue_id is not None else None,
+        global_id=int(global_id) if global_id is not None else None,
         rtv=int(args.get("rtv") or 0),
         depth=bool(args.get("depth")),
         stem=f"pixels_{resource_id if resource_id is not None else queue_id}",
@@ -785,12 +833,19 @@ def read_texture_pixels(args: dict[str, Any], context: ToolContext) -> ToolResul
     category="textures",
     parameters=with_session(
         resource_id={"type": "integer", "description": "Resource id to analyse."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event whose contents to analyse. Unique across every "
+                "queue, so use this for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' of the event whose contents to analyse. "
-                "Present only for events on the queue that export covers; use draw_index "
-                "or pass_name for the rest."
+                "Present only for events on the queue that export covers; use global_id "
+                "for the rest."
             ),
         },
         x={"type": "integer", "description": "Region left edge."},
@@ -809,8 +864,9 @@ def texture_pixel_stats(args: dict[str, Any], context: ToolContext) -> ToolResul
     capture = context.capture(args)
     resource_id = args.get("resource_id")
     queue_id = args.get("queue_id")
-    if resource_id is None and queue_id is None:
-        raise invalid_argument("resource_id/queue_id", "provide at least one")
+    global_id = args.get("global_id")
+    if resource_id is None and queue_id is None and global_id is None:
+        raise invalid_argument("resource_id/global_id/queue_id", "provide at least one")
 
     path, diagnostics = _texture_export(
         context,
@@ -818,6 +874,7 @@ def texture_pixel_stats(args: dict[str, Any], context: ToolContext) -> ToolResul
         capture,
         resource_id=int(resource_id) if resource_id is not None else None,
         queue_id=int(queue_id) if queue_id is not None else None,
+        global_id=int(global_id) if global_id is not None else None,
         rtv=int(args.get("rtv") or 0),
         depth=bool(args.get("depth")),
         stem=f"stats_{resource_id if resource_id is not None else queue_id}",
@@ -866,12 +923,19 @@ def texture_pixel_stats(args: dict[str, Any], context: ToolContext) -> ToolResul
         x={"type": "integer", "description": "Pixel X coordinate."},
         y={"type": "integer", "description": "Pixel Y coordinate."},
         resource_id={"type": "integer", "description": "Resource id to sample."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of the event whose contents to sample. Unique across every "
+                "queue, so use this for an id copied out of the PIX GUI."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list 'Queue ID' of the event whose contents to sample. "
-                "Present only for events on the queue that export covers; use draw_index "
-                "or pass_name for the rest."
+                "Present only for events on the queue that export covers; use global_id "
+                "for the rest."
             ),
         },
         depth={"type": "boolean", "description": "Sample the depth buffer."},
@@ -887,8 +951,9 @@ def pick_pixel(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     resource_id = args.get("resource_id")
     queue_id = args.get("queue_id")
-    if resource_id is None and queue_id is None:
-        raise invalid_argument("resource_id/queue_id", "provide at least one")
+    global_id = args.get("global_id")
+    if resource_id is None and queue_id is None and global_id is None:
+        raise invalid_argument("resource_id/global_id/queue_id", "provide at least one")
 
     path, diagnostics = _texture_export(
         context,
@@ -896,6 +961,7 @@ def pick_pixel(args: dict[str, Any], context: ToolContext) -> ToolResult:
         capture,
         resource_id=int(resource_id) if resource_id is not None else None,
         queue_id=int(queue_id) if queue_id is not None else None,
+        global_id=int(global_id) if global_id is not None else None,
         rtv=int(args.get("rtv") or 0),
         depth=bool(args.get("depth")),
         stem=f"pick_{resource_id if resource_id is not None else queue_id}",

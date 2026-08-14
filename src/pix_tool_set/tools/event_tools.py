@@ -241,15 +241,25 @@ def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
     parameters=with_session(
         PAGE_PARAMS,
         pass_name={"type": "string", "description": "Substring match on the innermost marker."},
+        global_id={
+            "type": "integer",
+            "description": (
+                "PIX Global ID of any event inside a pass. Restricts the search to that "
+                "one pass, across every queue -- this is the selector for an id copied "
+                "out of the PIX GUI. A name cannot single out a pass when several share "
+                "a label, and queue_id only reaches the exported queue."
+            ),
+        },
         queue_id={
             "type": "integer",
             "description": (
                 "Exported event list row id of any event inside a pass. Restricts the "
                 "search to that one pass, which a name cannot do when passes share a "
-                "label. Only works for the exported queue; pass_name or marker reach "
-                "every pass."
+                "label. Only works for the exported queue; global_id, pass_name or "
+                "marker reach every pass."
             ),
         },
+
 
         marker={"type": "string", "description": "Substring match on the full marker path."},
         kind={
@@ -277,6 +287,7 @@ def search_actions(args: dict[str, Any], context: ToolContext) -> ToolResult:
     returns="Paged list of draw calls with counts of bound resources.",
     examples=[
         "pix-tool-set find-draw-calls --pass-name Lumen --limit 10",
+        "pix-tool-set find-draw-calls --global-id 5367",
         "pix-tool-set find-draw-calls --queue-id 18704",
         "pix-tool-set find-draw-calls --kind dispatch --min-triangles 0",
         "pix-tool-set find-draw-calls --uses-resource 641 --detail",
@@ -287,7 +298,11 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
     capture = context.capture(args)
     offset, limit = page_args(args)
 
-    if args.get("queue_id") is not None:
+    # Either id names exactly one pass, so both take the "restrict to this pass"
+    # path; resolve_pass prefers global_id when both are given.
+    pass_selected = args.get("queue_id") is not None or args.get("global_id") is not None
+
+    if pass_selected:
         # Resolve the id to one pass, then apply the remaining filters within it.
         # Filtering by the pass's name would widen the result again, because names
         # are not unique across the frame.
@@ -327,7 +342,7 @@ def find_draw_calls(args: dict[str, Any], context: ToolContext) -> ToolResult:
         # The engine paginates before this filter runs, so a page that contains no
         # matching actions would report total=0 even though later pages have them.
         # Re-run without pagination, filter, then apply the caller's page.
-        if args.get("queue_id") is not None:
+        if pass_selected:
             wanted = tuple(resolve_pass(capture, args)["marker_path"])
             candidates, _ = capture.find_draw_calls(
                 kind=args.get("kind"),
